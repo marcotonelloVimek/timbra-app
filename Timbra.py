@@ -2588,7 +2588,12 @@ if not st.session_state.logged_in:
         else:
             st.error("Nome utente o password errati.")
 else:
-    st_autorefresh(interval=5000, key="datarefresh")  
+    # Aggiorna automaticamente la pagina ogni 60 secondi (prima erano 5): con un
+    # database locale non aveva costi, ma con un database remoto come Turso ogni
+    # aggiornamento richiede una richiesta di rete, e farlo ogni 5 secondi per ogni
+    # persona collegata appesantiva parecchio l'app. 60 secondi è un buon compromesso
+    # per un'app di presenze aziendali (i dati non devono essere aggiornati al secondo).
+    st_autorefresh(interval=60000, key="datarefresh")
     user_info = get_user_info()
     st.sidebar.button("Logout", on_click=logout)
     st.subheader(f"Benvenuto, {user_info['name']}!")
