@@ -3466,6 +3466,29 @@ def render_area_personale(username, key_prefix):
             else:
                 st.error(errore)
 
+
+def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
+    """Menu di navigazione della sidebar organizzato per categorie invece di un unico
+    lungo elenco piatto: prima si sceglie la categoria (poche voci, facili da
+    scansionare), poi le pagine di quella categoria appaiono raggruppate in un
+    riquadro. 'categorie' è una lista di tuple (nome_categoria, [elenco pagine]).
+    Restituisce il nome della pagina scelta, esattamente come farebbe un unico
+    st.sidebar.radio con tutte le opzioni appiattite: il resto del codice che
+    confronta il valore restituito con le singole etichette non deve quindi
+    cambiare."""
+    mappa_pagine_per_categoria = dict(categorie)
+    nomi_categorie = list(mappa_pagine_per_categoria.keys())
+    categoria_scelta = st.sidebar.radio(titolo_categoria, nomi_categorie, key=f"{key_prefix}_categoria")
+    pagine_categoria = mappa_pagine_per_categoria[categoria_scelta]
+    with st.sidebar.container(border=True):
+        if len(pagine_categoria) == 1:
+            # Una categoria con una sola pagina non ha bisogno di un'altra scelta:
+            # il riquadro serve solo a confermare dove ci si trova.
+            st.caption(f"📁 {pagine_categoria[0]}")
+            return pagine_categoria[0]
+        return st.radio(categoria_scelta, pagine_categoria, key=f"{key_prefix}_pagina_{categoria_scelta}")
+
+
 # ================== INTERFACCIA STREAMLIT ==================
 
 if not st.session_state.logged_in:
@@ -3501,7 +3524,13 @@ else:
         st.info("Sei connesso come amministratore. Puoi visualizzare i timbri di tutti gli utenti.")
         st.markdown("---")
 
-        admin_page = st.sidebar.radio("Sezione amministratore", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Gestione Commesse", "Resoconto Commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "🧳 Trasferte e Interventi (Service)", "📅 Disponibilità Team", "Gestione Utenti DB"])
+        admin_page = render_menu_a_categorie([
+            ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
+            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse"]),
+            ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
+            ("🧳 Trasferte e Team", ["🧳 Trasferte e Interventi (Service)", "📅 Disponibilità Team"]),
+            ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
+        ], key_prefix="admin_menu", titolo_categoria="Sezione amministratore")
 
         if admin_page == "Dati e Presenze":
             st.subheader("📊 Pannello Amministrazione")
@@ -4067,7 +4096,12 @@ else:
         if modalita == "Mie funzioni personali":
             # *** REPLICA DELLA SEZIONE UTENTE PER IL RESPONSABILE ***
             dipendente_scelto = user_info["name"]
-            pagina_utente = st.sidebar.radio("Funzione personale", ["Profilo", "Timbrature", "Riepilogo personale", "Report mensile", "📷 Report Intervento", "Richiesta ferie/permessi", "Richiesta rettifica"])
+            pagina_utente = render_menu_a_categorie([
+                ("👤 Profilo", ["Profilo"]),
+                ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
+                ("🧳 Service", ["📷 Report Intervento"]),
+                ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
+            ], key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
 
             if pagina_utente == "Profilo":
                 st.subheader("👤 Profilo personale")
@@ -4238,7 +4272,11 @@ else:
             area_responsabile = user_info["area"]
             dipendenti_area = get_users_in_area(area_responsabile)
 
-            resp_page = st.sidebar.radio("Sezione team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature", "Statistiche area", "Resoconto Commesse", "Gestione fasi commessa", "📅 Disponibilità Team"])
+            resp_page = render_menu_a_categorie([
+                ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature"]),
+                ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa"]),
+                ("📅 Disponibilità", ["📅 Disponibilità Team"]),
+            ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
 
             if resp_page == "Timbrature del team":
                 st.subheader(f"📋 Timbrature - Area: {area_responsabile}")
@@ -4380,10 +4418,15 @@ else:
     else:
         # --- LATO UTENTE ---
         dipendente_scelto = user_info["name"]
-        pagina_utente_opzioni = ["Profilo", "Timbrature", "Riepilogo personale", "Report mensile", "📷 Report Intervento", "Richiesta ferie/permessi", "Richiesta rettifica"]
+        pagine_service_utente = ["📷 Report Intervento"]
         if is_area_service(user_info["area"]):
-            pagina_utente_opzioni.append("🧳 Trasferte Service")
-        pagina_utente = st.sidebar.radio("Funzione utente", pagina_utente_opzioni)
+            pagine_service_utente.append("🧳 Trasferte Service")
+        pagina_utente = render_menu_a_categorie([
+            ("👤 Profilo", ["Profilo"]),
+            ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
+            ("🧳 Service", pagine_service_utente),
+            ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
+        ], key_prefix="user_menu", titolo_categoria="Funzione utente")
 
         if pagina_utente == "Profilo":
             st.subheader("👤 Profilo personale")
