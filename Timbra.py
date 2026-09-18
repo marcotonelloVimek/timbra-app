@@ -850,6 +850,21 @@ def get_livelli_costo_orario_map():
         c.execute("SELECT livello, costo_orario FROM livelli_ferie_permessi")
         return {row[0]: float(row[1]) for row in c.fetchall() if row[1] is not None}
 
+def get_users_distanza_map():
+    """Mappa {nome_dipendente: distanza_km}, stesso motivo di get_users_area_map(): da
+    usare al posto di get_distanza_km_utente() quando serve la distanza di più
+    dipendenti insieme (es. nel calcolo CO2 evitata della sezione Sostenibilità)."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, distanza_km FROM utenti")
+        risultato = {}
+        for nome, distanza in c.fetchall():
+            try:
+                risultato[nome] = float(distanza) if distanza is not None else 0.0
+            except (TypeError, ValueError):
+                risultato[nome] = 0.0
+        return risultato
+
 def get_area_names():
     with db_connect() as conn:
         c = conn.cursor()
@@ -2074,7 +2089,7 @@ def compute_co2_risparmiata_pendolarismo(df, start_date, end_date, area_filter=N
     if giorni_smart.empty:
         return pd.DataFrame(columns=colonne), 0.0
 
-    giorni_smart["Distanza_km"] = giorni_smart["Dipendente"].apply(get_distanza_km_utente)
+    giorni_smart["Distanza_km"] = giorni_smart["Dipendente"].map(get_users_distanza_map()).fillna(0.0)
     giorni_smart["CO2_evitata_kg"] = (giorni_smart["Giorni_smart"] * giorni_smart["Distanza_km"] * 2 * float(co2_kg_per_km)).round(2)
     totale_kg = round(float(giorni_smart["CO2_evitata_kg"].sum()), 2)
     return giorni_smart[colonne].sort_values("CO2_evitata_kg", ascending=False).reset_index(drop=True), totale_kg
