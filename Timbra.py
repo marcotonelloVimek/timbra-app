@@ -16,7 +16,6 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
 
-
 def _load_optional_dependency(module_name):
     """Carica una dipendenza opzionale senza bloccare l'app se manca."""
     try:
