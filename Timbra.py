@@ -1366,7 +1366,16 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
 
 # --- FUNZIONI DATABASE TIMBRATURE/RICHIESTE ---
 
+@st.cache_data(ttl=30)
 def carica_dati_db():
+    """Carica tutte le timbrature. È la lettura dal database più pesante e più
+    frequente di tutta l'app (viene fatta ad ogni pagina, per ogni utente): con un
+    database locale non aveva costi, ma con un database remoto come Turso rifarla ad
+    ogni singolo clic (anche solo per cambiare una tendina) è molto lento. La cache la
+    tiene in memoria per 30 secondi invece di rileggerla ogni volta; le funzioni che
+    scrivono nuove timbrature (registra_orario, approva_rettifica) chiamano
+    carica_dati_db.clear() subito dopo, cosi' chi ha appena timbrato vede subito il
+    proprio aggiornamento invece di aspettare la scadenza della cache."""
     with db_connect() as conn:
         df = pd.read_sql("SELECT Data, Dipendente, Ora, Azione, Luogo, Dettaglio_Trasferta, Commessa, Fase, Dettaglio_Fase, Ruolo FROM timbrature", conn)
     if df.empty:
@@ -1409,6 +1418,7 @@ def registra_orario(nome_dipendente, tipo_azione, luogo_lavoro, dettaglio, comme
                      VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
                   (data_str, nome_dipendente, ora_str, tipo_azione, luogo_lavoro, dettaglio, commessa, fase, dettaglio_fase, ruolo, stato))
         conn.commit()
+    carica_dati_db.clear()  # la nuova timbratura deve essere visibile subito, non solo dopo la cache
 
     if fase_da_chiudere:
         st.info(f"🧩 La fase '{fase_da_chiudere[1]}' su '{fase_da_chiudere[0]}' era ancora aperta: chiusa automaticamente con l'uscita.")
@@ -1570,10 +1580,11 @@ def approva_rettifica(rettifica_id, admin_username):
                   (data_prevista, dipendente, ora_prevista, azione, "Rettifica", "-", "", "", "", "", "Rettificata"))
         
         # Aggiorna lo stato della rettifica
-        c.execute("UPDATE rettifiche SET Stato = ?, Approvato_da = ? WHERE ID = ?", 
+        c.execute("UPDATE rettifiche SET Stato = ?, Approvato_da = ? WHERE ID = ?",
                   ("Approvato", admin_username, rettifica_id))
         conn.commit()
-    
+    carica_dati_db.clear()  # è stata aggiunta una nuova timbratura (quella rettificata)
+
     # 📧 Invia email di notifica al dipendente
     email_dipendente = dipendente.replace(" ", ".").lower() + "@azienda.com"
     oggetto = "✅ Rettifica timbratura approvata"
