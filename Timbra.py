@@ -221,8 +221,14 @@ def is_legacy_plaintext_password(stored_value):
     separatore, si tratta di una password salvata in chiaro dalle versioni precedenti."""
     return bool(stored_value) and "$" not in stored_value
 
+@st.cache_resource
 def init_db():
-    """Inizializza il database e crea le tabelle se non esistono."""
+    """Inizializza il database e crea le tabelle se non esistono. Il decoratore
+    'cache_resource' fa sì che questa funzione venga eseguita una sola volta
+    all'avvio dell'app (o dopo un riavvio/redeploy), invece che ad ogni singola
+    interazione dell'utente come farebbe normalmente Streamlit: con un database
+    remoto come Turso questo evita una ventina di operazioni di rete inutili ad ogni
+    clic, ed è il motivo principale per cui l'app era diventata lenta."""
     with db_connect() as conn:
         c = conn.cursor()
         # Migliora la concorrenza quando più dipendenti usano l'app contemporaneamente.
