@@ -461,8 +461,16 @@ def init_db():
                         ore_lavoro REAL,
                         commessa TEXT,
                         fase TEXT,
+                        data_intervento TEXT,
                         data_creazione TEXT
                     )''')
+        # Migrazione: aggiungi la colonna data_intervento se la tabella esisteva già
+        # (il giorno specifico a cui si riferiscono le ore calcolate dalle timbrature)
+        try:
+            c.execute("ALTER TABLE report_interventi ADD COLUMN data_intervento TEXT")
+            conn.commit()
+        except db_migration_error_classes():
+            pass  # Colonna già esistente
 
         # Tabella Foto Report Interventi - le foto vengono ridimensionate/compresse
         # prima di essere salvate (vedi comprimi_immagine_upload) per non appesantire
@@ -1857,18 +1865,33 @@ def comprimi_immagine_upload(uploaded_file, max_dimensione=1600, qualita=80):
     immagine.save(buffer_immagine, format="JPEG", quality=qualita)
     return buffer_immagine.getvalue()
 
-def salva_report_intervento(trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, foto_caricate):
+def calcola_ore_lavorate_periodo(df, dipendente, data_inizio, data_fine):
+    """Ore effettivamente lavorate da un dipendente tra data_inizio e data_fine
+    (estremi inclusi), calcolate dalle sue timbrature reali (coppie Ingresso/Uscita)
+    invece di farle inserire a mano nel report intervento."""
+    giornaliero = compute_daily_work(df)
+    if giornaliero.empty:
+        return 0.0
+    filtrato = giornaliero[(giornaliero["Dipendente"] == dipendente) &
+                            (giornaliero["Data"] >= data_inizio) & (giornaliero["Data"] <= data_fine)]
+    return round(float(filtrato["Ore_lavorate"].sum()), 2) if not filtrato.empty else 0.0
+
+def salva_report_intervento(trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, foto_caricate, data_intervento=None):
     """Salva il report di un intervento (testo + eventuali foto compresse) per una
-    trasferta del dipendente. Restituisce (ok, errore)."""
+    trasferta del dipendente. Le ore di lavoro sono calcolate dal chiamante dalle
+    timbrature reali (vedi calcola_ore_lavorate_periodo), non inserite a mano.
+    Restituisce (ok, errore)."""
     if not descrizione or not str(descrizione).strip():
         return False, "Inserisci una descrizione del lavoro svolto."
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""INSERT INTO report_interventi
-                     (trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, data_creazione)
-                     VALUES (?,?,?,?,?,?,?,?)""",
+                     (trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, data_intervento, data_creazione)
+                     VALUES (?,?,?,?,?,?,?,?,?)""",
                   (trasferta_id, dipendente, str(cliente_luogo or "").strip(), str(descrizione).strip(),
-                   float(ore_lavoro) if ore_lavoro else 0.0, commessa, fase, datetime.date.today().isoformat()))
+                   float(ore_lavoro) if ore_lavoro else 0.0, commessa, fase,
+                   data_intervento.isoformat() if hasattr(data_intervento, "isoformat") else data_intervento,
+                   datetime.date.today().isoformat()))
         report_id = c.lastrowid
         oggi_str = datetime.date.today().isoformat()
         for foto in (foto_caricate or []):
@@ -1882,8 +1905,8 @@ def get_report_interventi_dettaglio(dipendente=None, area=None):
     """Report interventi (con dati della trasferta collegata e numero di foto
     allegate), filtrabili per dipendente o per area."""
     query = """SELECT r.id AS ID, r.dipendente AS Dipendente, t.data_inizio AS 'Trasferta dal', t.data_fine AS 'Trasferta al',
-                      r.cliente_luogo AS 'Cliente/Luogo', r.descrizione AS Descrizione, r.ore_lavoro AS 'Ore lavoro',
-                      r.commessa AS Commessa, r.fase AS Fase, r.data_creazione AS 'Data report',
+                      r.cliente_luogo AS 'Cliente/Luogo', r.descrizione AS Descrizione, r.data_intervento AS 'Giorno intervento',
+                      r.ore_lavoro AS 'Ore lavoro', r.commessa AS Commessa, r.fase AS Fase, r.data_creazione AS 'Data report',
                       (SELECT COUNT(*) FROM report_interventi_foto f WHERE f.report_id = r.id) AS 'N. foto'
                FROM report_interventi r LEFT JOIN trasferte t ON r.trasferta_id = t.id"""
     condizioni, parametri = [], []
@@ -1895,7 +1918,7 @@ def get_report_interventi_dettaglio(dipendente=None, area=None):
         dipendenti_area = [nome for nome, area_nome in mappa_aree.items() if area_nome == area]
         if not dipendenti_area:
             return pd.DataFrame(columns=["ID", "Dipendente", "Trasferta dal", "Trasferta al", "Cliente/Luogo",
-                                          "Descrizione", "Ore lavoro", "Commessa", "Fase", "Data report", "N. foto"])
+                                          "Descrizione", "Giorno intervento", "Ore lavoro", "Commessa", "Fase", "Data report", "N. foto"])
         condizioni.append(f"r.dipendente IN ({','.join('?' for _ in dipendenti_area)})")
         parametri.extend(dipendenti_area)
     if condizioni:
@@ -2011,10 +2034,12 @@ def render_gestione_trasferte_service(attore_nome, key_prefix):
                 else:
                     st.error(errore)
 
-def render_report_intervento(dipendente_nome, key_prefix):
+def render_report_intervento(dipendente_nome, df, key_prefix):
     """Il dipendente compila il report di un intervento svolto durante una propria
-    trasferta già programmata (cliente/luogo, descrizione, ore, commessa/fase) e può
-    allegare una o più foto."""
+    trasferta già programmata (cliente/luogo, descrizione, commessa/fase) e può
+    allegare una o più foto. Le ore di lavoro NON si inseriscono a mano: vengono
+    calcolate automaticamente dalle sue timbrature reali (Ingresso/Uscita) del
+    giorno dell'intervento scelto."""
     st.subheader("📷 Report Intervento")
     trasferte_dipendente = get_trasferte_dipendente(dipendente_nome)
     if trasferte_dipendente.empty:
@@ -2031,7 +2056,11 @@ def render_report_intervento(dipendente_nome, key_prefix):
 
     cliente_luogo_rep = st.text_input("Cliente / luogo dell'intervento", key=f"{key_prefix}_rep_luogo")
     descrizione_rep = st.text_area("Descrizione del lavoro svolto", key=f"{key_prefix}_rep_descrizione")
-    ore_lavoro_rep = st.number_input("Ore di lavoro sul posto", min_value=0.0, step=0.5, key=f"{key_prefix}_rep_ore")
+
+    giorno_intervento_rep = st.date_input("Giorno dell'intervento", value=datetime.date.today(), key=f"{key_prefix}_rep_giorno")
+    ore_calcolate_rep = calcola_ore_lavorate_periodo(df, dipendente_nome, giorno_intervento_rep, giorno_intervento_rep)
+    st.metric("Ore di lavoro (calcolate dalle tue timbrature)", f"{ore_calcolate_rep:.2f} h")
+    st.caption("Le ore vengono calcolate automaticamente dalle timbrature Ingresso/Uscita registrate per il giorno indicato sopra: se risultano 0, verifica di aver timbrato quel giorno.")
 
     commesse_rep = get_commesse_names()
     commessa_rep, fase_rep = None, None
@@ -2052,7 +2081,8 @@ def render_report_intervento(dipendente_nome, key_prefix):
 
     if st.button("💾 Salva report intervento", key=f"{key_prefix}_rep_salva"):
         ok, errore = salva_report_intervento(trasferta_id_scelta, dipendente_nome, cliente_luogo_rep,
-                                              descrizione_rep, ore_lavoro_rep, commessa_rep, fase_rep, foto_caricate)
+                                              descrizione_rep, ore_calcolate_rep, commessa_rep, fase_rep, foto_caricate,
+                                              data_intervento=giorno_intervento_rep)
         if ok:
             st.success("Report salvato.")
             st.rerun()
@@ -3838,7 +3868,7 @@ else:
                 render_report_mensile(dipendente_scelto, df, key_prefix="resp")
 
             elif pagina_utente == "📷 Report Intervento":
-                render_report_intervento(dipendente_scelto, key_prefix="resp")
+                render_report_intervento(dipendente_scelto, df, key_prefix="resp")
 
             elif pagina_utente == "Richiesta ferie/permessi":
                 st.subheader("Richiesta ferie / permessi")
@@ -4196,7 +4226,7 @@ else:
             render_report_mensile(dipendente_scelto, df, key_prefix="user")
 
         elif pagina_utente == "📷 Report Intervento":
-            render_report_intervento(dipendente_scelto, key_prefix="user")
+            render_report_intervento(dipendente_scelto, df, key_prefix="user")
 
         elif pagina_utente == "🧳 Trasferte Service":
             render_gestione_trasferte_service(user_info["name"], key_prefix="user_service")
