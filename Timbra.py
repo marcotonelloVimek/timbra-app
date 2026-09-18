@@ -16,6 +16,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
 
+
 def _load_optional_dependency(module_name):
     """Carica una dipendenza opzionale senza bloccare l'app se manca."""
     try:
@@ -71,6 +72,13 @@ except Exception:
     inch = None
     SimpleDocTemplate = Table = TableStyle = Paragraph = Spacer = PageBreak = None
     colors = None
+
+try:
+    PIL_Image = _load_optional_dependency("PIL.Image")
+    PIL_AVAILABLE = PIL_Image is not None
+except Exception:
+    PIL_Image = None
+    PIL_AVAILABLE = False
 
 # --- CONFIGURAZIONE DATABASE SQLite ---
 DB_FILE = "timbrature_aziendali.db"
@@ -425,7 +433,48 @@ def init_db():
                         Data_richiesta TEXT,
                         Approvato_da TEXT DEFAULT NULL
                     )''')
-        
+
+        # Tabella Trasferte - programmate da chi fa parte dell'area Service (o
+        # dall'admin) per un operatore scelto tra tutti i dipendenti.
+        c.execute('''CREATE TABLE IF NOT EXISTS trasferte (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        dipendente TEXT NOT NULL,
+                        data_inizio TEXT NOT NULL,
+                        data_fine TEXT NOT NULL,
+                        mezzo TEXT NOT NULL,
+                        dettaglio_mezzo TEXT,
+                        auto_propria INTEGER NOT NULL DEFAULT 0,
+                        cliente_luogo TEXT,
+                        note TEXT,
+                        creata_da TEXT,
+                        data_creazione TEXT
+                    )''')
+
+        # Tabella Report Interventi - compilata dal dipendente per una sua trasferta
+        # (una trasferta può avere più report, es. più clienti visitati nello stesso viaggio).
+        c.execute('''CREATE TABLE IF NOT EXISTS report_interventi (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        trasferta_id INTEGER NOT NULL,
+                        dipendente TEXT NOT NULL,
+                        cliente_luogo TEXT,
+                        descrizione TEXT,
+                        ore_lavoro REAL,
+                        commessa TEXT,
+                        fase TEXT,
+                        data_creazione TEXT
+                    )''')
+
+        # Tabella Foto Report Interventi - le foto vengono ridimensionate/compresse
+        # prima di essere salvate (vedi comprimi_immagine_upload) per non appesantire
+        # troppo il database, soprattutto su un database esterno come Turso.
+        c.execute('''CREATE TABLE IF NOT EXISTS report_interventi_foto (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        report_id INTEGER NOT NULL,
+                        nome_file TEXT,
+                        foto BLOB NOT NULL,
+                        data_caricamento TEXT
+                    )''')
+
         # Inserimento dell'utente Admin di base se il DB è vuoto
         c.execute("SELECT COUNT(*) FROM utenti")
         if c.fetchone()[0] == 0:
@@ -1717,6 +1766,328 @@ def rifiuta_rettifica(rettifica_id):
         conn.commit()
     st.success("❌ Rettifica rifiutata.")
 
+# --- FUNZIONI TRASFERTE SERVICE E REPORT INTERVENTI ---
+# Chi programma le trasferte: l'amministratore, oppure chiunque abbia l'area
+# "Service" impostata sul proprio utente (indipendentemente dal ruolo). Chi compila
+# il report dell'intervento (testo + foto): il dipendente stesso, per una propria
+# trasferta già programmata. La vista "Disponibilità Team" (chi è in sede/trasferta/
+# ferie) è visibile ad amministratore e responsabili di reparto.
+
+def is_area_service(area):
+    """Vero se l'area indicata è (senza distinguere maiuscole/minuscole o spazi) l'area
+    Service, usata per sbloccare la programmazione trasferte a chiunque ne faccia parte."""
+    return str(area or "").strip().lower() == "service"
+
+def valida_trasferta(dipendente, data_inizio, data_fine, mezzo, dettaglio_mezzo):
+    """Validazione dati di una trasferta prima del salvataggio. Restituisce (ok, errore)."""
+    if not dipendente:
+        return False, "Seleziona un operatore."
+    if data_fine < data_inizio:
+        return False, "La data di fine trasferta non può essere precedente alla data di inizio."
+    if mezzo not in ("Auto", "Treno", "Aereo"):
+        return False, "Mezzo di trasporto non valido."
+    if not str(dettaglio_mezzo or "").strip():
+        etichetta = {"Auto": "la targa", "Treno": "il numero del treno", "Aereo": "il numero del volo"}[mezzo]
+        return False, f"Inserisci {etichetta}."
+    return True, ""
+
+def crea_trasferta(dipendente, data_inizio, data_fine, mezzo, dettaglio_mezzo, auto_propria, cliente_luogo, note, creata_da):
+    """Programma una nuova trasferta per un operatore. Restituisce (ok, errore)."""
+    ok, errore = valida_trasferta(dipendente, data_inizio, data_fine, mezzo, dettaglio_mezzo)
+    if not ok:
+        return False, errore
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""INSERT INTO trasferte
+                     (dipendente, data_inizio, data_fine, mezzo, dettaglio_mezzo, auto_propria, cliente_luogo, note, creata_da, data_creazione)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                  (dipendente, data_inizio.isoformat(), data_fine.isoformat(), mezzo, str(dettaglio_mezzo or "").strip(),
+                   1 if auto_propria else 0, str(cliente_luogo or "").strip(), str(note or "").strip(),
+                   creata_da, datetime.date.today().isoformat()))
+        conn.commit()
+    return True, ""
+
+def get_trasferte_dettaglio():
+    """Tutte le trasferte programmate, più recenti prima, per la tabella riassuntiva
+    di chi gestisce l'area Service."""
+    with db_connect() as conn:
+        df = pd.read_sql("""SELECT id AS ID, dipendente AS Dipendente, data_inizio AS Dal, data_fine AS Al,
+                                    mezzo AS Mezzo, dettaglio_mezzo AS Dettaglio,
+                                    CASE WHEN auto_propria=1 THEN 'Sì' ELSE 'No' END AS 'Auto propria',
+                                    cliente_luogo AS 'Cliente/Luogo', note AS Note, creata_da AS 'Programmata da'
+                             FROM trasferte ORDER BY data_inizio DESC, id DESC""", conn)
+    return df
+
+def get_trasferte_dipendente(dipendente):
+    """Trasferte di un singolo dipendente (per la tendina del report intervento),
+    più recenti prima."""
+    with db_connect() as conn:
+        df = pd.read_sql("""SELECT id AS ID, data_inizio AS Dal, data_fine AS Al, cliente_luogo AS 'Cliente/Luogo'
+                             FROM trasferte WHERE dipendente = ? ORDER BY data_inizio DESC, id DESC""",
+                          conn, params=(dipendente,))
+    return df
+
+def elimina_trasferta(trasferta_id):
+    """Elimina una trasferta programmata, ma solo se non ha già un report intervento
+    collegato (altrimenti chiede di eliminare prima quello). Restituisce (ok, errore)."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM report_interventi WHERE trasferta_id = ?", (trasferta_id,))
+        if c.fetchone()[0] > 0:
+            return False, "Questa trasferta ha già un report intervento collegato: elimina prima quello."
+        c.execute("DELETE FROM trasferte WHERE id = ?", (trasferta_id,))
+        conn.commit()
+    return True, ""
+
+def comprimi_immagine_upload(uploaded_file, max_dimensione=1600, qualita=80):
+    """Ridimensiona e comprime una foto caricata (JPEG) prima di salvarla nel
+    database, per non appesantirlo troppo: soprattutto su un database esterno come
+    Turso, foto non compresse potrebbero esaurire rapidamente lo spazio disponibile."""
+    if not PIL_AVAILABLE:
+        return uploaded_file.getvalue()
+    immagine = PIL_Image.open(uploaded_file)
+    if immagine.mode not in ("RGB",):
+        immagine = immagine.convert("RGB")
+    larghezza, altezza = immagine.size
+    lato_massimo = max(larghezza, altezza)
+    if lato_massimo > max_dimensione:
+        fattore = max_dimensione / lato_massimo
+        immagine = immagine.resize((int(larghezza * fattore), int(altezza * fattore)))
+    buffer_immagine = BytesIO()
+    immagine.save(buffer_immagine, format="JPEG", quality=qualita)
+    return buffer_immagine.getvalue()
+
+def salva_report_intervento(trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, foto_caricate):
+    """Salva il report di un intervento (testo + eventuali foto compresse) per una
+    trasferta del dipendente. Restituisce (ok, errore)."""
+    if not descrizione or not str(descrizione).strip():
+        return False, "Inserisci una descrizione del lavoro svolto."
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""INSERT INTO report_interventi
+                     (trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, data_creazione)
+                     VALUES (?,?,?,?,?,?,?,?)""",
+                  (trasferta_id, dipendente, str(cliente_luogo or "").strip(), str(descrizione).strip(),
+                   float(ore_lavoro) if ore_lavoro else 0.0, commessa, fase, datetime.date.today().isoformat()))
+        report_id = c.lastrowid
+        oggi_str = datetime.date.today().isoformat()
+        for foto in (foto_caricate or []):
+            dati_foto = comprimi_immagine_upload(foto)
+            c.execute("INSERT INTO report_interventi_foto (report_id, nome_file, foto, data_caricamento) VALUES (?,?,?,?)",
+                      (report_id, foto.name, dati_foto, oggi_str))
+        conn.commit()
+    return True, ""
+
+def get_report_interventi_dettaglio(dipendente=None, area=None):
+    """Report interventi (con dati della trasferta collegata e numero di foto
+    allegate), filtrabili per dipendente o per area."""
+    query = """SELECT r.id AS ID, r.dipendente AS Dipendente, t.data_inizio AS 'Trasferta dal', t.data_fine AS 'Trasferta al',
+                      r.cliente_luogo AS 'Cliente/Luogo', r.descrizione AS Descrizione, r.ore_lavoro AS 'Ore lavoro',
+                      r.commessa AS Commessa, r.fase AS Fase, r.data_creazione AS 'Data report',
+                      (SELECT COUNT(*) FROM report_interventi_foto f WHERE f.report_id = r.id) AS 'N. foto'
+               FROM report_interventi r LEFT JOIN trasferte t ON r.trasferta_id = t.id"""
+    condizioni, parametri = [], []
+    if dipendente:
+        condizioni.append("r.dipendente = ?")
+        parametri.append(dipendente)
+    if area and area != "Tutte le aree":
+        mappa_aree = get_users_area_map()
+        dipendenti_area = [nome for nome, area_nome in mappa_aree.items() if area_nome == area]
+        if not dipendenti_area:
+            return pd.DataFrame(columns=["ID", "Dipendente", "Trasferta dal", "Trasferta al", "Cliente/Luogo",
+                                          "Descrizione", "Ore lavoro", "Commessa", "Fase", "Data report", "N. foto"])
+        condizioni.append(f"r.dipendente IN ({','.join('?' for _ in dipendenti_area)})")
+        parametri.extend(dipendenti_area)
+    if condizioni:
+        query += " WHERE " + " AND ".join(condizioni)
+    query += " ORDER BY r.data_creazione DESC, r.id DESC"
+    with db_connect() as conn:
+        df = pd.read_sql(query, conn, params=tuple(parametri))
+    return df
+
+def get_foto_report(report_id):
+    """Elenco (nome_file, dati_foto) delle foto allegate a un report intervento."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome_file, foto FROM report_interventi_foto WHERE report_id = ?", (report_id,))
+        return c.fetchall()
+
+def compute_disponibilita_giornaliera(data_riferimento, area_filter=None):
+    """Per il giorno indicato, restituisce lo stato di ogni dipendente: 'Ferie/
+    Permesso' se ha una richiesta approvata che copre quel giorno, 'In trasferta' se
+    ha una trasferta programmata che lo copre, altrimenti 'In sede'. È una vista di
+    pianificazione basata sulle richieste approvate e sulle trasferte programmate,
+    NON sulle timbrature effettive del giorno."""
+    area_scelta = area_filter or "Tutte le aree"
+    dipendenti = get_users_in_area(area_scelta)
+    if not dipendenti:
+        return pd.DataFrame(columns=["Dipendente", "Area", "Stato", "Dettaglio"])
+
+    mappa_aree = get_users_area_map()
+    data_iso = data_riferimento.isoformat()
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT Dipendente, Tipo FROM richieste WHERE Stato = 'Approvato'
+                     AND Data_inizio <= ? AND Data_fine >= ?""", (data_iso, data_iso))
+        ferie_permessi = {row[0]: row[1] for row in c.fetchall()}
+        c.execute("""SELECT dipendente, cliente_luogo FROM trasferte
+                     WHERE data_inizio <= ? AND data_fine >= ?""", (data_iso, data_iso))
+        trasferte_in_corso = {row[0]: row[1] for row in c.fetchall()}
+
+    righe = []
+    for nome in dipendenti:
+        if nome in ferie_permessi:
+            righe.append({"Dipendente": nome, "Area": mappa_aree.get(nome, "Unknown"),
+                          "Stato": ferie_permessi[nome], "Dettaglio": ""})
+        elif nome in trasferte_in_corso:
+            righe.append({"Dipendente": nome, "Area": mappa_aree.get(nome, "Unknown"),
+                          "Stato": "In trasferta", "Dettaglio": trasferte_in_corso[nome] or ""})
+        else:
+            righe.append({"Dipendente": nome, "Area": mappa_aree.get(nome, "Unknown"),
+                          "Stato": "In sede", "Dettaglio": ""})
+    return pd.DataFrame(righe)
+
+def render_gestione_trasferte_service(attore_nome, key_prefix):
+    """Pagina di programmazione trasferte: scelta dell'operatore tra tutti i
+    dipendenti, date, mezzo di trasporto e relativo dettaglio (targa/numero treno o
+    volo). Accessibile all'amministratore e a chiunque faccia parte dell'area Service."""
+    st.subheader("🧳 Programmazione Trasferte (Service)")
+
+    st.markdown("**Nuova trasferta**")
+    operatori_disponibili = get_user_names()
+    if not operatori_disponibili:
+        st.warning("Nessun dipendente disponibile.")
+        return
+    operatore_scelto = st.selectbox("Operatore", operatori_disponibili, key=f"{key_prefix}_trasf_operatore")
+    col_data1, col_data2 = st.columns(2)
+    with col_data1:
+        data_inizio_trasf = st.date_input("Data inizio trasferta", value=datetime.date.today(), key=f"{key_prefix}_trasf_inizio")
+    with col_data2:
+        data_fine_trasf = st.date_input("Data fine trasferta", value=datetime.date.today(), key=f"{key_prefix}_trasf_fine")
+    cliente_luogo_trasf = st.text_input("Cliente / luogo della trasferta", key=f"{key_prefix}_trasf_luogo")
+    mezzo_trasf = st.radio("Mezzo di trasporto", ["Auto", "Treno", "Aereo"], horizontal=True, key=f"{key_prefix}_trasf_mezzo")
+
+    auto_propria_trasf = False
+    if mezzo_trasf == "Auto":
+        auto_propria_trasf = st.checkbox("Auto propria (non aziendale)", key=f"{key_prefix}_trasf_auto_propria")
+        dettaglio_mezzo_trasf = st.text_input("Targa", key=f"{key_prefix}_trasf_targa")
+    elif mezzo_trasf == "Treno":
+        dettaglio_mezzo_trasf = st.text_input("Numero treno", key=f"{key_prefix}_trasf_treno")
+    else:
+        dettaglio_mezzo_trasf = st.text_input("Numero volo", key=f"{key_prefix}_trasf_volo")
+
+    note_trasf = st.text_area("Note (opzionale)", key=f"{key_prefix}_trasf_note")
+
+    if st.button("💾 Programma trasferta", key=f"{key_prefix}_trasf_salva"):
+        ok, errore = crea_trasferta(operatore_scelto, data_inizio_trasf, data_fine_trasf, mezzo_trasf,
+                                     dettaglio_mezzo_trasf, auto_propria_trasf, cliente_luogo_trasf,
+                                     note_trasf, attore_nome)
+        if ok:
+            st.success(f"Trasferta programmata per {operatore_scelto}.")
+            st.rerun()
+        else:
+            st.error(errore)
+
+    st.markdown("---")
+    st.markdown("**Trasferte programmate**")
+    trasferte_df = get_trasferte_dettaglio()
+    if trasferte_df.empty:
+        st.info("Nessuna trasferta programmata.")
+    else:
+        st.dataframe(trasferte_df, use_container_width=True)
+
+        st.markdown("**Elimina una trasferta**")
+        opzioni_elimina = [f"#{id_} - {dip} ({dal} → {al})" for id_, dip, dal, al in
+                            zip(trasferte_df["ID"], trasferte_df["Dipendente"], trasferte_df["Dal"], trasferte_df["Al"])]
+        mappa_id_elimina = dict(zip(opzioni_elimina, trasferte_df["ID"].tolist()))
+        if opzioni_elimina:
+            scelta_elimina = st.selectbox("Trasferta da eliminare", opzioni_elimina, key=f"{key_prefix}_trasf_elimina_select")
+            if st.button("🗑️ Elimina trasferta selezionata", key=f"{key_prefix}_trasf_elimina_btn"):
+                ok, errore = elimina_trasferta(mappa_id_elimina[scelta_elimina])
+                if ok:
+                    st.success("Trasferta eliminata.")
+                    st.rerun()
+                else:
+                    st.error(errore)
+
+def render_report_intervento(dipendente_nome, key_prefix):
+    """Il dipendente compila il report di un intervento svolto durante una propria
+    trasferta già programmata (cliente/luogo, descrizione, ore, commessa/fase) e può
+    allegare una o più foto."""
+    st.subheader("📷 Report Intervento")
+    trasferte_dipendente = get_trasferte_dipendente(dipendente_nome)
+    if trasferte_dipendente.empty:
+        st.info("Non hai ancora trasferte programmate a cui associare un report. Contatta l'area Service.")
+        return
+
+    opzioni_trasferta = [
+        f"{dal} → {al}" + (f" ({luogo})" if luogo else "")
+        for dal, al, luogo in zip(trasferte_dipendente["Dal"], trasferte_dipendente["Al"], trasferte_dipendente["Cliente/Luogo"])
+    ]
+    mappa_trasferta_id = dict(zip(opzioni_trasferta, trasferte_dipendente["ID"].tolist()))
+    trasferta_scelta_label = st.selectbox("Trasferta di riferimento", opzioni_trasferta, key=f"{key_prefix}_rep_trasferta")
+    trasferta_id_scelta = mappa_trasferta_id[trasferta_scelta_label]
+
+    cliente_luogo_rep = st.text_input("Cliente / luogo dell'intervento", key=f"{key_prefix}_rep_luogo")
+    descrizione_rep = st.text_area("Descrizione del lavoro svolto", key=f"{key_prefix}_rep_descrizione")
+    ore_lavoro_rep = st.number_input("Ore di lavoro sul posto", min_value=0.0, step=0.5, key=f"{key_prefix}_rep_ore")
+
+    commesse_rep = get_commesse_names()
+    commessa_rep, fase_rep = None, None
+    if commesse_rep:
+        commessa_scelta_rep = st.selectbox("Commessa (opzionale)", ["(nessuna)"] + commesse_rep, key=f"{key_prefix}_rep_commessa")
+        if commessa_scelta_rep != "(nessuna)":
+            commessa_rep = commessa_scelta_rep
+            fasi_rep = get_fasi_per_commessa_e_area(commessa_rep, get_user_area_by_name(dipendente_nome))
+            if fasi_rep:
+                fase_scelta_rep = st.selectbox("Fase (opzionale)", ["(nessuna)"] + fasi_rep, key=f"{key_prefix}_rep_fase")
+                fase_rep = fase_scelta_rep if fase_scelta_rep != "(nessuna)" else None
+
+    if not PIL_AVAILABLE:
+        st.caption("ℹ️ Le foto verranno salvate senza compressione (libreria Pillow non disponibile).")
+    foto_caricate = st.file_uploader("Foto dell'intervento (opzionale, puoi caricarne più di una)",
+                                      type=["png", "jpg", "jpeg"], accept_multiple_files=True,
+                                      key=f"{key_prefix}_rep_foto")
+
+    if st.button("💾 Salva report intervento", key=f"{key_prefix}_rep_salva"):
+        ok, errore = salva_report_intervento(trasferta_id_scelta, dipendente_nome, cliente_luogo_rep,
+                                              descrizione_rep, ore_lavoro_rep, commessa_rep, fase_rep, foto_caricate)
+        if ok:
+            st.success("Report salvato.")
+            st.rerun()
+        else:
+            st.error(errore)
+
+    st.markdown("---")
+    st.markdown("**I tuoi report inviati**")
+    report_dip = get_report_interventi_dettaglio(dipendente=dipendente_nome)
+    if report_dip.empty:
+        st.info("Nessun report inviato finora.")
+    else:
+        st.dataframe(report_dip.drop(columns=["Dipendente"]), use_container_width=True)
+
+def render_disponibilita_team(area_default=None, forza_area=False, key_prefix=""):
+    """Vista 'chi è dove' per un giorno scelto: in sede, in trasferta o in ferie/
+    permesso. È una vista di pianificazione basata sulle trasferte programmate e
+    sulle richieste ferie/permessi già approvate, non sulle timbrature effettive."""
+    st.subheader("📅 Disponibilità Team")
+    data_riferimento = st.date_input("Giorno", value=datetime.date.today(), key=f"{key_prefix}_disp_data")
+
+    if forza_area:
+        area_scelta = area_default
+        st.caption(f"Reparto: {area_scelta}")
+    else:
+        aree_disponibili = get_area_names()
+        area_scelta = st.selectbox("Reparto", aree_disponibili, key=f"{key_prefix}_disp_area")
+
+    disponibilita_df = compute_disponibilita_giornaliera(data_riferimento, area_scelta)
+    if disponibilita_df.empty:
+        st.info("Nessun dipendente trovato per questo reparto.")
+        return
+    st.dataframe(disponibilita_df, use_container_width=True)
+    st.caption("Basata sulle trasferte programmate e sulle richieste ferie/permessi già approvate: se un dipendente non risulta né in trasferta né in ferie/permesso viene mostrato come 'In sede', indipendentemente dalle timbrature effettive del giorno.")
+
 # --- FUNZIONI RUOLO RESPONSABILE ---
 
 def get_responsabile_area(area):
@@ -2771,7 +3142,7 @@ else:
         st.info("Sei connesso come amministratore. Puoi visualizzare i timbri di tutti gli utenti.")
         st.markdown("---")
 
-        admin_page = st.sidebar.radio("Sezione amministratore", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Gestione Commesse", "Resoconto Commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "Gestione Utenti DB"])
+        admin_page = st.sidebar.radio("Sezione amministratore", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Gestione Commesse", "Resoconto Commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "🧳 Trasferte e Interventi (Service)", "📅 Disponibilità Team", "Gestione Utenti DB"])
 
         if admin_page == "Dati e Presenze":
             st.subheader("📊 Pannello Amministrazione")
@@ -3282,6 +3653,30 @@ else:
                         st.success(f"Livello '{livello_sel}' eliminato. Gli utenti con questo livello useranno i valori di default aziendali.")
                         st.rerun()
 
+        if admin_page == "🧳 Trasferte e Interventi (Service)":
+            render_gestione_trasferte_service(user_info["name"], key_prefix="admin")
+            st.markdown("---")
+            st.markdown("**Report interventi ricevuti**")
+            report_tutti = get_report_interventi_dettaglio()
+            if report_tutti.empty:
+                st.info("Nessun report intervento inviato finora.")
+            else:
+                st.dataframe(report_tutti, use_container_width=True)
+                opzioni_foto = [f"#{id_} - {dip} ({data_rep})" for id_, dip, data_rep in
+                                 zip(report_tutti["ID"], report_tutti["Dipendente"], report_tutti["Data report"])]
+                mappa_report_id = dict(zip(opzioni_foto, report_tutti["ID"].tolist()))
+                report_da_vedere = st.selectbox("Vedi foto del report", ["(nessuno)"] + opzioni_foto, key="admin_report_foto_select")
+                if report_da_vedere != "(nessuno)":
+                    foto_report = get_foto_report(mappa_report_id[report_da_vedere])
+                    if not foto_report:
+                        st.info("Nessuna foto allegata a questo report.")
+                    else:
+                        for nome_file, dati_foto in foto_report:
+                            st.image(dati_foto, caption=nome_file, use_container_width=True)
+
+        if admin_page == "📅 Disponibilità Team":
+            render_disponibilita_team(key_prefix="admin")
+
         if not df.empty and admin_page == "Dati e Presenze":
             st.markdown("---")
             export_df = prepare_registro_for_export(df, selected_user=selected_user, start_date=start_date, end_date=end_date)
@@ -3303,13 +3698,17 @@ else:
         st.info("🔧 Sei connesso come Responsabile. Accedi a funzioni personali e di gestione team.")
         st.markdown("---")
         
-        # Selettore principale: Mie funzioni vs Gestione Team
-        modalita = st.sidebar.radio("📌 Modalità", ["Mie funzioni personali", "Gestione Team"])
-        
+        # Selettore principale: Mie funzioni vs Gestione Team (più Trasferte Service
+        # se il responsabile fa parte dell'area Service)
+        opzioni_modalita = ["Mie funzioni personali", "Gestione Team"]
+        if is_area_service(user_info["area"]):
+            opzioni_modalita.append("🧳 Trasferte Service")
+        modalita = st.sidebar.radio("📌 Modalità", opzioni_modalita)
+
         if modalita == "Mie funzioni personali":
             # *** REPLICA DELLA SEZIONE UTENTE PER IL RESPONSABILE ***
             dipendente_scelto = user_info["name"]
-            pagina_utente = st.sidebar.radio("Funzione personale", ["Profilo", "Timbrature", "Riepilogo personale", "Report mensile", "Richiesta ferie/permessi", "Richiesta rettifica"])
+            pagina_utente = st.sidebar.radio("Funzione personale", ["Profilo", "Timbrature", "Riepilogo personale", "Report mensile", "📷 Report Intervento", "Richiesta ferie/permessi", "Richiesta rettifica"])
 
             if pagina_utente == "Profilo":
                 st.subheader("👤 Profilo personale")
@@ -3438,6 +3837,9 @@ else:
             elif pagina_utente == "Report mensile":
                 render_report_mensile(dipendente_scelto, df, key_prefix="resp")
 
+            elif pagina_utente == "📷 Report Intervento":
+                render_report_intervento(dipendente_scelto, key_prefix="resp")
+
             elif pagina_utente == "Richiesta ferie/permessi":
                 st.subheader("Richiesta ferie / permessi")
                 tipo_richiesta = st.radio("Tipo", ["Ferie", "Permesso"])
@@ -3470,15 +3872,15 @@ else:
                 st.write("### Tutte le tue rettifiche")
                 st.dataframe(carica_rettifiche()[carica_rettifiche()["Dipendente"] == dipendente_scelto], use_container_width=True)
         
-        else:
+        elif modalita == "Gestione Team":
             # *** SEZIONE GESTIONE TEAM (ORIGINALE DEL RESPONSABILE) ***
             st.subheader("📊 Pannello Responsabile - Gestione Team")
-            
+
             area_responsabile = user_info["area"]
             dipendenti_area = get_users_in_area(area_responsabile)
-            
-            resp_page = st.sidebar.radio("Sezione team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature", "Statistiche area", "Resoconto Commesse", "Gestione fasi commessa"])
-            
+
+            resp_page = st.sidebar.radio("Sezione team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature", "Statistiche area", "Resoconto Commesse", "Gestione fasi commessa", "📅 Disponibilità Team"])
+
             if resp_page == "Timbrature del team":
                 st.subheader(f"📋 Timbrature - Area: {area_responsabile}")
                 df_filtrato = df[df["Dipendente"].isin(dipendenti_area)] if not df.empty else pd.DataFrame()
@@ -3603,10 +4005,26 @@ else:
                     else:
                         st.info("Il tuo reparto è sotto la media aziendale in questo periodo.")
 
+            elif resp_page == "📅 Disponibilità Team":
+                render_disponibilita_team(area_default=area_responsabile, forza_area=True, key_prefix="resp")
+
+        elif modalita == "🧳 Trasferte Service":
+            render_gestione_trasferte_service(user_info["name"], key_prefix="resp_service")
+            st.markdown("---")
+            st.markdown("**Report interventi ricevuti**")
+            report_area_service = get_report_interventi_dettaglio()
+            if report_area_service.empty:
+                st.info("Nessun report intervento inviato finora.")
+            else:
+                st.dataframe(report_area_service, use_container_width=True)
+
     else:
         # --- LATO UTENTE ---
         dipendente_scelto = user_info["name"]
-        pagina_utente = st.sidebar.radio("Funzione utente", ["Profilo", "Timbrature", "Riepilogo personale", "Report mensile", "Richiesta ferie/permessi", "Richiesta rettifica"])
+        pagina_utente_opzioni = ["Profilo", "Timbrature", "Riepilogo personale", "Report mensile", "📷 Report Intervento", "Richiesta ferie/permessi", "Richiesta rettifica"]
+        if is_area_service(user_info["area"]):
+            pagina_utente_opzioni.append("🧳 Trasferte Service")
+        pagina_utente = st.sidebar.radio("Funzione utente", pagina_utente_opzioni)
 
         if pagina_utente == "Profilo":
             st.subheader("👤 Profilo personale")
@@ -3776,6 +4194,19 @@ else:
 
         elif pagina_utente == "Report mensile":
             render_report_mensile(dipendente_scelto, df, key_prefix="user")
+
+        elif pagina_utente == "📷 Report Intervento":
+            render_report_intervento(dipendente_scelto, key_prefix="user")
+
+        elif pagina_utente == "🧳 Trasferte Service":
+            render_gestione_trasferte_service(user_info["name"], key_prefix="user_service")
+            st.markdown("---")
+            st.markdown("**Report interventi ricevuti**")
+            report_utente_service = get_report_interventi_dettaglio()
+            if report_utente_service.empty:
+                st.info("Nessun report intervento inviato finora.")
+            else:
+                st.dataframe(report_utente_service, use_container_width=True)
 
         elif pagina_utente == "Richiesta ferie/permessi":
             st.subheader("Richiesta ferie / permessi")
