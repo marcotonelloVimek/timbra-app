@@ -1,0 +1,18 @@
+streamlit
+pandas
+altair
+pytz
+streamlit-autorefresh
+reportlab
+
+# Necessario SOLO se configuri un database esterno Turso (TURSO_DATABASE_URL /
+# TURSO_AUTH_TOKEN), ad esempio per il deploy su Streamlit Community Cloud senza
+# perdere i dati ad ogni riavvio. Se resti sul file SQLite locale, puoi lasciare
+# questa riga commentata.
+# IMPORTANTE: prima di attivarla in produzione, esegui test_connessione_turso.py in
+# locale per confermare che questo pacchetto funzioni davvero con il tuo database.
+# Si usa "libsql" (pacchetto ufficiale tursodatabase/libsql-python): è quello
+# attivamente mantenuto e con interfaccia sincrona identica a sqlite3. Un'altra
+# libreria ("turso_serverless") è stata scartata dopo un test reale perché ha dato un
+# errore nella verifica del token di autenticazione.
+# libsql
