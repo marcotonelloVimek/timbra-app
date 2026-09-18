@@ -56,6 +56,7 @@ try:
         Paragraph = reportlab_platypus.Paragraph
         Spacer = reportlab_platypus.Spacer
         PageBreak = reportlab_platypus.PageBreak
+        Image = reportlab_platypus.Image
         colors = reportlab_lib.colors
         PDF_AVAILABLE = True
     else:
@@ -63,14 +64,14 @@ try:
         letter = A4 = landscape = None
         getSampleStyleSheet = ParagraphStyle = None
         inch = None
-        SimpleDocTemplate = Table = TableStyle = Paragraph = Spacer = PageBreak = None
+        SimpleDocTemplate = Table = TableStyle = Paragraph = Spacer = PageBreak = Image = None
         colors = None
 except Exception:
     PDF_AVAILABLE = False
     letter = A4 = landscape = None
     getSampleStyleSheet = ParagraphStyle = None
     inch = None
-    SimpleDocTemplate = Table = TableStyle = Paragraph = Spacer = PageBreak = None
+    SimpleDocTemplate = Table = TableStyle = Paragraph = Spacer = PageBreak = Image = None
     colors = None
 
 try:
@@ -663,16 +664,26 @@ def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, 
         story = []
         styles = getSampleStyleSheet()
         
-        # Titolo
+        # Titolo (stesso blu Vimek e stesso logo usati nel sito)
         title_style = ParagraphStyle(
             'CustomTitle',
             parent=styles['Heading1'],
             fontSize=24,
-            textColor=colors.HexColor('#1f77b4'),
+            textColor=colors.HexColor(VIMEK_NAVY),
             spaceAfter=6,
             alignment=1
         )
-        story.append(Paragraph("📊 RAPPORTO TIMBRATURE", title_style))
+        logo_pdf = _logo_reportlab_image()
+        if logo_pdf is not None:
+            intestazione_logo = Table([[logo_pdf, Paragraph("RAPPORTO TIMBRATURE", title_style)]],
+                                       colWidths=[0.85 * inch, None])
+            intestazione_logo.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+            ]))
+            story.append(intestazione_logo)
+        else:
+            story.append(Paragraph("📊 RAPPORTO TIMBRATURE", title_style))
         story.append(Spacer(1, 0.2*inch))
         
         # Informazioni dipendente
@@ -711,13 +722,13 @@ def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, 
             col_widths = ([1.1*inch] if multi_dipendente else []) + [1.1*inch, 1.2*inch, 1*inch, 0.8*inch, 1.4*inch]
             table = Table(table_data, colWidths=col_widths)
             stile_tabella = [
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f77b4')),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(VIMEK_NAVY)),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
                 ('FONTSIZE', (0, 0), (-1, 0), 9),
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#c9d3dc')),
                 ('FONTSIZE', (0, 1), (-1, -1), 8),
             ]
             if multi_dipendente:
@@ -725,7 +736,7 @@ def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, 
                     colore_riga = colori_dipendenti.get(str(row.get('Dipendente', '')), '#f5f5dc')
                     stile_tabella.append(('BACKGROUND', (0, i), (-1, i), colors.HexColor(colore_riga)))
             else:
-                stile_tabella.append(('BACKGROUND', (0, 1), (-1, -1), colors.beige))
+                stile_tabella.append(('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#eef3f8')))
             table.setStyle(TableStyle(stile_tabella))
             story.append(table)
             story.append(Spacer(1, 0.2*inch))
@@ -762,8 +773,19 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
         styles = getSampleStyleSheet()
 
         title_style = ParagraphStyle('CartellinoTitle', parent=styles['Heading1'], fontSize=18,
-                                      textColor=colors.HexColor('#1f77b4'), spaceAfter=6, alignment=1)
-        story.append(Paragraph(f"🗓️ CARTELLINO MENSILE — {calendar.month_name[mese].capitalize()} {anno}", title_style))
+                                      textColor=colors.HexColor(VIMEK_NAVY), spaceAfter=6, alignment=1)
+        titolo_cartellino = f"CARTELLINO MENSILE — {calendar.month_name[mese].capitalize()} {anno}"
+        logo_pdf = _logo_reportlab_image()
+        if logo_pdf is not None:
+            intestazione_logo = Table([[logo_pdf, Paragraph(titolo_cartellino, title_style)]],
+                                       colWidths=[0.75 * inch, None])
+            intestazione_logo.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+            ]))
+            story.append(intestazione_logo)
+        else:
+            story.append(Paragraph(f"🗓️ {titolo_cartellino}", title_style))
         story.append(Spacer(1, 0.15*inch))
 
         info_style = styles['Normal']
@@ -789,15 +811,15 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
             col_widths = [0.85*inch, 0.65*inch, 0.65*inch, 0.65*inch, 0.65*inch, 3.1*inch, 1.0*inch, 0.55*inch, 0.6*inch]
             table = Table(table_data, colWidths=col_widths, repeatRows=1)
             stile_tabella = [
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f77b4')),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(VIMEK_NAVY)),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
                 ('FONTSIZE', (0, 0), (-1, 0), 8),
                 ('FONTSIZE', (0, 1), (-1, -1), 7),
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#c9d3dc')),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#eef3f8')),
             ]
             table.setStyle(TableStyle(stile_tabella))
             story.append(table)
@@ -925,6 +947,27 @@ def _render_logo_header(container=None, centrato=False):
         <span>VIMEK</span>
     </div>
     """, unsafe_allow_html=True)
+
+
+def _logo_reportlab_image(altezza=0.5 * inch if PDF_AVAILABLE else None):
+    """Restituisce il logo Vimek come immagine ReportLab pronta per l'intestazione dei
+    PDF (stessa immagine usata nel sito), mantenendone le proporzioni originali.
+    Se ReportLab non e' disponibile restituisce None e i PDF vengono generati senza
+    immagine (solo con il titolo colorato in blu Vimek)."""
+    if not PDF_AVAILABLE or Image is None:
+        return None
+    try:
+        logo_bytes = base64.b64decode(VIMEK_LOGO_BASE64)
+        larghezza_px, altezza_px = 2496, 2424
+        if PIL_AVAILABLE:
+            try:
+                larghezza_px, altezza_px = PIL_Image.open(BytesIO(logo_bytes)).size
+            except Exception:
+                pass
+        larghezza = altezza * (larghezza_px / altezza_px)
+        return Image(BytesIO(logo_bytes), width=larghezza, height=altezza)
+    except Exception:
+        return None
 # --- FINE IDENTITA' VISIVA VIMEK ----------------------------------------------------
 
 st.set_page_config(page_title="Timbra - Vimek", page_icon="🏢", layout="wide")
