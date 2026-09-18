@@ -435,20 +435,45 @@ def init_db():
                     )''')
 
         # Tabella Trasferte - programmate da chi fa parte dell'area Service (o
-        # dall'admin) per un operatore scelto tra tutti i dipendenti.
+        # dall'admin) per un operatore scelto tra tutti i dipendenti. Il cliente si
+        # ricava dalla commessa scelta (non si inserisce a mano); luogo di lavoro
+        # (stato/indirizzo) e albergo sono campi liberi, dato che l'azienda lavora in
+        # tutto il mondo; i mezzi di trasporto sono più di uno selezionabile insieme
+        # (es. Aereo per arrivare + Auto a noleggio per muoversi sul posto).
         c.execute('''CREATE TABLE IF NOT EXISTS trasferte (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         dipendente TEXT NOT NULL,
                         data_inizio TEXT NOT NULL,
                         data_fine TEXT NOT NULL,
-                        mezzo TEXT NOT NULL,
-                        dettaglio_mezzo TEXT,
+                        commessa TEXT,
+                        cliente TEXT,
+                        stato TEXT,
+                        indirizzo TEXT,
+                        albergo TEXT,
+                        mezzi TEXT,
+                        dettaglio_auto TEXT,
                         auto_propria INTEGER NOT NULL DEFAULT 0,
-                        cliente_luogo TEXT,
+                        dettaglio_treno TEXT,
+                        dettaglio_aereo TEXT,
+                        dettaglio_auto_noleggio TEXT,
                         note TEXT,
                         creata_da TEXT,
                         data_creazione TEXT
                     )''')
+        # Migrazione: aggiungi le nuove colonne se la tabella esisteva già in una
+        # versione precedente (con un solo campo "cliente_luogo" e un solo "mezzo").
+        # Le vecchie colonne mezzo/dettaglio_mezzo/cliente_luogo restano nel database
+        # per compatibilità con eventuali righe già create, ma non vengono più usate.
+        for colonna_trasferta, tipo_colonna in [
+            ("commessa", "TEXT"), ("cliente", "TEXT"), ("stato", "TEXT"), ("indirizzo", "TEXT"),
+            ("albergo", "TEXT"), ("mezzi", "TEXT"), ("dettaglio_auto", "TEXT"),
+            ("dettaglio_treno", "TEXT"), ("dettaglio_aereo", "TEXT"), ("dettaglio_auto_noleggio", "TEXT"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE trasferte ADD COLUMN {colonna_trasferta} {tipo_colonna}")
+                conn.commit()
+            except db_migration_error_classes():
+                pass  # Colonna già esistente
 
         # Tabella Report Interventi - compilata dal dipendente per una sua trasferta
         # (una trasferta può avere più report, es. più clienti visitati nello stesso viaggio).
@@ -1786,32 +1811,76 @@ def is_area_service(area):
     Service, usata per sbloccare la programmazione trasferte a chiunque ne faccia parte."""
     return str(area or "").strip().lower() == "service"
 
-def valida_trasferta(dipendente, data_inizio, data_fine, mezzo, dettaglio_mezzo):
+MEZZI_TRASPORTO_DISPONIBILI = ["Auto", "Treno", "Aereo", "Auto a noleggio"]
+
+def get_cliente_commessa(commessa):
+    """Cliente associato a una commessa (l'anagrafica cliente si inserisce solo in
+    'Gestione Commesse': qui si ricava, non si reinserisce a mano)."""
+    if not commessa:
+        return ""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT cliente FROM commesse WHERE nome = ?", (commessa,))
+        row = c.fetchone()
+        return row[0] or "" if row else ""
+
+def get_paese_commessa(commessa):
+    """Paese di installazione di una commessa, usato solo come suggerimento di
+    partenza per il campo 'Stato' della trasferta (resta comunque modificabile,
+    perché la trasferta potrebbe non essere nel paese della commessa)."""
+    if not commessa:
+        return ""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT paese FROM commesse WHERE nome = ?", (commessa,))
+        row = c.fetchone()
+        return row[0] or "" if row else ""
+
+def valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati, dettaglio_auto, dettaglio_treno, dettaglio_aereo):
     """Validazione dati di una trasferta prima del salvataggio. Restituisce (ok, errore)."""
     if not dipendente:
         return False, "Seleziona un operatore."
+    if not commessa:
+        return False, "Seleziona la commessa su cui si baserà la trasferta (serve a determinare il cliente)."
     if data_fine < data_inizio:
         return False, "La data di fine trasferta non può essere precedente alla data di inizio."
-    if mezzo not in ("Auto", "Treno", "Aereo"):
-        return False, "Mezzo di trasporto non valido."
-    if not str(dettaglio_mezzo or "").strip():
-        etichetta = {"Auto": "la targa", "Treno": "il numero del treno", "Aereo": "il numero del volo"}[mezzo]
-        return False, f"Inserisci {etichetta}."
+    if not mezzi_selezionati:
+        return False, "Seleziona almeno un mezzo di trasporto."
+    if "Auto" in mezzi_selezionati and not str(dettaglio_auto or "").strip():
+        return False, "Inserisci la targa dell'auto."
+    if "Treno" in mezzi_selezionati and not str(dettaglio_treno or "").strip():
+        return False, "Inserisci il numero del treno."
+    if "Aereo" in mezzi_selezionati and not str(dettaglio_aereo or "").strip():
+        return False, "Inserisci il numero del volo."
     return True, ""
 
-def crea_trasferta(dipendente, data_inizio, data_fine, mezzo, dettaglio_mezzo, auto_propria, cliente_luogo, note, creata_da):
-    """Programma una nuova trasferta per un operatore. Restituisce (ok, errore)."""
-    ok, errore = valida_trasferta(dipendente, data_inizio, data_fine, mezzo, dettaglio_mezzo)
+def crea_trasferta(dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi_selezionati,
+                    dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio,
+                    note, creata_da):
+    """Programma una nuova trasferta per un operatore, su una commessa (da cui si
+    ricava il cliente), con uno o più mezzi di trasporto insieme (es. aereo per
+    arrivare + auto a noleggio per muoversi sul posto). Restituisce (ok, errore)."""
+    ok, errore = valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati,
+                                   dettaglio_auto, dettaglio_treno, dettaglio_aereo)
     if not ok:
         return False, errore
+    cliente = get_cliente_commessa(commessa)
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""INSERT INTO trasferte
-                     (dipendente, data_inizio, data_fine, mezzo, dettaglio_mezzo, auto_propria, cliente_luogo, note, creata_da, data_creazione)
-                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                  (dipendente, data_inizio.isoformat(), data_fine.isoformat(), mezzo, str(dettaglio_mezzo or "").strip(),
-                   1 if auto_propria else 0, str(cliente_luogo or "").strip(), str(note or "").strip(),
-                   creata_da, datetime.date.today().isoformat()))
+                     (dipendente, data_inizio, data_fine, commessa, cliente, stato, indirizzo, albergo, mezzi,
+                      dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio,
+                      note, creata_da, data_creazione)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (dipendente, data_inizio.isoformat(), data_fine.isoformat(), commessa, cliente,
+                   str(stato or "").strip(), str(indirizzo or "").strip(), str(albergo or "").strip(),
+                   ",".join(mezzi_selezionati),
+                   str(dettaglio_auto or "").strip() if "Auto" in mezzi_selezionati else "",
+                   1 if (auto_propria and "Auto" in mezzi_selezionati) else 0,
+                   str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
+                   str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
+                   str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
+                   str(note or "").strip(), creata_da, datetime.date.today().isoformat()))
         conn.commit()
     return True, ""
 
@@ -1820,9 +1889,11 @@ def get_trasferte_dettaglio():
     di chi gestisce l'area Service."""
     with db_connect() as conn:
         df = pd.read_sql("""SELECT id AS ID, dipendente AS Dipendente, data_inizio AS Dal, data_fine AS Al,
-                                    mezzo AS Mezzo, dettaglio_mezzo AS Dettaglio,
+                                    commessa AS Commessa, cliente AS Cliente, stato AS Stato, indirizzo AS Indirizzo,
+                                    albergo AS Albergo, mezzi AS Mezzi, dettaglio_auto AS Targa,
                                     CASE WHEN auto_propria=1 THEN 'Sì' ELSE 'No' END AS 'Auto propria',
-                                    cliente_luogo AS 'Cliente/Luogo', note AS Note, creata_da AS 'Programmata da'
+                                    dettaglio_treno AS 'Numero treno', dettaglio_aereo AS 'Numero volo',
+                                    dettaglio_auto_noleggio AS 'Note noleggio', note AS Note, creata_da AS 'Programmata da'
                              FROM trasferte ORDER BY data_inizio DESC, id DESC""", conn)
     return df
 
@@ -1830,7 +1901,7 @@ def get_trasferte_dipendente(dipendente):
     """Trasferte di un singolo dipendente (per la tendina del report intervento),
     più recenti prima."""
     with db_connect() as conn:
-        df = pd.read_sql("""SELECT id AS ID, data_inizio AS Dal, data_fine AS Al, cliente_luogo AS 'Cliente/Luogo'
+        df = pd.read_sql("""SELECT id AS ID, data_inizio AS Dal, data_fine AS Al, cliente AS Cliente, stato AS Stato
                              FROM trasferte WHERE dipendente = ? ORDER BY data_inizio DESC, id DESC""",
                           conn, params=(dipendente,))
     return df
@@ -1954,9 +2025,14 @@ def compute_disponibilita_giornaliera(data_riferimento, area_filter=None):
         c.execute("""SELECT Dipendente, Tipo FROM richieste WHERE Stato = 'Approvato'
                      AND Data_inizio <= ? AND Data_fine >= ?""", (data_iso, data_iso))
         ferie_permessi = {row[0]: row[1] for row in c.fetchall()}
-        c.execute("""SELECT dipendente, cliente_luogo FROM trasferte
+        c.execute("""SELECT dipendente, cliente, stato FROM trasferte
                      WHERE data_inizio <= ? AND data_fine >= ?""", (data_iso, data_iso))
-        trasferte_in_corso = {row[0]: row[1] for row in c.fetchall()}
+        trasferte_in_corso = {}
+        for nome_dip, cliente_trasf, stato_trasf in c.fetchall():
+            descrizione_trasf = cliente_trasf or ""
+            if stato_trasf:
+                descrizione_trasf = f"{descrizione_trasf} ({stato_trasf})" if descrizione_trasf else stato_trasf
+            trasferte_in_corso[nome_dip] = descrizione_trasf
 
     righe = []
     for nome in dipendenti:
@@ -1973,8 +2049,11 @@ def compute_disponibilita_giornaliera(data_riferimento, area_filter=None):
 
 def render_gestione_trasferte_service(attore_nome, key_prefix):
     """Pagina di programmazione trasferte: scelta dell'operatore tra tutti i
-    dipendenti, date, mezzo di trasporto e relativo dettaglio (targa/numero treno o
-    volo). Accessibile all'amministratore e a chiunque faccia parte dell'area Service."""
+    dipendenti, della commessa (da cui si ricava il cliente), del luogo di lavoro
+    (stato/indirizzo, dato che l'azienda lavora in tutto il mondo), dell'albergo, e
+    di uno o più mezzi di trasporto insieme (es. aereo per arrivare + auto a
+    noleggio per muoversi sul posto). Accessibile all'amministratore e a chiunque
+    faccia parte dell'area Service."""
     st.subheader("🧳 Programmazione Trasferte (Service)")
 
     st.markdown("**Nuova trasferta**")
@@ -1983,29 +2062,57 @@ def render_gestione_trasferte_service(attore_nome, key_prefix):
         st.warning("Nessun dipendente disponibile.")
         return
     operatore_scelto = st.selectbox("Operatore", operatori_disponibili, key=f"{key_prefix}_trasf_operatore")
+
+    commesse_disponibili_trasf = get_commesse_names()
+    if not commesse_disponibili_trasf:
+        st.warning("Nessuna commessa configurata: creane una in 'Gestione Commesse' prima di programmare una trasferta (serve a determinare il cliente).")
+        return
+    commessa_scelta_trasf = st.selectbox("Commessa (determina il cliente)", commesse_disponibili_trasf, key=f"{key_prefix}_trasf_commessa")
+    cliente_derivato_trasf = get_cliente_commessa(commessa_scelta_trasf)
+    st.text_input("Cliente (ricavato dalla commessa)", value=cliente_derivato_trasf or "(nessun cliente impostato per questa commessa)",
+                  disabled=True, key=f"{key_prefix}_trasf_cliente_display")
+
     col_data1, col_data2 = st.columns(2)
     with col_data1:
         data_inizio_trasf = st.date_input("Data inizio trasferta", value=datetime.date.today(), key=f"{key_prefix}_trasf_inizio")
     with col_data2:
         data_fine_trasf = st.date_input("Data fine trasferta", value=datetime.date.today(), key=f"{key_prefix}_trasf_fine")
-    cliente_luogo_trasf = st.text_input("Cliente / luogo della trasferta", key=f"{key_prefix}_trasf_luogo")
-    mezzo_trasf = st.radio("Mezzo di trasporto", ["Auto", "Treno", "Aereo"], horizontal=True, key=f"{key_prefix}_trasf_mezzo")
 
-    auto_propria_trasf = False
-    if mezzo_trasf == "Auto":
-        auto_propria_trasf = st.checkbox("Auto propria (non aziendale)", key=f"{key_prefix}_trasf_auto_propria")
-        dettaglio_mezzo_trasf = st.text_input("Targa", key=f"{key_prefix}_trasf_targa")
-    elif mezzo_trasf == "Treno":
-        dettaglio_mezzo_trasf = st.text_input("Numero treno", key=f"{key_prefix}_trasf_treno")
-    else:
-        dettaglio_mezzo_trasf = st.text_input("Numero volo", key=f"{key_prefix}_trasf_volo")
+    st.markdown("**Luogo di lavoro e alloggio**")
+    col_luogo1, col_luogo2 = st.columns(2)
+    with col_luogo1:
+        stato_trasf = st.text_input("Stato", value=get_paese_commessa(commessa_scelta_trasf) or "", key=f"{key_prefix}_trasf_stato")
+    with col_luogo2:
+        indirizzo_trasf = st.text_input("Indirizzo", key=f"{key_prefix}_trasf_indirizzo")
+    albergo_trasf = st.text_input("Albergo (nome e/o indirizzo)", key=f"{key_prefix}_trasf_albergo")
+
+    st.markdown("**Mezzi di trasporto**")
+    st.caption("Puoi selezionarne più di uno: es. Aereo per arrivare e Auto a noleggio per muoversi una volta lì.")
+    mezzi_scelti_trasf = st.multiselect("Seleziona uno o più mezzi", MEZZI_TRASPORTO_DISPONIBILI, key=f"{key_prefix}_trasf_mezzi")
+
+    dettaglio_auto_trasf, auto_propria_trasf = "", False
+    dettaglio_treno_trasf, dettaglio_aereo_trasf, dettaglio_noleggio_trasf = "", "", ""
+
+    if "Auto" in mezzi_scelti_trasf:
+        col_auto1, col_auto2 = st.columns(2)
+        with col_auto1:
+            dettaglio_auto_trasf = st.text_input("Targa", key=f"{key_prefix}_trasf_targa")
+        with col_auto2:
+            auto_propria_trasf = st.checkbox("Auto propria (non aziendale)", key=f"{key_prefix}_trasf_auto_propria")
+    if "Treno" in mezzi_scelti_trasf:
+        dettaglio_treno_trasf = st.text_input("Numero treno", key=f"{key_prefix}_trasf_treno")
+    if "Aereo" in mezzi_scelti_trasf:
+        dettaglio_aereo_trasf = st.text_input("Numero volo", key=f"{key_prefix}_trasf_volo")
+    if "Auto a noleggio" in mezzi_scelti_trasf:
+        dettaglio_noleggio_trasf = st.text_input("Note auto a noleggio (agenzia, prenotazione, ecc. - opzionale)", key=f"{key_prefix}_trasf_noleggio")
 
     note_trasf = st.text_area("Note (opzionale)", key=f"{key_prefix}_trasf_note")
 
     if st.button("💾 Programma trasferta", key=f"{key_prefix}_trasf_salva"):
-        ok, errore = crea_trasferta(operatore_scelto, data_inizio_trasf, data_fine_trasf, mezzo_trasf,
-                                     dettaglio_mezzo_trasf, auto_propria_trasf, cliente_luogo_trasf,
-                                     note_trasf, attore_nome)
+        ok, errore = crea_trasferta(operatore_scelto, data_inizio_trasf, data_fine_trasf, commessa_scelta_trasf,
+                                     stato_trasf, indirizzo_trasf, albergo_trasf, mezzi_scelti_trasf,
+                                     dettaglio_auto_trasf, auto_propria_trasf, dettaglio_treno_trasf,
+                                     dettaglio_aereo_trasf, dettaglio_noleggio_trasf, note_trasf, attore_nome)
         if ok:
             st.success(f"Trasferta programmata per {operatore_scelto}.")
             st.rerun()
@@ -2021,8 +2128,8 @@ def render_gestione_trasferte_service(attore_nome, key_prefix):
         st.dataframe(trasferte_df, use_container_width=True)
 
         st.markdown("**Elimina una trasferta**")
-        opzioni_elimina = [f"#{id_} - {dip} ({dal} → {al})" for id_, dip, dal, al in
-                            zip(trasferte_df["ID"], trasferte_df["Dipendente"], trasferte_df["Dal"], trasferte_df["Al"])]
+        opzioni_elimina = [f"#{id_} - {dip} ({dal} → {al}) - {cliente or 'nessun cliente'}" for id_, dip, dal, al, cliente in
+                            zip(trasferte_df["ID"], trasferte_df["Dipendente"], trasferte_df["Dal"], trasferte_df["Al"], trasferte_df["Cliente"])]
         mappa_id_elimina = dict(zip(opzioni_elimina, trasferte_df["ID"].tolist()))
         if opzioni_elimina:
             scelta_elimina = st.selectbox("Trasferta da eliminare", opzioni_elimina, key=f"{key_prefix}_trasf_elimina_select")
@@ -2047,8 +2154,9 @@ def render_report_intervento(dipendente_nome, df, key_prefix):
         return
 
     opzioni_trasferta = [
-        f"{dal} → {al}" + (f" ({luogo})" if luogo else "")
-        for dal, al, luogo in zip(trasferte_dipendente["Dal"], trasferte_dipendente["Al"], trasferte_dipendente["Cliente/Luogo"])
+        f"{dal} → {al}" + (f" ({cliente}" + (f", {stato})" if stato else ")") if cliente else "")
+        for dal, al, cliente, stato in zip(trasferte_dipendente["Dal"], trasferte_dipendente["Al"],
+                                            trasferte_dipendente["Cliente"], trasferte_dipendente["Stato"])
     ]
     mappa_trasferta_id = dict(zip(opzioni_trasferta, trasferte_dipendente["ID"].tolist()))
     trasferta_scelta_label = st.selectbox("Trasferta di riferimento", opzioni_trasferta, key=f"{key_prefix}_rep_trasferta")
