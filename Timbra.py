@@ -341,17 +341,29 @@ def init_db():
                     )''')
 
         # Migrazione: aggiungi le colonne anagrafiche se il DB esisteva già prima di questa versione
-        for colonna_commessa, tipo_colonna in [("cliente", "TEXT"), ("tipologia_impianto", "TEXT"), ("anno_produzione", "INTEGER"), ("paese", "TEXT")]:
+        for colonna_commessa, tipo_colonna in [("cliente", "TEXT"), ("tipologia_impianto", "TEXT"), ("anno_produzione", "INTEGER"), ("paese", "TEXT"),
+                                                ("priorita", "TEXT"), ("stato", "TEXT")]:
             try:
                 c.execute(f"ALTER TABLE commesse ADD COLUMN {colonna_commessa} {tipo_colonna}")
                 conn.commit()
             except db_migration_error_classes():
                 pass  # Colonna già esistente
 
+        # Le commesse create prima dell'introduzione di priorità/stato non hanno questi
+        # valori: le consideriamo "Media"/"In corso" di default (già avviate, non
+        # "da iniziare"), invece di lasciarle vuote nelle nuove viste per priorità/stato.
+        c.execute("UPDATE commesse SET priorita = 'Media' WHERE priorita IS NULL OR priorita = ''")
+        c.execute("UPDATE commesse SET stato = 'In corso' WHERE stato IS NULL OR stato = ''")
+        conn.commit()
+
         # Tabella Fasi per Commessa - ogni fase appartiene a UNA commessa e UNA area:
         # l'admin può gestire fasi di qualsiasi area, i responsabili solo quelle della propria.
         # Le ore stimate sono obbligatorie: sono la base del calcolo di produttività
         # (ore stimate / ore effettive: >100% = si è finiti prima, <100% = si è sforato).
+        # operatore_assegnato (facoltativo) indica chi, nel reparto di quella fase, ne è
+        # responsabile: una fase senza operatore assegnato resta visibile a tutto il
+        # reparto (per non nascondere lavoro non ancora assegnato), una fase assegnata
+        # compare solo all'operatore scelto.
         c.execute('''CREATE TABLE IF NOT EXISTS fasi_commessa (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         commessa TEXT NOT NULL,
@@ -362,6 +374,11 @@ def init_db():
                         data_creazione TEXT,
                         UNIQUE(commessa, area, fase)
                     )''')
+        try:
+            c.execute("ALTER TABLE fasi_commessa ADD COLUMN operatore_assegnato TEXT")
+            conn.commit()
+        except db_migration_error_classes():
+            pass  # Colonna già esistente
 
         # Tabella Template Fasi - fasi/ore standard per tipologia di impianto, riusabili
         # su più commesse. Una tipologia con almeno una riga qui è "standard": creando
@@ -1199,6 +1216,12 @@ def render_gestione_fasi_area(default_area=None):
 # UNA commessa e UNA area con delle ore stimate obbligatorie: l'admin può gestirle
 # per qualsiasi area, i responsabili solo per la propria. Sono queste ore stimate
 # la base del calcolo di produttività (ore stimate / ore effettive lavorate).
+# Ogni commessa ha anche una priorità e uno stato (ciclo di vita: Da iniziare -> In
+# corso -> eventualmente In pausa -> Completata), e ogni fase può avere un operatore
+# assegnato: chi vede cosa nella tendina di timbratura dipende da questi due dati.
+
+PRIORITA_COMMESSA_DISPONIBILI = ["Bassa", "Media", "Alta"]
+STATI_COMMESSA_DISPONIBILI = ["Da iniziare", "In corso", "In pausa", "Completata"]
 
 def get_commesse_names():
     """Elenco di tutte le commesse esistenti, in ordine alfabetico."""
@@ -1208,31 +1231,55 @@ def get_commesse_names():
         return [row[0] for row in c.fetchall()]
 
 def get_commesse_dettaglio():
-    """Tutte le commesse con la loro anagrafica completa, per la vista d'insieme dell'admin."""
+    """Tutte le commesse con la loro anagrafica completa (inclusi priorità e stato),
+    per la vista d'insieme dell'admin."""
     with db_connect() as conn:
         return pd.read_sql(
             "SELECT nome AS Nome, cliente AS Cliente, tipologia_impianto AS 'Tipologia impianto', "
-            "anno_produzione AS 'Anno produzione', paese AS Paese, descrizione AS Descrizione "
-            "FROM commesse ORDER BY nome", conn)
+            "anno_produzione AS 'Anno produzione', paese AS Paese, priorita AS Priorità, stato AS Stato, "
+            "descrizione AS Descrizione FROM commesse ORDER BY nome", conn)
 
-def crea_commessa(nome, descrizione, creata_da, cliente="", tipologia_impianto="", anno_produzione=None, paese=""):
+def crea_commessa(nome, descrizione, creata_da, cliente="", tipologia_impianto="", anno_produzione=None, paese="", priorita="Media"):
     """Crea una nuova commessa (solo admin), con la sua anagrafica (cliente, tipologia
-    impianto, anno di produzione, paese di installazione). Restituisce (ok, messaggio_errore)."""
+    impianto, anno di produzione, paese di installazione) e una priorità. Una
+    commessa nasce sempre con stato 'Da iniziare': lo stato si cambia in seguito
+    (vedi aggiorna_stato_priorita_commessa), man mano che il lavoro procede.
+    Restituisce (ok, messaggio_errore)."""
     nome = (nome or "").strip()
     if not nome:
         return False, "Il nome della commessa è obbligatorio."
+    if priorita not in PRIORITA_COMMESSA_DISPONIBILI:
+        priorita = "Media"
     with db_connect() as conn:
         c = conn.cursor()
         try:
-            c.execute("""INSERT INTO commesse (nome, descrizione, cliente, tipologia_impianto, anno_produzione, paese, creata_da, data_creazione)
-                         VALUES (?,?,?,?,?,?,?,?)""",
+            c.execute("""INSERT INTO commesse (nome, descrizione, cliente, tipologia_impianto, anno_produzione, paese,
+                                                 priorita, stato, creata_da, data_creazione)
+                         VALUES (?,?,?,?,?,?,?,?,?,?)""",
                       (nome, (descrizione or "").strip(), (cliente or "").strip(), (tipologia_impianto or "").strip(),
                        int(anno_produzione) if anno_produzione else None, (paese or "").strip(),
-                       creata_da, datetime.date.today().isoformat()))
+                       priorita, "Da iniziare", creata_da, datetime.date.today().isoformat()))
             conn.commit()
             return True, ""
         except db_error_classes("IntegrityError"):
             return False, "Esiste già una commessa con questo nome."
+
+def aggiorna_stato_priorita_commessa(nome, stato, priorita):
+    """Cambia stato e priorità di una commessa già esistente (solo admin): ad esempio
+    per metterla 'In pausa' per un'urgenza, segnarla 'Completata' a lavoro finito, o
+    alzarne la priorità. Restituisce (ok, messaggio_errore)."""
+    if stato not in STATI_COMMESSA_DISPONIBILI:
+        return False, f"Stato non valido. Valori ammessi: {', '.join(STATI_COMMESSA_DISPONIBILI)}."
+    if priorita not in PRIORITA_COMMESSA_DISPONIBILI:
+        return False, f"Priorità non valida. Valori ammessi: {', '.join(PRIORITA_COMMESSA_DISPONIBILI)}."
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE commesse SET stato=?, priorita=? WHERE nome=?", (stato, priorita, nome))
+        righe_modificate = c.rowcount
+        conn.commit()
+    if righe_modificate == 0:
+        return False, "Commessa non trovata."
+    return True, ""
 
 def elimina_commessa(nome):
     """Elimina una commessa e tutte le fasi (di ogni area) configurate al suo interno."""
@@ -1398,25 +1445,55 @@ def render_gestione_template_fasi(scope_area=None, attore=""):
                     st.rerun()
 
 def get_fasi_commessa(commessa, area=None):
-    """Fasi configurate per una commessa (eventualmente filtrate per area), con ore stimate.
-    Restituisce tuple (id, fase, area, ore_stimate)."""
+    """Fasi configurate per una commessa (eventualmente filtrate per area), con ore
+    stimate e operatore assegnato (stringa vuota se non ancora assegnata a nessuno).
+    Restituisce tuple (id, fase, area, ore_stimate, operatore_assegnato)."""
     with db_connect() as conn:
         c = conn.cursor()
         if area and area != "Tutte le aree":
-            c.execute("SELECT id, fase, area, ore_stimate FROM fasi_commessa WHERE commessa=? AND area=? ORDER BY fase", (commessa, area))
+            c.execute("SELECT id, fase, area, ore_stimate, operatore_assegnato FROM fasi_commessa WHERE commessa=? AND area=? ORDER BY fase", (commessa, area))
         else:
-            c.execute("SELECT id, fase, area, ore_stimate FROM fasi_commessa WHERE commessa=? ORDER BY area, fase", (commessa,))
-        return c.fetchall()
+            c.execute("SELECT id, fase, area, ore_stimate, operatore_assegnato FROM fasi_commessa WHERE commessa=? ORDER BY area, fase", (commessa,))
+        return [(id_, fase, area_, ore, operatore or "") for id_, fase, area_, ore, operatore in c.fetchall()]
 
 def get_fasi_per_commessa_e_area(commessa, area):
-    """Solo i nomi delle fasi disponibili per la tendina di timbratura (Inizio fase)."""
+    """Solo i nomi delle fasi disponibili per la tendina di timbratura (Inizio fase),
+    a prescindere da chi è l'operatore assegnato: usata dove non interessa filtrare
+    per operatore (es. per etichettare un report intervento)."""
     if not commessa or not area:
         return []
     return [row[1] for row in get_fasi_commessa(commessa, area=area)]
 
-def aggiungi_fase_commessa(commessa, area, fase, ore_stimate, creata_da):
+def get_commesse_assegnate_a_operatore(dipendente, area):
+    """Commesse su cui un operatore può avviare una fase nel proprio reparto:
+    quelle 'Da iniziare' o 'In corso' (le 'In pausa'/'Completate' non si avviano) che
+    hanno, in quel reparto, almeno una fase assegnata a lui oppure non ancora
+    assegnata a nessuno (per non nascondere lavoro non ancora assegnato). Ordinate
+    per priorità (Alta prima), poi per nome."""
+    if not dipendente or not area:
+        return []
+    ordine_priorita = {"Alta": 0, "Media": 1, "Bassa": 2}
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT DISTINCT co.nome, co.priorita FROM commesse co
+                     JOIN fasi_commessa f ON f.commessa = co.nome
+                     WHERE f.area = ? AND (f.operatore_assegnato IS NULL OR f.operatore_assegnato = '' OR f.operatore_assegnato = ?)
+                       AND co.stato IN ('Da iniziare', 'In corso')""", (area, dipendente))
+        righe = c.fetchall()
+    righe.sort(key=lambda r: (ordine_priorita.get(r[1], 1), r[0]))
+    return [nome for nome, _priorita in righe]
+
+def get_fasi_assegnate_a_operatore(commessa, area, dipendente):
+    """Fasi di una commessa/area disponibili per l'avvio da parte di questo
+    operatore: quelle assegnate a lui, oppure non ancora assegnate a nessuno."""
+    if not commessa or not area:
+        return []
+    return [row[1] for row in get_fasi_commessa(commessa, area=area) if not row[4] or row[4] == dipendente]
+
+def aggiungi_fase_commessa(commessa, area, fase, ore_stimate, creata_da, operatore_assegnato=""):
     """Aggiunge una fase a una commessa per una specifica area, con ore stimate
-    obbligatorie (> 0). Restituisce (ok, messaggio_errore)."""
+    obbligatorie (> 0) e un operatore assegnato facoltativo (lasciando vuoto, la
+    fase resta visibile a tutto il reparto). Restituisce (ok, messaggio_errore)."""
     commessa = (commessa or "").strip()
     area = (area or "").strip()
     fase = (fase or "").strip()
@@ -1431,8 +1508,10 @@ def aggiungi_fase_commessa(commessa, area, fase, ore_stimate, creata_da):
     with db_connect() as conn:
         c = conn.cursor()
         try:
-            c.execute("INSERT INTO fasi_commessa (commessa, area, fase, ore_stimate, creata_da, data_creazione) VALUES (?,?,?,?,?,?)",
-                      (commessa, area, fase, ore_stimate, creata_da, datetime.date.today().isoformat()))
+            c.execute("""INSERT INTO fasi_commessa (commessa, area, fase, ore_stimate, creata_da, data_creazione, operatore_assegnato)
+                         VALUES (?,?,?,?,?,?,?)""",
+                      (commessa, area, fase, ore_stimate, creata_da, datetime.date.today().isoformat(),
+                       (operatore_assegnato or "").strip()))
             conn.commit()
             return True, ""
         except db_error_classes("IntegrityError"):
@@ -1452,11 +1531,84 @@ def aggiorna_ore_stimate_fase(fase_id, ore_stimate):
         conn.commit()
     return True, ""
 
+def aggiorna_operatore_fase(fase_id, operatore_assegnato):
+    """Assegna (o rimuove, passando stringa vuota) l'operatore responsabile di una
+    fase già esistente: da quel momento la fase compare solo a lui nella tendina di
+    timbratura del suo reparto (finché non viene riassegnata o svuotata)."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE fasi_commessa SET operatore_assegnato=? WHERE id=?", ((operatore_assegnato or "").strip(), fase_id))
+        conn.commit()
+    return True, ""
+
 def elimina_fase_commessa(fase_id):
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM fasi_commessa WHERE id=?", (fase_id,))
         conn.commit()
+
+def get_attivita_assegnate_dipendente(dipendente, area):
+    """Le fasi assegnate esplicitamente a questo dipendente nel proprio reparto, con
+    cliente/priorità/stato della commessa a cui appartengono: per la pagina
+    personale 'Le mie Commesse' (cosa devo fare, cosa è in pausa, cosa ho già
+    completato). A differenza di get_commesse_assegnate_a_operatore, qui NON sono
+    incluse le fasi non assegnate a nessuno: questa è la lista di ciò che è
+    esplicitamente suo, non di ciò che potrebbe prendere in mano."""
+    if not dipendente or not area:
+        return pd.DataFrame(columns=["Commessa", "Cliente", "Fase", "Priorità", "Stato", "Ore stimate"])
+    with db_connect() as conn:
+        df = pd.read_sql("""SELECT f.commessa AS Commessa, co.cliente AS Cliente, f.fase AS Fase,
+                                    co.priorita AS Priorità, co.stato AS Stato, f.ore_stimate AS 'Ore stimate'
+                             FROM fasi_commessa f JOIN commesse co ON co.nome = f.commessa
+                             WHERE f.area = ? AND f.operatore_assegnato = ?""", conn, params=(area, dipendente))
+    if df.empty:
+        return df
+    ordine_priorita = {"Alta": 0, "Media": 1, "Bassa": 2}
+    df["_ordine"] = df["Priorità"].map(ordine_priorita).fillna(1)
+    df = df.sort_values(["_ordine", "Commessa", "Fase"]).drop(columns=["_ordine"]).reset_index(drop=True)
+    return df
+
+def get_storico_attivita_commessa(commessa, df):
+    """Traccia cronologica di 'chi ha fatto cosa' su una commessa: ogni sessione di
+    lavoro su una fase (Inizio fase -> Fine fase), con dipendente, reparto, giorno,
+    orario di inizio/fine e durata. Usa le timbrature già caricate (df) invece di
+    interrogare di nuovo il database. Una fase avviata ma non ancora chiusa compare
+    comunque, con Fine/Ore vuoti, per non nascondere il lavoro in corso."""
+    colonne = ["Dipendente", "Area", "Fase", "Data", "Inizio", "Fine", "Ore"]
+    if not commessa or df is None or df.empty:
+        return pd.DataFrame(columns=colonne)
+    dfn = normalize_datetime(df)
+    dfn = dfn[(dfn["Commessa"] == commessa) & (dfn["Azione"].isin(["Inizio fase", "Fine fase"]))]
+    if dfn.empty:
+        return pd.DataFrame(columns=colonne)
+    mappa_aree = get_users_area_map()
+    righe = []
+    for (dip, data_lavoro, fase), gruppo in dfn.groupby(["Dipendente", "Data", "Fase"]):
+        gruppo = gruppo.sort_values("Timestamp")
+        coda_inizio = []
+        for _, riga in gruppo.iterrows():
+            if riga["Azione"] == "Inizio fase":
+                coda_inizio.append(riga["Timestamp"])
+            elif riga["Azione"] == "Fine fase":
+                inizio_ts = coda_inizio.pop(0) if coda_inizio else None
+                ore = None
+                if inizio_ts is not None and pd.notna(inizio_ts) and pd.notna(riga["Timestamp"]) and riga["Timestamp"] > inizio_ts:
+                    ore = round((riga["Timestamp"] - inizio_ts).total_seconds() / 3600, 2)
+                righe.append({
+                    "Dipendente": dip, "Area": mappa_aree.get(dip, "Unknown"), "Fase": fase, "Data": data_lavoro,
+                    "Inizio": inizio_ts.strftime("%H:%M") if inizio_ts is not None and pd.notna(inizio_ts) else "-",
+                    "Fine": riga["Timestamp"].strftime("%H:%M") if pd.notna(riga["Timestamp"]) else "-",
+                    "Ore": ore,
+                })
+        for inizio_ts in coda_inizio:  # "Inizio fase" senza un "Fine fase" corrispondente: fase ancora aperta
+            righe.append({
+                "Dipendente": dip, "Area": mappa_aree.get(dip, "Unknown"), "Fase": fase, "Data": data_lavoro,
+                "Inizio": inizio_ts.strftime("%H:%M") if pd.notna(inizio_ts) else "-",
+                "Fine": "(in corso)", "Ore": None,
+            })
+    if not righe:
+        return pd.DataFrame(columns=colonne)
+    return pd.DataFrame(righe).sort_values(["Data", "Inizio"]).reset_index(drop=True)
 
 def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, attore=""):
     """UI di gestione fasi/ore-stimate per commessa. Se scope_area è impostata
@@ -1485,6 +1637,8 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
         with col_paese:
             nuovo_paese = st.text_input("Paese di installazione", key="nuova_commessa_paese")
 
+        nuova_priorita = st.selectbox("Priorità", options=PRIORITA_COMMESSA_DISPONIBILI,
+                                       index=PRIORITA_COMMESSA_DISPONIBILI.index("Media"), key="nuova_commessa_priorita")
         nuova_descrizione = st.text_area("Descrizione (opzionale)", key="nuova_commessa_descrizione")
 
         ha_template_cc = bool(nuova_tipologia) and nuova_tipologia in tipologie_esistenti_cc
@@ -1496,7 +1650,8 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
         if st.button("Crea commessa", key="btn_crea_commessa"):
             ok, errore = crea_commessa(
                 nuovo_nome, nuova_descrizione, attore,
-                cliente=nuovo_cliente, tipologia_impianto=nuova_tipologia, anno_produzione=nuovo_anno, paese=nuovo_paese
+                cliente=nuovo_cliente, tipologia_impianto=nuova_tipologia, anno_produzione=nuovo_anno, paese=nuovo_paese,
+                priorita=nuova_priorita
             )
             if ok:
                 nome_creata = nuovo_nome.strip()
@@ -1518,6 +1673,27 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
             st.info("Nessuna commessa ancora creata.")
         else:
             st.dataframe(commesse_dettaglio, use_container_width=True)
+
+            st.markdown("**Aggiorna stato e priorità**")
+            st.caption("Usalo per mettere una commessa 'In pausa' per un'urgenza, segnarla 'Completata' a lavoro finito, o cambiarne la priorità: lo stato decide anche quali commesse i dipendenti vedono tra quelle da poter avviare.")
+            commessa_stato_sel = st.selectbox("Commessa", options=get_commesse_names(), key="commessa_stato_select")
+            riga_commessa_sel = commesse_dettaglio[commesse_dettaglio["Nome"] == commessa_stato_sel].iloc[0]
+            col_stato1, col_stato2 = st.columns(2)
+            with col_stato1:
+                nuovo_stato_commessa = st.selectbox("Stato", options=STATI_COMMESSA_DISPONIBILI,
+                                                     index=STATI_COMMESSA_DISPONIBILI.index(riga_commessa_sel["Stato"]) if riga_commessa_sel["Stato"] in STATI_COMMESSA_DISPONIBILI else 0,
+                                                     key=f"commessa_stato_{commessa_stato_sel}")
+            with col_stato2:
+                nuova_priorita_commessa = st.selectbox("Priorità", options=PRIORITA_COMMESSA_DISPONIBILI,
+                                                        index=PRIORITA_COMMESSA_DISPONIBILI.index(riga_commessa_sel["Priorità"]) if riga_commessa_sel["Priorità"] in PRIORITA_COMMESSA_DISPONIBILI else 1,
+                                                        key=f"commessa_priorita_{commessa_stato_sel}")
+            if st.button("💾 Salva stato e priorità", key=f"btn_stato_commessa_{commessa_stato_sel}"):
+                ok, errore = aggiorna_stato_priorita_commessa(commessa_stato_sel, nuovo_stato_commessa, nuova_priorita_commessa)
+                if ok:
+                    st.success(f"Commessa '{commessa_stato_sel}' aggiornata: {nuovo_stato_commessa}, priorità {nuova_priorita_commessa}.")
+                    st.rerun()
+                else:
+                    st.error(errore)
         st.markdown("---")
 
     commesse = get_commesse_names()
@@ -1540,17 +1716,25 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
 
     fasi_esistenti = get_fasi_commessa(commessa_sel, area=area_sel)
     if fasi_esistenti:
-        st.dataframe(pd.DataFrame(fasi_esistenti, columns=["ID", "Fase", "Area", "Ore stimate"]), use_container_width=True)
+        fasi_esistenti_df = pd.DataFrame(fasi_esistenti, columns=["ID", "Fase", "Area", "Ore stimate", "Operatore assegnato"])
+        fasi_esistenti_df["Operatore assegnato"] = fasi_esistenti_df["Operatore assegnato"].replace("", "(nessuno: visibile a tutto il reparto)")
+        st.dataframe(fasi_esistenti_df, use_container_width=True)
     else:
         st.info("Nessuna fase configurata per questa combinazione commessa/area.")
+
+    operatori_area_sel = get_users_in_area(area_sel)
+    opzioni_operatore_fase = ["(nessuno: visibile a tutto il reparto)"] + operatori_area_sel
 
     col_add, col_edit = st.columns(2)
     with col_add:
         st.markdown("**Aggiungi fase**")
         nuova_fase = st.text_input("Nome fase", key=f"nuova_fase_{commessa_sel}_{area_sel}")
         nuove_ore = st.number_input("Ore stimate", min_value=0.0, step=0.5, key=f"nuove_ore_{commessa_sel}_{area_sel}")
+        nuovo_operatore_fase = st.selectbox("Operatore assegnato (opzionale)", options=opzioni_operatore_fase,
+                                             key=f"nuovo_operatore_{commessa_sel}_{area_sel}")
         if st.button("➕ Aggiungi fase", key=f"btn_add_fase_{commessa_sel}_{area_sel}"):
-            ok, errore = aggiungi_fase_commessa(commessa_sel, area_sel, nuova_fase, nuove_ore, attore)
+            operatore_da_salvare = "" if nuovo_operatore_fase == "(nessuno: visibile a tutto il reparto)" else nuovo_operatore_fase
+            ok, errore = aggiungi_fase_commessa(commessa_sel, area_sel, nuova_fase, nuove_ore, attore, operatore_assegnato=operatore_da_salvare)
             if ok:
                 st.success(f"Fase '{nuova_fase.strip()}' aggiunta.")
                 st.rerun()
@@ -1563,8 +1747,13 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
             opzioni_fase = {f"{row[1]} ({row[3]:g}h)": row[0] for row in fasi_esistenti}
             fase_scelta_label = st.selectbox("Fase", options=list(opzioni_fase.keys()), key=f"fase_modifica_{commessa_sel}_{area_sel}")
             fase_id_scelta = opzioni_fase[fase_scelta_label]
+            operatore_attuale_fase = next((row[4] for row in fasi_esistenti if row[0] == fase_id_scelta), "")
             nuove_ore_modifica = st.number_input("Nuove ore stimate", min_value=0.0, step=0.5, key=f"ore_modifica_{fase_id_scelta}")
-            col_mod1, col_mod2 = st.columns(2)
+            operatore_modifica_fase = st.selectbox(
+                "Operatore assegnato", options=opzioni_operatore_fase,
+                index=opzioni_operatore_fase.index(operatore_attuale_fase) if operatore_attuale_fase in opzioni_operatore_fase else 0,
+                key=f"operatore_modifica_{fase_id_scelta}")
+            col_mod1, col_mod2, col_mod3 = st.columns(3)
             with col_mod1:
                 if st.button("💾 Aggiorna ore", key=f"btn_update_fase_{fase_id_scelta}"):
                     ok, errore = aggiorna_ore_stimate_fase(fase_id_scelta, nuove_ore_modifica)
@@ -1574,6 +1763,12 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
                     else:
                         st.error(errore)
             with col_mod2:
+                if st.button("👤 Aggiorna operatore", key=f"btn_update_operatore_fase_{fase_id_scelta}"):
+                    operatore_da_salvare_mod = "" if operatore_modifica_fase == "(nessuno: visibile a tutto il reparto)" else operatore_modifica_fase
+                    aggiorna_operatore_fase(fase_id_scelta, operatore_da_salvare_mod)
+                    st.success("Operatore assegnato aggiornato.")
+                    st.rerun()
+            with col_mod3:
                 if st.button("🗑️ Elimina fase", key=f"btn_delete_fase_{fase_id_scelta}"):
                     elimina_fase_commessa(fase_id_scelta)
                     st.success("Fase eliminata.")
@@ -2446,6 +2641,31 @@ def render_disponibilita_team(area_default=None, forza_area=False, key_prefix=""
         return
     st.dataframe(disponibilita_df, use_container_width=True)
     st.caption("Basata sulle trasferte programmate e sulle richieste ferie/permessi già approvate: se un dipendente non risulta né in trasferta né in ferie/permesso viene mostrato come 'In sede', indipendentemente dalle timbrature effettive del giorno.")
+
+def render_le_mie_commesse(dipendente_nome, area, key_prefix):
+    """Le fasi assegnate a questo dipendente nel proprio reparto, divise per stato
+    della commessa a cui appartengono: da fare (Da iniziare/In corso), in pausa
+    (es. per un'urgenza) e completate (storico del lavoro già svolto). Ordinate per
+    priorità, cosi' è chiaro cosa prendere in mano prima."""
+    st.subheader("🏭 Le mie Commesse")
+    attivita = get_attivita_assegnate_dipendente(dipendente_nome, area)
+    if attivita.empty:
+        st.info("Nessuna fase è ancora stata assegnata specificamente a te. Le fasi non assegnate a nessuno restano comunque disponibili nella scheda Timbrature.")
+        return
+
+    vista_scelta = st.radio("Vista", ["📋 Da fare", "⏸️ In pausa", "✅ Completate"], horizontal=True, key=f"{key_prefix}_commesse_vista")
+    if vista_scelta == "📋 Da fare":
+        filtrate = attivita[attivita["Stato"].isin(["Da iniziare", "In corso"])]
+    elif vista_scelta == "⏸️ In pausa":
+        filtrate = attivita[attivita["Stato"] == "In pausa"]
+    else:
+        filtrate = attivita[attivita["Stato"] == "Completata"]
+
+    if filtrate.empty:
+        st.info("Nessuna attività in questa categoria.")
+    else:
+        st.dataframe(filtrate, use_container_width=True)
+    st.caption("Ordinate per priorità (Alta prima). Lo stato e la priorità sono impostati dall'amministratore in 'Gestione Commesse'.")
 
 # --- FUNZIONI RUOLO RESPONSABILE ---
 
@@ -3688,6 +3908,20 @@ else:
                 ).properties(height=30 * len(produttivita_dettaglio) + 60)
                 st.altair_chart(bar_stima_effettiva, use_container_width=True)
 
+            st.markdown("---")
+            st.write("#### 🔎 Traccia lavorazioni di una commessa (chi ha fatto cosa)")
+            st.caption("Elenco cronologico di ogni sessione Inizio fase → Fine fase su questa commessa, per avere traccia di tutto il processo produttivo passo per passo (non limitato al periodo scelto sopra).")
+            commesse_per_traccia = get_commesse_names()
+            if not commesse_per_traccia:
+                st.info("Nessuna commessa configurata.")
+            else:
+                commessa_traccia = st.selectbox("Commessa", options=commesse_per_traccia, key="resoconto_commessa_traccia")
+                storico_commessa = get_storico_attivita_commessa(commessa_traccia, df)
+                if storico_commessa.empty:
+                    st.info("Nessuna lavorazione registrata finora su questa commessa.")
+                else:
+                    st.dataframe(storico_commessa, use_container_width=True)
+
         elif admin_page == "Grafici e Classifiche":
             st.write("### 📈 Grafici e Classifiche per Area")
             g_start = st.date_input("Inizio periodo", value=datetime.date.today().replace(day=1), key="g_start")
@@ -4099,6 +4333,7 @@ else:
             pagina_utente = render_menu_a_categorie([
                 ("👤 Profilo", ["Profilo"]),
                 ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
+                ("🏭 Le mie Commesse", ["Le mie Commesse"]),
                 ("🧳 Service", ["📷 Report Intervento"]),
                 ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
             ], key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
@@ -4162,15 +4397,18 @@ else:
                 if fase_aperta_resp:
                     st.info(f"Fase attualmente aperta: **{fase_aperta_resp[0]} → {fase_aperta_resp[1]}**")
 
-                commesse_disponibili_resp = get_commesse_names()
+                # Solo le commesse 'Da iniziare'/'In corso' che hanno, nel suo reparto,
+                # almeno una fase assegnata a lui o non ancora assegnata a nessuno:
+                # ordinate per priorità, cosi' si vede subito cosa prendere in mano prima.
+                commesse_disponibili_resp = get_commesse_assegnate_a_operatore(dipendente_scelto, user_info["area"])
                 if not commesse_disponibili_resp:
-                    st.warning("Nessuna commessa configurata. Chiedi all'admin di crearne una prima di avviare una fase.")
+                    st.warning("Nessuna commessa disponibile per il tuo reparto al momento. Chiedi all'admin di crearne una o di assegnartela.")
                     commessa_scelta, fase_scelta = None, None
                 else:
                     commessa_scelta = st.selectbox("🏗️ Commessa", commesse_disponibili_resp, key="resp_commessa_timbra")
-                    fasi_disponibili_resp = get_fasi_per_commessa_e_area(commessa_scelta, user_info["area"])
+                    fasi_disponibili_resp = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto)
                     if not fasi_disponibili_resp:
-                        st.warning(f"Nessuna fase configurata per '{commessa_scelta}' nel tuo reparto. Aggiungila in 'Gestione fasi commessa'.")
+                        st.warning(f"Nessuna fase disponibile per te su '{commessa_scelta}' nel tuo reparto. Aggiungila in 'Gestione fasi commessa'.")
                         fase_scelta = None
                     else:
                         fase_scelta = st.selectbox("Fase", fasi_disponibili_resp, key="resp_fase_timbra")
@@ -4229,6 +4467,9 @@ else:
 
             elif pagina_utente == "Report mensile":
                 render_report_mensile(dipendente_scelto, df, key_prefix="resp")
+
+            elif pagina_utente == "Le mie Commesse":
+                render_le_mie_commesse(dipendente_scelto, user_info["area"], key_prefix="resp")
 
             elif pagina_utente == "📷 Report Intervento":
                 render_report_intervento(dipendente_scelto, df, key_prefix="resp")
@@ -4424,6 +4665,7 @@ else:
         pagina_utente = render_menu_a_categorie([
             ("👤 Profilo", ["Profilo"]),
             ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
+            ("🏭 Le mie Commesse", ["Le mie Commesse"]),
             ("🧳 Service", pagine_service_utente),
             ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
         ], key_prefix="user_menu", titolo_categoria="Funzione utente")
@@ -4487,15 +4729,18 @@ else:
             if fase_aperta_utente:
                 st.info(f"Fase attualmente aperta: **{fase_aperta_utente[0]} → {fase_aperta_utente[1]}**")
 
-            commesse_disponibili_utente = get_commesse_names()
+            # Solo le commesse 'Da iniziare'/'In corso' che hanno, nel suo reparto,
+            # almeno una fase assegnata a lui o non ancora assegnata a nessuno:
+            # ordinate per priorità, cosi' si vede subito cosa prendere in mano prima.
+            commesse_disponibili_utente = get_commesse_assegnate_a_operatore(dipendente_scelto, user_info["area"])
             if not commesse_disponibili_utente:
-                st.warning("Nessuna commessa configurata. Chiedi all'admin di crearne una prima di avviare una fase.")
+                st.warning("Nessuna commessa disponibile per il tuo reparto al momento. Chiedi all'admin di crearne una o di assegnartela.")
                 commessa_scelta, fase_scelta = None, None
             else:
                 commessa_scelta = st.selectbox("🏗️ Commessa", commesse_disponibili_utente, key="utente_commessa_timbra")
-                fasi_disponibili_utente = get_fasi_per_commessa_e_area(commessa_scelta, user_info["area"])
+                fasi_disponibili_utente = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto)
                 if not fasi_disponibili_utente:
-                    st.warning(f"Nessuna fase configurata per '{commessa_scelta}' nel tuo reparto. Chiedi al tuo responsabile di aggiungerla.")
+                    st.warning(f"Nessuna fase disponibile per te su '{commessa_scelta}' nel tuo reparto. Chiedi al tuo responsabile di aggiungerla.")
                     fase_scelta = None
                 else:
                     fase_scelta = st.selectbox("Fase", fasi_disponibili_utente, key="utente_fase_timbra")
@@ -4596,6 +4841,9 @@ else:
 
         elif pagina_utente == "Report mensile":
             render_report_mensile(dipendente_scelto, df, key_prefix="user")
+
+        elif pagina_utente == "Le mie Commesse":
+            render_le_mie_commesse(dipendente_scelto, user_info["area"], key_prefix="user")
 
         elif pagina_utente == "📷 Report Intervento":
             render_report_intervento(dipendente_scelto, df, key_prefix="user")
