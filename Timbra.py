@@ -822,6 +822,34 @@ def get_user_area_by_name(name):
         row = c.fetchone()
         return row[0] if row else "Unknown"
 
+def get_users_area_map():
+    """Mappa {nome_dipendente: area}, per abbinare l'area a più dipendenti in blocco
+    (una sola query invece di una per dipendente/riga). Da preferire a
+    get_user_area_by_name() ogni volta che serve l'area di più dipendenti insieme
+    (es. dentro un .apply() su una colonna): con un database locale una query in più
+    non si notava, ma con un database remoto come Turso ogni query è un giro di rete,
+    e farne una per riga può rendere una pagina molto lenta."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, area FROM utenti")
+        return {row[0]: (row[1] or "Unknown") for row in c.fetchall()}
+
+def get_users_livello_map():
+    """Mappa {nome_dipendente: livello}, stesso motivo di get_users_area_map()."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, livello FROM utenti")
+        return {row[0]: (row[1] or "") for row in c.fetchall()}
+
+def get_livelli_costo_orario_map():
+    """Mappa {livello: costo_orario}, stesso motivo di get_users_area_map(): da usare
+    insieme a get_users_livello_map() invece di chiamare get_costo_orario_per_livello()
+    per ogni dipendente in un ciclo o in un .apply()."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT livello, costo_orario FROM livelli_ferie_permessi")
+        return {row[0]: float(row[1]) for row in c.fetchall() if row[1] is not None}
+
 def get_area_names():
     with db_connect() as conn:
         c = conn.cursor()
@@ -1590,7 +1618,7 @@ def get_utenti_responsabile(username):
 def attach_request_area(df_requests):
     if df_requests.empty: return df_requests.copy()
     df = df_requests.copy()
-    df["Area"] = df["Dipendente"].apply(get_user_area_by_name)
+    df["Area"] = df["Dipendente"].map(get_users_area_map()).fillna("Unknown")
     return df
 
 def calculate_ferie_days(start_date, end_date):
@@ -1609,8 +1637,9 @@ def compute_leave_balances(df_requests, year=None, area="Tutte le aree"):
     if area != "Tutte le aree" and "Area" in requests.columns: requests = requests[requests["Area"] == area]
 
     rows = []
+    mappa_aree = get_users_area_map()  # una sola query, invece di una per dipendente nel ciclo
     for name in get_users_in_area(area):
-        area_name = get_user_area_by_name(name)
+        area_name = mappa_aree.get(name, "Unknown")
         user_requests = requests[(requests["Dipendente"] == name) & (requests["Stato"] == "Approvato")] if "Dipendente" in requests.columns else pd.DataFrame()
         ferie_presi = 0; permesso_ore_presi = 0.0
         for _, row in user_requests.iterrows():
@@ -1867,9 +1896,13 @@ def compute_costo_dipendenti(df, start_date, end_date, employee_name=None):
         return pd.DataFrame(columns=["Dipendente", "Area", "Livello", "Ore_lavorate", "Costo_orario", "Costo_totale"])
 
     agg = ore_per_dipendente.groupby("Dipendente", as_index=False).agg({"Ore_lavorate": "sum"})
-    agg["Area"] = agg["Dipendente"].apply(get_user_area_by_name)
-    agg["Livello"] = agg["Dipendente"].apply(lambda n: get_livello_utente(n) or "(non impostato)")
-    agg["Costo_orario"] = agg["Dipendente"].apply(lambda n: get_costo_orario_per_livello(get_livello_utente(n)))
+    # Tre mappe con una query ciascuna, invece di tre query per ogni dipendente in tabella.
+    mappa_aree = get_users_area_map()
+    mappa_livelli = get_users_livello_map()
+    mappa_costi_livello = get_livelli_costo_orario_map()
+    agg["Area"] = agg["Dipendente"].map(lambda n: mappa_aree.get(n, "Unknown"))
+    agg["Livello"] = agg["Dipendente"].map(lambda n: mappa_livelli.get(n) or "(non impostato)")
+    agg["Costo_orario"] = agg["Dipendente"].map(lambda n: mappa_costi_livello.get(mappa_livelli.get(n), float(DEFAULT_COSTO_ORARIO)))
     agg["Ore_lavorate"] = agg["Ore_lavorate"].round(2)
     agg["Costo_totale"] = (agg["Ore_lavorate"] * agg["Costo_orario"]).round(2)
     return agg.sort_values("Costo_totale", ascending=False).reset_index(drop=True)
@@ -1959,7 +1992,8 @@ def compute_ore_per_luogo(df, start_date, end_date, area_filter=None, employee_n
     if employee_name:
         dfn = dfn[dfn["Dipendente"] == employee_name]
     if area_filter and area_filter != "Tutte le aree":
-        dfn = dfn[dfn["Dipendente"].apply(get_user_area_by_name) == area_filter]
+        mappa_aree = get_users_area_map()
+        dfn = dfn[dfn["Dipendente"].map(lambda n: mappa_aree.get(n, "Unknown")) == area_filter]
     if dfn.empty:
         return pd.DataFrame(columns=["Luogo", "Ore_lavorate"])
 
@@ -2014,7 +2048,8 @@ def compute_giorni_smart_per_dipendente(df, start_date, end_date, area_filter=No
     if employee_name:
         dfn = dfn[dfn["Dipendente"] == employee_name]
     if area_filter and area_filter != "Tutte le aree":
-        dfn = dfn[dfn["Dipendente"].apply(get_user_area_by_name) == area_filter]
+        mappa_aree = get_users_area_map()
+        dfn = dfn[dfn["Dipendente"].map(lambda n: mappa_aree.get(n, "Unknown")) == area_filter]
     if dfn.empty:
         return pd.DataFrame(columns=["Dipendente", "Giorni_smart"])
 
@@ -2313,7 +2348,7 @@ def compute_productivity_by_area(df, start_date, end_date, area_filter="Tutte le
     if merged.empty:
         return pd.DataFrame(columns=["Area", "Ore_presenza", "Ore_fase", "Produttivita_%"])
     merged["Ore_fase"] = merged["Ore_fase"].fillna(0.0)
-    merged["Area"] = merged["Dipendente"].apply(get_user_area_by_name)
+    merged["Area"] = merged["Dipendente"].map(get_users_area_map()).fillna("Unknown")
 
     if area_filter and area_filter != "Tutte le aree":
         merged = merged[merged["Area"] == area_filter]
@@ -2348,7 +2383,7 @@ def compute_fasi_commessa_ore_effettive(df, start_date, end_date, area_filter=No
     dfn = dfn[dfn["Data"].apply(lambda d: start_date <= d <= end_date)]
     if dfn.empty: return pd.DataFrame(columns=["Commessa", "Fase", "Area", "Ore_effettive"])
     dfn = dfn.copy()
-    dfn["Area"] = dfn["Dipendente"].apply(get_user_area_by_name)
+    dfn["Area"] = dfn["Dipendente"].map(get_users_area_map()).fillna("Unknown")
     if area_filter and area_filter != "Tutte le aree":
         dfn = dfn[dfn["Area"] == area_filter]
     if dfn.empty: return pd.DataFrame(columns=["Commessa", "Fase", "Area", "Ore_effettive"])
@@ -2775,7 +2810,7 @@ else:
                 df_hours = df_hours[(df_hours["Data"] >= start_date) & (df_hours["Data"] <= end_date)]
                 if df_hours.empty:
                     return pd.DataFrame(columns=["Area", "Ore_lavorate"])
-                df_hours["Area"] = df_hours["Dipendente"].apply(get_user_area_by_name)
+                df_hours["Area"] = df_hours["Dipendente"].map(get_users_area_map()).fillna("Unknown")
                 if area_filter and area_filter != "Tutte le aree":
                     df_hours = df_hours[df_hours["Area"] == area_filter]
                 agg = df_hours.groupby("Area", as_index=False).agg({"Ore_lavorate": "sum"})
