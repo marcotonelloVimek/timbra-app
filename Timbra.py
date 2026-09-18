@@ -1942,12 +1942,82 @@ def get_trasferte_dettaglio():
 
 def get_trasferte_dipendente(dipendente):
     """Trasferte di un singolo dipendente (per la tendina del report intervento),
-    più recenti prima."""
+    più recenti prima. Include anche l'indirizzo, così il report intervento può
+    precompilare da sola il campo 'Cliente/Luogo' invece di farlo riscrivere a mano."""
     with db_connect() as conn:
-        df = pd.read_sql("""SELECT id AS ID, data_inizio AS Dal, data_fine AS Al, cliente AS Cliente, stato AS Stato
+        df = pd.read_sql("""SELECT id AS ID, data_inizio AS Dal, data_fine AS Al, cliente AS Cliente, stato AS Stato,
+                                    indirizzo AS Indirizzo
                              FROM trasferte WHERE dipendente = ? ORDER BY data_inizio DESC, id DESC""",
                           conn, params=(dipendente,))
     return df
+
+
+def get_trasferta_by_id(trasferta_id):
+    """Tutti i dati grezzi di una trasferta (per precompilare il modulo di modifica
+    con i valori attualmente salvati). Restituisce un dizionario, oppure None se
+    l'id non esiste."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi,
+                            dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio, note
+                     FROM trasferte WHERE id = ?""", (trasferta_id,))
+        riga = c.fetchone()
+    if not riga:
+        return None
+    (dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi,
+     dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio, note) = riga
+    return {
+        "dipendente": dipendente,
+        "data_inizio": datetime.date.fromisoformat(str(data_inizio)[:10]),
+        "data_fine": datetime.date.fromisoformat(str(data_fine)[:10]),
+        "commessa": commessa or "",
+        "stato": stato or "",
+        "indirizzo": indirizzo or "",
+        "albergo": albergo or "",
+        "mezzi": [m for m in (mezzi or "").split(",") if m],
+        "dettaglio_auto": dettaglio_auto or "",
+        "auto_propria": bool(auto_propria),
+        "dettaglio_treno": dettaglio_treno or "",
+        "dettaglio_aereo": dettaglio_aereo or "",
+        "dettaglio_auto_noleggio": dettaglio_auto_noleggio or "",
+        "note": note or "",
+    }
+
+
+def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo,
+                        mezzi_selezionati, dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo,
+                        dettaglio_auto_noleggio, note):
+    """Modifica una trasferta già programmata, ad esempio per correggere un errore di
+    data, indirizzo, albergo o mezzo scoperto dopo la creazione. A differenza della
+    cancellazione, la modifica è permessa anche se la trasferta ha già un report
+    intervento collegato (il report resta comunque associato tramite l'id). Il
+    dipendente non è modificabile da qui: se serve cambiare operatore conviene
+    eliminare la trasferta (se non ha ancora un report collegato) e ricrearla.
+    Restituisce (ok, errore)."""
+    ok, errore = valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati,
+                                   dettaglio_auto, dettaglio_treno, dettaglio_aereo)
+    if not ok:
+        return False, errore
+    cliente = get_cliente_commessa(commessa)
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""UPDATE trasferte SET data_inizio=?, data_fine=?, commessa=?, cliente=?, stato=?, indirizzo=?,
+                            albergo=?, mezzi=?, dettaglio_auto=?, auto_propria=?, dettaglio_treno=?, dettaglio_aereo=?,
+                            dettaglio_auto_noleggio=?, note=? WHERE id=?""",
+                  (data_inizio.isoformat(), data_fine.isoformat(), commessa, cliente,
+                   str(stato or "").strip(), str(indirizzo or "").strip(), str(albergo or "").strip(),
+                   ",".join(mezzi_selezionati),
+                   str(dettaglio_auto or "").strip() if "Auto" in mezzi_selezionati else "",
+                   1 if (auto_propria and "Auto" in mezzi_selezionati) else 0,
+                   str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
+                   str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
+                   str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
+                   str(note or "").strip(), trasferta_id))
+        righe_modificate = c.rowcount
+        conn.commit()
+    if righe_modificate == 0:
+        return False, "Trasferta non trovata (potrebbe essere stata eliminata nel frattempo)."
+    return True, ""
 
 def elimina_trasferta(trasferta_id):
     """Elimina una trasferta programmata, ma solo se non ha già un report intervento
@@ -1993,12 +2063,23 @@ def calcola_ore_lavorate_periodo(df, dipendente, data_inizio, data_fine):
 def salva_report_intervento(trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, foto_caricate, data_intervento=None):
     """Salva il report di un intervento (testo + eventuali foto compresse) per una
     trasferta del dipendente. Le ore di lavoro sono calcolate dal chiamante dalle
-    timbrature reali (vedi calcola_ore_lavorate_periodo), non inserite a mano.
-    Restituisce (ok, errore)."""
+    timbrature reali (vedi calcola_ore_lavorate_periodo), non inserite a mano. Se
+    viene indicato un giorno dell'intervento, deve rientrare nel periodo Dal/Al della
+    trasferta selezionata: altrimenti le ore calcolate finirebbero per riferirsi a un
+    giorno che non c'entra nulla con quella trasferta. Restituisce (ok, errore)."""
     if not descrizione or not str(descrizione).strip():
         return False, "Inserisci una descrizione del lavoro svolto."
     with db_connect() as conn:
         c = conn.cursor()
+        if data_intervento is not None:
+            data_intervento_iso = data_intervento.isoformat() if hasattr(data_intervento, "isoformat") else str(data_intervento)
+            c.execute("SELECT data_inizio, data_fine FROM trasferte WHERE id = ?", (trasferta_id,))
+            riga_trasferta = c.fetchone()
+            if riga_trasferta:
+                data_inizio_trasferta, data_fine_trasferta = riga_trasferta
+                if data_intervento_iso < data_inizio_trasferta or data_intervento_iso > data_fine_trasferta:
+                    return False, (f"Il giorno dell'intervento ({data_intervento_iso}) deve rientrare nel periodo della "
+                                   f"trasferta selezionata ({data_inizio_trasferta} → {data_fine_trasferta}).")
         c.execute("""INSERT INTO report_interventi
                      (trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, data_intervento, data_creazione)
                      VALUES (?,?,?,?,?,?,?,?,?)""",
@@ -2170,6 +2251,82 @@ def render_gestione_trasferte_service(attore_nome, key_prefix):
     else:
         st.dataframe(trasferte_df, use_container_width=True)
 
+        st.markdown("**Modifica una trasferta esistente**")
+        st.caption("Utile per correggere un errore (data, indirizzo, albergo, mezzo...) scoperto dopo la creazione: a differenza dell'eliminazione, funziona anche se la trasferta ha già un report intervento collegato.")
+        opzioni_modifica = [f"#{id_} - {dip} ({dal} → {al}) - {cliente or 'nessun cliente'}" for id_, dip, dal, al, cliente in
+                             zip(trasferte_df["ID"], trasferte_df["Dipendente"], trasferte_df["Dal"], trasferte_df["Al"], trasferte_df["Cliente"])]
+        mappa_id_modifica = dict(zip(opzioni_modifica, trasferte_df["ID"].tolist()))
+        scelta_modifica = st.selectbox("Trasferta da modificare", opzioni_modifica, key=f"{key_prefix}_trasf_modifica_select")
+        trasferta_id_modifica = mappa_id_modifica[scelta_modifica]
+        dati_mod = get_trasferta_by_id(trasferta_id_modifica)
+        if dati_mod is None:
+            st.warning("Trasferta non trovata (potrebbe essere stata eliminata nel frattempo).")
+        else:
+            st.caption(f"Operatore: {dati_mod['dipendente']} (non modificabile qui: per cambiare operatore elimina la trasferta, se non ha ancora un report collegato, e ricreala).")
+
+            commesse_opzioni_mod = list(commesse_disponibili_trasf)
+            if dati_mod["commessa"] and dati_mod["commessa"] not in commesse_opzioni_mod:
+                commesse_opzioni_mod = [dati_mod["commessa"]] + commesse_opzioni_mod
+            indice_commessa_mod = commesse_opzioni_mod.index(dati_mod["commessa"]) if dati_mod["commessa"] in commesse_opzioni_mod else 0
+            commessa_mod = st.selectbox("Commessa (determina il cliente)", commesse_opzioni_mod, index=indice_commessa_mod,
+                                         key=f"{key_prefix}_trasf_mod_commessa_{trasferta_id_modifica}")
+            cliente_derivato_mod = get_cliente_commessa(commessa_mod)
+            st.text_input("Cliente (ricavato dalla commessa)", value=cliente_derivato_mod or "(nessun cliente impostato per questa commessa)",
+                          disabled=True, key=f"{key_prefix}_trasf_mod_cliente_display_{trasferta_id_modifica}")
+
+            col_mod_data1, col_mod_data2 = st.columns(2)
+            with col_mod_data1:
+                data_inizio_mod = st.date_input("Data inizio trasferta", value=dati_mod["data_inizio"],
+                                                 key=f"{key_prefix}_trasf_mod_inizio_{trasferta_id_modifica}")
+            with col_mod_data2:
+                data_fine_mod = st.date_input("Data fine trasferta", value=dati_mod["data_fine"],
+                                               key=f"{key_prefix}_trasf_mod_fine_{trasferta_id_modifica}")
+
+            st.markdown("Luogo di lavoro e alloggio")
+            col_mod_luogo1, col_mod_luogo2 = st.columns(2)
+            with col_mod_luogo1:
+                stato_mod = st.text_input("Stato", value=dati_mod["stato"], key=f"{key_prefix}_trasf_mod_stato_{trasferta_id_modifica}")
+            with col_mod_luogo2:
+                indirizzo_mod = st.text_input("Indirizzo", value=dati_mod["indirizzo"], key=f"{key_prefix}_trasf_mod_indirizzo_{trasferta_id_modifica}")
+            albergo_mod = st.text_input("Albergo (nome e/o indirizzo)", value=dati_mod["albergo"],
+                                         key=f"{key_prefix}_trasf_mod_albergo_{trasferta_id_modifica}")
+
+            st.markdown("Mezzi di trasporto")
+            mezzi_mod = st.multiselect("Seleziona uno o più mezzi", MEZZI_TRASPORTO_DISPONIBILI, default=dati_mod["mezzi"],
+                                        key=f"{key_prefix}_trasf_mod_mezzi_{trasferta_id_modifica}")
+
+            dettaglio_auto_mod, auto_propria_mod = dati_mod["dettaglio_auto"], dati_mod["auto_propria"]
+            dettaglio_treno_mod, dettaglio_aereo_mod = dati_mod["dettaglio_treno"], dati_mod["dettaglio_aereo"]
+            dettaglio_noleggio_mod = dati_mod["dettaglio_auto_noleggio"]
+
+            if "Auto" in mezzi_mod:
+                col_mod_auto1, col_mod_auto2 = st.columns(2)
+                with col_mod_auto1:
+                    dettaglio_auto_mod = st.text_input("Targa", value=dettaglio_auto_mod, key=f"{key_prefix}_trasf_mod_targa_{trasferta_id_modifica}")
+                with col_mod_auto2:
+                    auto_propria_mod = st.checkbox("Auto propria (non aziendale)", value=auto_propria_mod,
+                                                    key=f"{key_prefix}_trasf_mod_auto_propria_{trasferta_id_modifica}")
+            if "Treno" in mezzi_mod:
+                dettaglio_treno_mod = st.text_input("Numero treno", value=dettaglio_treno_mod, key=f"{key_prefix}_trasf_mod_treno_{trasferta_id_modifica}")
+            if "Aereo" in mezzi_mod:
+                dettaglio_aereo_mod = st.text_input("Numero volo", value=dettaglio_aereo_mod, key=f"{key_prefix}_trasf_mod_volo_{trasferta_id_modifica}")
+            if "Auto a noleggio" in mezzi_mod:
+                dettaglio_noleggio_mod = st.text_input("Note auto a noleggio (agenzia, prenotazione, ecc. - opzionale)",
+                                                        value=dettaglio_noleggio_mod, key=f"{key_prefix}_trasf_mod_noleggio_{trasferta_id_modifica}")
+
+            note_mod = st.text_area("Note (opzionale)", value=dati_mod["note"], key=f"{key_prefix}_trasf_mod_note_{trasferta_id_modifica}")
+
+            if st.button("💾 Salva modifiche", key=f"{key_prefix}_trasf_mod_salva_{trasferta_id_modifica}"):
+                ok, errore = aggiorna_trasferta(trasferta_id_modifica, dati_mod["dipendente"], data_inizio_mod, data_fine_mod,
+                                                 commessa_mod, stato_mod, indirizzo_mod, albergo_mod, mezzi_mod,
+                                                 dettaglio_auto_mod, auto_propria_mod, dettaglio_treno_mod, dettaglio_aereo_mod,
+                                                 dettaglio_noleggio_mod, note_mod)
+                if ok:
+                    st.success("Trasferta aggiornata.")
+                    st.rerun()
+                else:
+                    st.error(errore)
+
         st.markdown("**Elimina una trasferta**")
         opzioni_elimina = [f"#{id_} - {dip} ({dal} → {al}) - {cliente or 'nessun cliente'}" for id_, dip, dal, al, cliente in
                             zip(trasferte_df["ID"], trasferte_df["Dipendente"], trasferte_df["Dal"], trasferte_df["Al"], trasferte_df["Cliente"])]
@@ -2197,18 +2354,39 @@ def render_report_intervento(dipendente_nome, df, key_prefix):
         return
 
     opzioni_trasferta = [
-        f"{dal} → {al}" + (f" ({cliente}" + (f", {stato})" if stato else ")") if cliente else "")
-        for dal, al, cliente, stato in zip(trasferte_dipendente["Dal"], trasferte_dipendente["Al"],
-                                            trasferte_dipendente["Cliente"], trasferte_dipendente["Stato"])
+        f"#{id_} - {dal} → {al}" + (f" ({cliente}" + (f", {stato})" if stato else ")") if cliente else "")
+        for id_, dal, al, cliente, stato in zip(trasferte_dipendente["ID"], trasferte_dipendente["Dal"], trasferte_dipendente["Al"],
+                                                  trasferte_dipendente["Cliente"], trasferte_dipendente["Stato"])
     ]
     mappa_trasferta_id = dict(zip(opzioni_trasferta, trasferte_dipendente["ID"].tolist()))
     trasferta_scelta_label = st.selectbox("Trasferta di riferimento", opzioni_trasferta, key=f"{key_prefix}_rep_trasferta")
     trasferta_id_scelta = mappa_trasferta_id[trasferta_scelta_label]
+    riga_trasferta_scelta = trasferte_dipendente[trasferte_dipendente["ID"] == trasferta_id_scelta].iloc[0]
+    data_inizio_trasferta_scelta = datetime.date.fromisoformat(str(riga_trasferta_scelta["Dal"])[:10])
+    data_fine_trasferta_scelta = datetime.date.fromisoformat(str(riga_trasferta_scelta["Al"])[:10])
 
-    cliente_luogo_rep = st.text_input("Cliente / luogo dell'intervento", key=f"{key_prefix}_rep_luogo")
+    # Precompilato con cliente/indirizzo già noti dalla trasferta scelta, per non
+    # farli riscrivere a mano: resta comunque modificabile per ogni singola trasferta
+    # (la chiave include l'id, così cambiando trasferta il default si aggiorna).
+    cliente_default_rep = str(riga_trasferta_scelta.get("Cliente") or "").strip()
+    indirizzo_default_rep = str(riga_trasferta_scelta.get("Indirizzo") or "").strip()
+    if cliente_default_rep and indirizzo_default_rep:
+        default_cliente_luogo_rep = f"{cliente_default_rep} - {indirizzo_default_rep}"
+    else:
+        default_cliente_luogo_rep = cliente_default_rep or indirizzo_default_rep
+    cliente_luogo_rep = st.text_input("Cliente / luogo dell'intervento", value=default_cliente_luogo_rep,
+                                       key=f"{key_prefix}_rep_luogo_{trasferta_id_scelta}")
     descrizione_rep = st.text_area("Descrizione del lavoro svolto", key=f"{key_prefix}_rep_descrizione")
 
-    giorno_intervento_rep = st.date_input("Giorno dell'intervento", value=datetime.date.today(), key=f"{key_prefix}_rep_giorno")
+    # Il giorno dell'intervento deve rientrare nel periodo Dal/Al della trasferta
+    # scelta sopra: altrimenti le ore calcolate si riferirebbero a una giornata che
+    # non ha niente a che fare con quella trasferta (es. una giornata normale in sede).
+    oggi_rep = datetime.date.today()
+    valore_default_giorno_rep = oggi_rep if data_inizio_trasferta_scelta <= oggi_rep <= data_fine_trasferta_scelta else data_inizio_trasferta_scelta
+    giorno_intervento_rep = st.date_input("Giorno dell'intervento", value=valore_default_giorno_rep,
+                                           min_value=data_inizio_trasferta_scelta, max_value=data_fine_trasferta_scelta,
+                                           key=f"{key_prefix}_rep_giorno_{trasferta_id_scelta}")
+    st.caption(f"Deve rientrare nel periodo della trasferta scelta ({data_inizio_trasferta_scelta.isoformat()} → {data_fine_trasferta_scelta.isoformat()}).")
     ore_calcolate_rep = calcola_ore_lavorate_periodo(df, dipendente_nome, giorno_intervento_rep, giorno_intervento_rep)
     st.metric("Ore di lavoro (calcolate dalle tue timbrature)", f"{ore_calcolate_rep:.2f} h")
     st.caption("Le ore vengono calcolate automaticamente dalle timbrature Ingresso/Uscita registrate per il giorno indicato sopra: se risultano 0, verifica di aver timbrato quel giorno.")
