@@ -153,6 +153,18 @@ def db_error_classes(nome_eccezione):
         classi.append(getattr(turso, nome_eccezione))
     return tuple(classi)
 
+def db_migration_error_classes():
+    """Classi di eccezione da ignorare nelle guardie di migrazione 'ALTER TABLE ADD
+    COLUMN ... già esistente' in init_db(). Con il file SQLite locale basta
+    OperationalError, ma verificato con un database Turso reale il client 'libsql'
+    segnala il tentativo di aggiungere una colonna già esistente con un semplice
+    ValueError invece che con un'eccezione OperationalError: quando è configurato
+    Turso viene quindi ignorato anche quello."""
+    classi = list(db_error_classes("OperationalError"))
+    if get_turso_config()[0]:
+        classi.append(ValueError)
+    return tuple(classi)
+
 # Ferie/permessi annuali di default, usati come punto di partenza per ogni livello
 # CCNL in "livelli_ferie_permessi" e come fallback per chi non ha un livello impostato.
 DEFAULT_FERIE_GIORNI = 20
@@ -248,7 +260,7 @@ def init_db():
             try:
                 c.execute(f"ALTER TABLE utenti ADD COLUMN {colonna_utente} {tipo_colonna}")
                 conn.commit()
-            except db_error_classes("OperationalError"):
+            except db_migration_error_classes():
                 pass  # Colonna già esistente
 
         # Tabella Livelli CCNL - ferie/permessi annuali e costo orario per livello di
@@ -265,7 +277,7 @@ def init_db():
         try:
             c.execute(f"ALTER TABLE livelli_ferie_permessi ADD COLUMN costo_orario REAL NOT NULL DEFAULT {DEFAULT_COSTO_ORARIO}")
             conn.commit()
-        except db_error_classes("OperationalError"):
+        except db_migration_error_classes():
             pass  # Colonna già esistente
         # Valori di partenza per i livelli standard del CCNL Metalmeccanico Industria
         # (uguali per tutti come punto di partenza: l'admin li personalizza da
@@ -289,7 +301,7 @@ def init_db():
         try:
             c.execute(f"ALTER TABLE impostazioni_sostenibilita ADD COLUMN co2_kg_per_km_pendolarismo REAL NOT NULL DEFAULT {DEFAULT_CO2_KG_PER_KM_PENDOLARISMO}")
             conn.commit()
-        except db_error_classes("OperationalError"):
+        except db_migration_error_classes():
             pass  # Colonna già esistente
         c.execute("INSERT OR IGNORE INTO impostazioni_sostenibilita (id, costo_orario_ufficio_evitato, co2_kg_orario_evitato, co2_kg_per_km_pendolarismo) VALUES (1, ?, ?, ?)",
                   (DEFAULT_COSTO_ORARIO_UFFICIO_EVITATO, DEFAULT_CO2_KG_ORARIO_EVITATO, DEFAULT_CO2_KG_PER_KM_PENDOLARISMO))
@@ -318,7 +330,7 @@ def init_db():
             try:
                 c.execute(f"ALTER TABLE commesse ADD COLUMN {colonna_commessa} {tipo_colonna}")
                 conn.commit()
-            except db_error_classes("OperationalError"):
+            except db_migration_error_classes():
                 pass  # Colonna già esistente
 
         # Tabella Fasi per Commessa - ogni fase appartiene a UNA commessa e UNA area:
@@ -371,7 +383,7 @@ def init_db():
         try:
             c.execute("ALTER TABLE timbrature ADD COLUMN Stato TEXT DEFAULT 'Valida'")
             conn.commit()
-        except db_error_classes("OperationalError"):
+        except db_migration_error_classes():
             pass  # Colonna già esiste
         
         # Tabella Richieste
@@ -392,7 +404,7 @@ def init_db():
         try:
             c.execute("ALTER TABLE richieste ADD COLUMN Approvatore_Richiesto TEXT DEFAULT 'admin'")
             conn.commit()
-        except db_error_classes("OperationalError"):
+        except db_migration_error_classes():
             pass  # Colonna già esiste
         
         # Tabella Rettifiche Timbrature - NUOVA
