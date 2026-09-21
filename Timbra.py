@@ -1477,8 +1477,8 @@ def get_commesse_assegnate_a_operatore(dipendente, area):
         c = conn.cursor()
         c.execute("""SELECT DISTINCT co.nome, co.priorita FROM commesse co
                      JOIN fasi_commessa f ON f.commessa = co.nome
-                     WHERE f.area = ? AND (f.operatore_assegnato IS NULL OR f.operatore_assegnato = '' OR f.operatore_assegnato = ?)
-                       AND co.stato IN ('Da iniziare', 'In corso')""", (area, dipendente))
+                     WHERE f.area = ? AND (f.operatore_assegnato IS NULL OR TRIM(f.operatore_assegnato) = '' OR TRIM(f.operatore_assegnato) = TRIM(?))
+                       AND co.stato IN ('Da iniziare', 'In corso')""", (area, dipendente or ""))
         righe = c.fetchall()
     righe.sort(key=lambda r: (ordine_priorita.get(r[1], 1), r[0]))
     return [nome for nome, _priorita in righe]
@@ -1488,7 +1488,9 @@ def get_fasi_assegnate_a_operatore(commessa, area, dipendente):
     operatore: quelle assegnate a lui, oppure non ancora assegnate a nessuno."""
     if not commessa or not area:
         return []
-    return [row[1] for row in get_fasi_commessa(commessa, area=area) if not row[4] or row[4] == dipendente]
+    dipendente_normalizzato = (dipendente or "").strip()
+    return [row[1] for row in get_fasi_commessa(commessa, area=area)
+            if not row[4] or row[4].strip() == dipendente_normalizzato]
 
 def aggiungi_fase_commessa(commessa, area, fase, ore_stimate, creata_da, operatore_assegnato=""):
     """Aggiunge una fase a una commessa per una specifica area, con ore stimate
@@ -1560,7 +1562,7 @@ def get_attivita_assegnate_dipendente(dipendente, area):
         df = pd.read_sql("""SELECT f.commessa AS Commessa, co.cliente AS Cliente, f.fase AS Fase,
                                     co.priorita AS Priorità, co.stato AS Stato, f.ore_stimate AS 'Ore stimate'
                              FROM fasi_commessa f JOIN commesse co ON co.nome = f.commessa
-                             WHERE f.area = ? AND f.operatore_assegnato = ?""", conn, params=(area, dipendente))
+                             WHERE f.area = ? AND TRIM(f.operatore_assegnato) = TRIM(?)""", conn, params=(area, dipendente or ""))
     if df.empty:
         return df
     ordine_priorita = {"Alta": 0, "Media": 1, "Bassa": 2}
