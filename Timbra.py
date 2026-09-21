@@ -1107,13 +1107,19 @@ def get_users_distanza_map():
                 risultato[nome] = 0.0
         return risultato
 
+@st.cache_data(ttl=30)
 def get_area_names():
+    """In cache per lo stesso motivo di get_commesse_names(): invalidata con
+    .clear() quando si crea/elimina un utente da 'Gestione Utenti DB'."""
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("SELECT DISTINCT area FROM utenti WHERE area != 'All' ORDER BY area")
         return ["Tutte le aree"] + [row[0] for row in c.fetchall()]
 
+@st.cache_data(ttl=30)
 def get_users_in_area(area):
+    """In cache per lo stesso motivo di get_commesse_names(): invalidata con
+    .clear() quando si crea/elimina un utente da 'Gestione Utenti DB'."""
     with db_connect() as conn:
         c = conn.cursor()
         if area == "Tutte le aree":
@@ -1223,16 +1229,25 @@ def render_gestione_fasi_area(default_area=None):
 PRIORITA_COMMESSA_DISPONIBILI = ["Bassa", "Media", "Alta"]
 STATI_COMMESSA_DISPONIBILI = ["Da iniziare", "In corso", "In pausa", "Completata"]
 
+@st.cache_data(ttl=30)
 def get_commesse_names():
-    """Elenco di tutte le commesse esistenti, in ordine alfabetico."""
+    """Elenco di tutte le commesse esistenti, in ordine alfabetico. Come
+    carica_dati_db(), viene tenuta in cache per 30 secondi (e invalidata subito dopo
+    ogni creazione/eliminazione con .clear()): sulla pagina "Gestione Commesse" questa
+    funzione veniva altrimenti richiamata ad ogni singola interazione (ogni carattere
+    digitato in un campo fa ripartire l'intero script Streamlit), e con un database
+    remoto come Turso ogni chiamata è un giro di rete: la pagina risultava lenta e
+    sembrava "aggiornarsi di continuo" a ogni digitazione."""
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("SELECT nome FROM commesse ORDER BY nome")
         return [row[0] for row in c.fetchall()]
 
+@st.cache_data(ttl=30)
 def get_commesse_dettaglio():
     """Tutte le commesse con la loro anagrafica completa (inclusi priorità e stato),
-    per la vista d'insieme dell'admin."""
+    per la vista d'insieme dell'admin. In cache per lo stesso motivo di
+    get_commesse_names()."""
     with db_connect() as conn:
         return pd.read_sql(
             "SELECT nome AS Nome, cliente AS Cliente, tipologia_impianto AS 'Tipologia impianto', "
@@ -1260,6 +1275,8 @@ def crea_commessa(nome, descrizione, creata_da, cliente="", tipologia_impianto="
                        int(anno_produzione) if anno_produzione else None, (paese or "").strip(),
                        priorita, "Da iniziare", creata_da, datetime.date.today().isoformat()))
             conn.commit()
+            get_commesse_names.clear()
+            get_commesse_dettaglio.clear()
             return True, ""
         except db_error_classes("IntegrityError"):
             return False, "Esiste già una commessa con questo nome."
@@ -1279,6 +1296,7 @@ def aggiorna_stato_priorita_commessa(nome, stato, priorita):
         conn.commit()
     if righe_modificate == 0:
         return False, "Commessa non trovata."
+    get_commesse_dettaglio.clear()
     return True, ""
 
 def elimina_commessa(nome):
@@ -1288,6 +1306,9 @@ def elimina_commessa(nome):
         c.execute("DELETE FROM fasi_commessa WHERE commessa=?", (nome,))
         c.execute("DELETE FROM commesse WHERE nome=?", (nome,))
         conn.commit()
+    get_commesse_names.clear()
+    get_commesse_dettaglio.clear()
+    get_fasi_commessa.clear()
 
 # --- FUNZIONI TEMPLATE FASI (MACCHINE STANDARD) ---
 # Una "tipologia impianto" con almeno una riga in template_fasi è considerata
@@ -1295,16 +1316,20 @@ def elimina_commessa(nome):
 # una nuova commessa invece di inserirle a mano. Le tipologie senza template
 # restano "su misura": le fasi si aggiungono manualmente come prima.
 
+@st.cache_data(ttl=30)
 def get_tipologie_standard():
-    """Elenco delle tipologie di impianto che hanno un template (almeno una fase configurata)."""
+    """Elenco delle tipologie di impianto che hanno un template (almeno una fase
+    configurata). In cache per lo stesso motivo di get_commesse_names()."""
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("SELECT DISTINCT tipologia FROM template_fasi ORDER BY tipologia")
         return [row[0] for row in c.fetchall()]
 
+@st.cache_data(ttl=30)
 def get_template_fasi(tipologia, area=None):
     """Fasi del template di una tipologia (eventualmente filtrate per area), con ore stimate.
-    Restituisce tuple (id, fase, area, ore_stimate)."""
+    Restituisce tuple (id, fase, area, ore_stimate). In cache per lo stesso motivo di
+    get_commesse_names()."""
     with db_connect() as conn:
         c = conn.cursor()
         if area and area != "Tutte le aree":
@@ -1333,6 +1358,8 @@ def aggiungi_template_fase(tipologia, area, fase, ore_stimate, creata_da):
             c.execute("INSERT INTO template_fasi (tipologia, area, fase, ore_stimate, creata_da, data_creazione) VALUES (?,?,?,?,?,?)",
                       (tipologia, area, fase, ore_stimate, creata_da, datetime.date.today().isoformat()))
             conn.commit()
+            get_tipologie_standard.clear()
+            get_template_fasi.clear()
             return True, ""
         except db_error_classes("IntegrityError"):
             return False, "Questa fase esiste già nel template di questa tipologia/area."
@@ -1348,6 +1375,7 @@ def aggiorna_ore_template_fase(template_id, ore_stimate):
         c = conn.cursor()
         c.execute("UPDATE template_fasi SET ore_stimate=? WHERE id=?", (ore_stimate, template_id))
         conn.commit()
+    get_template_fasi.clear()
     return True, ""
 
 def elimina_template_fase(template_id):
@@ -1355,6 +1383,8 @@ def elimina_template_fase(template_id):
         c = conn.cursor()
         c.execute("DELETE FROM template_fasi WHERE id=?", (template_id,))
         conn.commit()
+    get_tipologie_standard.clear()
+    get_template_fasi.clear()
 
 def applica_template_a_commessa(tipologia, commessa, creata_da):
     """Copia tutte le fasi del template di una tipologia (per ogni area configurata)
@@ -1373,6 +1403,8 @@ def applica_template_a_commessa(tipologia, commessa, creata_da):
             if c.rowcount:
                 copiate += 1
         conn.commit()
+    if copiate:
+        get_fasi_commessa.clear()
     return copiate
 
 def render_gestione_template_fasi(scope_area=None, attore=""):
@@ -1444,10 +1476,13 @@ def render_gestione_template_fasi(scope_area=None, attore=""):
                     st.success("Fase eliminata dal template.")
                     st.rerun()
 
+@st.cache_data(ttl=30)
 def get_fasi_commessa(commessa, area=None):
     """Fasi configurate per una commessa (eventualmente filtrate per area), con ore
     stimate e operatore assegnato (stringa vuota se non ancora assegnata a nessuno).
-    Restituisce tuple (id, fase, area, ore_stimate, operatore_assegnato)."""
+    Restituisce tuple (id, fase, area, ore_stimate, operatore_assegnato). In cache per
+    lo stesso motivo di get_commesse_names(): invalidata con .clear() da ogni funzione
+    che aggiunge/modifica/elimina una fase o il suo operatore assegnato."""
     with db_connect() as conn:
         c = conn.cursor()
         if area and area != "Tutte le aree":
@@ -1515,6 +1550,7 @@ def aggiungi_fase_commessa(commessa, area, fase, ore_stimate, creata_da, operato
                       (commessa, area, fase, ore_stimate, creata_da, datetime.date.today().isoformat(),
                        (operatore_assegnato or "").strip()))
             conn.commit()
+            get_fasi_commessa.clear()
             return True, ""
         except db_error_classes("IntegrityError"):
             return False, "Questa fase esiste già per questa commessa e area."
@@ -1531,6 +1567,7 @@ def aggiorna_ore_stimate_fase(fase_id, ore_stimate):
         c = conn.cursor()
         c.execute("UPDATE fasi_commessa SET ore_stimate=? WHERE id=?", (ore_stimate, fase_id))
         conn.commit()
+    get_fasi_commessa.clear()
     return True, ""
 
 def aggiorna_operatore_fase(fase_id, operatore_assegnato):
@@ -1541,6 +1578,7 @@ def aggiorna_operatore_fase(fase_id, operatore_assegnato):
         c = conn.cursor()
         c.execute("UPDATE fasi_commessa SET operatore_assegnato=? WHERE id=?", ((operatore_assegnato or "").strip(), fase_id))
         conn.commit()
+    get_fasi_commessa.clear()
     return True, ""
 
 def elimina_fase_commessa(fase_id):
@@ -1548,6 +1586,7 @@ def elimina_fase_commessa(fase_id):
         c = conn.cursor()
         c.execute("DELETE FROM fasi_commessa WHERE id=?", (fase_id,))
         conn.commit()
+    get_fasi_commessa.clear()
 
 def get_attivita_assegnate_dipendente(dipendente, area):
     """Le fasi assegnate esplicitamente a questo dipendente nel proprio reparto, con
@@ -3711,6 +3750,29 @@ def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
         return st.radio(categoria_scelta, pagine_categoria, key=f"{key_prefix}_pagina_{categoria_scelta}")
 
 
+# Pagine su cui l'aggiornamento automatico ogni 60 secondi (st_autorefresh più sotto)
+# viene saltato: sono le pagine con moduli da compilare (campi di testo, foto, form
+# di richiesta), dove un ricaricamento della pagina mentre si sta scrivendo risultava
+# fastidioso ("la pagina continua ad aggiornarsi"). Sulle pagine di sola
+# visualizzazione (dashboard, report, elenchi) l'aggiornamento resta attivo, perché lì
+# è comodo vedere i dati aggiornati senza dover premere nulla. Il nome è quello esatto
+# restituito da render_menu_a_categorie() per quella pagina (uguale su più ruoli
+# quando la pagina si chiama allo stesso modo, es. "Gestione fasi commessa").
+PAGINE_SENZA_AUTOREFRESH_AUTOMATICO = {
+    "Gestione Commesse", "Gestione fasi commessa", "Gestione Utenti DB",
+    "Profilo", "Timbrature", "📷 Report Intervento",
+    "🧳 Trasferte e Interventi (Service)", "🧳 Trasferte Service",
+    "Richiesta ferie/permessi", "Richiesta rettifica",
+}
+
+def pagina_abilitata_per_autorefresh(pagina):
+    """True se la pagina indicata (l'ultima pagina vista, da session_state) può avere
+    l'aggiornamento automatico ogni 60 secondi attivo; False per le pagine con moduli
+    da compilare elencate in PAGINE_SENZA_AUTOREFRESH_AUTOMATICO, per non interrompere
+    chi sta scrivendo in un campo. None (nessuna pagina vista ancora, es. subito dopo
+    il login) è trattato come abilitato, cioè il comportamento di prima."""
+    return pagina not in PAGINE_SENZA_AUTOREFRESH_AUTOMATICO
+
 # ================== INTERFACCIA STREAMLIT ==================
 
 if not st.session_state.logged_in:
@@ -3733,7 +3795,13 @@ else:
     # aggiornamento richiede una richiesta di rete, e farlo ogni 5 secondi per ogni
     # persona collegata appesantiva parecchio l'app. 60 secondi è un buon compromesso
     # per un'app di presenze aziendali (i dati non devono essere aggiornati al secondo).
-    st_autorefresh(interval=60000, key="datarefresh")
+    # Viene saltato del tutto sulle pagine con moduli da compilare (vedi
+    # PAGINE_SENZA_AUTOREFRESH_AUTOMATICO sopra), cosi non si interrompe più chi sta
+    # scrivendo in un campo: si basa sull'ultima pagina vista (session_state), quindi
+    # nel caso limite di un cambio pagina l'aggiornamento può scattare al più una volta
+    # in più prima di fermarsi, cosa che non crea alcun problema pratico.
+    if pagina_abilitata_per_autorefresh(st.session_state.get("_ultima_pagina_vista")):
+        st_autorefresh(interval=60000, key="datarefresh")
     user_info = get_user_info()
     _render_logo_header(container=st.sidebar)
     st.sidebar.markdown("---")
@@ -3753,6 +3821,7 @@ else:
             ("🧳 Trasferte e Team", ["🧳 Trasferte e Interventi (Service)", "📅 Disponibilità Team"]),
             ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
         ], key_prefix="admin_menu", titolo_categoria="Sezione amministratore")
+        st.session_state["_ultima_pagina_vista"] = admin_page
 
         if admin_page == "Dati e Presenze":
             st.subheader("📊 Pannello Amministrazione")
@@ -4192,6 +4261,8 @@ else:
                                 c.execute("INSERT INTO utenti (username, nome, password, role, area, posizione, livello, colore, data_assunzione) VALUES (?,?,?,?,?,?,?,?,?)",
                                           (new_username, new_name, hash_password(new_password), new_role, new_area, new_position, new_level, new_color, new_hire_date.isoformat()))
                                 conn.commit()
+                            get_area_names.clear()
+                            get_users_in_area.clear()
                             st.success(f"Utente {new_name} aggiunto!")
                             st.rerun()
                         except db_error_classes("IntegrityError"):
@@ -4221,6 +4292,8 @@ else:
                         else:
                             c.execute("UPDATE utenti SET role=?, livello=?, colore=?, data_assunzione=? WHERE username=?", (new_role, new_level, new_color, new_hire_date.isoformat(), selected_username))
                         conn.commit()
+                    get_area_names.clear()
+                    get_users_in_area.clear()
                     st.success("Utente aggiornato!")
                     st.rerun()
 
@@ -4231,6 +4304,8 @@ else:
                         c = conn.cursor()
                         c.execute("DELETE FROM utenti WHERE username=?", (to_delete,))
                         conn.commit()
+                    get_area_names.clear()
+                    get_users_in_area.clear()
                     st.success("Utente eliminato dal database!")
                     st.rerun()
 
@@ -4339,6 +4414,7 @@ else:
                 ("🧳 Service", ["📷 Report Intervento"]),
                 ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
             ], key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
+            st.session_state["_ultima_pagina_vista"] = pagina_utente
 
             if pagina_utente == "Profilo":
                 st.subheader("👤 Profilo personale")
@@ -4520,6 +4596,7 @@ else:
                 ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa"]),
                 ("📅 Disponibilità", ["📅 Disponibilità Team"]),
             ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
+            st.session_state["_ultima_pagina_vista"] = resp_page
 
             if resp_page == "Timbrature del team":
                 st.subheader(f"📋 Timbrature - Area: {area_responsabile}")
@@ -4649,6 +4726,7 @@ else:
                 render_disponibilita_team(area_default=area_responsabile, forza_area=True, key_prefix="resp")
 
         elif modalita == "🧳 Trasferte Service":
+            st.session_state["_ultima_pagina_vista"] = "🧳 Trasferte Service"
             render_gestione_trasferte_service(user_info["name"], key_prefix="resp_service")
             st.markdown("---")
             st.markdown("**Report interventi ricevuti**")
@@ -4671,6 +4749,7 @@ else:
             ("🧳 Service", pagine_service_utente),
             ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
         ], key_prefix="user_menu", titolo_categoria="Funzione utente")
+        st.session_state["_ultima_pagina_vista"] = pagina_utente
 
         if pagina_utente == "Profilo":
             st.subheader("👤 Profilo personale")
