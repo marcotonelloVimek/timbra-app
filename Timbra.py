@@ -355,7 +355,7 @@ def init_db():
 
         # Migrazione: aggiungi le colonne anagrafiche se il DB esisteva già prima di questa versione
         for colonna_commessa, tipo_colonna in [("cliente", "TEXT"), ("tipologia_impianto", "TEXT"), ("anno_produzione", "INTEGER"), ("paese", "TEXT"),
-                                                ("priorita", "TEXT"), ("stato", "TEXT")]:
+                                                ("priorita", "TEXT"), ("stato", "TEXT"), ("data_inizio_lavori", "TEXT")]:
             try:
                 c.execute(f"ALTER TABLE commesse ADD COLUMN {colonna_commessa} {tipo_colonna}")
                 conn.commit()
@@ -420,6 +420,20 @@ def init_db():
                     )''')
         for macro_fase_default in MACRO_FASI_DISPONIBILI:
             c.execute("INSERT OR IGNORE INTO macro_fase_reparto (macro_fase, reparto) VALUES (?, '')", (macro_fase_default,))
+        conn.commit()
+
+        # Tabella Scadenze Macro-fase per Commessa - una data di termine PREVISTA
+        # (obiettivo/scadenza), impostata a mano dall'admin, per ogni macro-fase di
+        # ogni commessa: è un riferimento di pianificazione mostrato accanto al Gantt
+        # teorico (calcolato invece automaticamente dalle ore stimate), per poter
+        # confrontare "dove dovremmo essere secondo l'obiettivo" con "dove siamo
+        # secondo il calcolo automatico" e con l'andamento reale.
+        c.execute('''CREATE TABLE IF NOT EXISTS scadenze_macro_fase (
+                        commessa TEXT NOT NULL,
+                        macro_fase TEXT NOT NULL,
+                        data_fine_prevista TEXT NOT NULL,
+                        PRIMARY KEY (commessa, macro_fase)
+                    )''')
         conn.commit()
 
         # Tabella Template Fasi - fasi/ore standard per tipologia di impianto, riusabili
@@ -1380,6 +1394,57 @@ def aggiorna_priorita_commessa(nome, priorita):
     get_commesse_dettaglio.clear()
     return True, ""
 
+def aggiorna_data_inizio_lavori_commessa(nome, data_inizio_lavori):
+    """Imposta (o svuota, passando None/stringa vuota) la data di inizio lavori di
+    una commessa: è il punto di partenza da cui il Gantt teorico calcola in automatico
+    quando dovrebbe iniziare/finire ogni fase (vedi compute_gantt_teorico_commessa).
+    Restituisce (ok, messaggio_errore)."""
+    data_inizio_lavori = (data_inizio_lavori or "").strip() or None
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE commesse SET data_inizio_lavori=? WHERE nome=?", (data_inizio_lavori, nome))
+        righe_modificate = c.rowcount
+        conn.commit()
+    if righe_modificate == 0:
+        return False, "Commessa non trovata."
+    get_commesse_dettaglio.clear()
+    return True, ""
+
+def get_data_inizio_lavori_commessa(commessa):
+    """Data di inizio lavori di una commessa (stringa ISO, o None se non ancora
+    impostata)."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT data_inizio_lavori FROM commesse WHERE nome=?", (commessa,))
+        row = c.fetchone()
+        return row[0] if row and row[0] else None
+
+def get_scadenze_macro_fase(commessa):
+    """Scadenze (date di termine previste) impostate per le macro-fasi di questa
+    commessa, come {macro_fase: 'YYYY-MM-DD'}. Solo le macro-fasi con una scadenza
+    esplicitamente impostata compaiono nel dizionario."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT macro_fase, data_fine_prevista FROM scadenze_macro_fase WHERE commessa=?", (commessa,))
+        return {macro_fase: data for macro_fase, data in c.fetchall()}
+
+def imposta_scadenza_macro_fase(commessa, macro_fase, data_fine_prevista):
+    """Imposta (o rimuove, passando None/stringa vuota) la data di termine prevista
+    per una macro-fase di una commessa. Restituisce (ok, messaggio_errore)."""
+    if not commessa or not macro_fase:
+        return False, "Commessa e macro-fase sono obbligatorie."
+    data_fine_prevista = (data_fine_prevista or "").strip()
+    with db_connect() as conn:
+        c = conn.cursor()
+        if data_fine_prevista:
+            c.execute("""INSERT INTO scadenze_macro_fase (commessa, macro_fase, data_fine_prevista) VALUES (?,?,?)
+                         ON CONFLICT(commessa, macro_fase) DO UPDATE SET data_fine_prevista=excluded.data_fine_prevista""",
+                      (commessa, macro_fase, data_fine_prevista))
+        else:
+            c.execute("DELETE FROM scadenze_macro_fase WHERE commessa=? AND macro_fase=?", (commessa, macro_fase))
+        conn.commit()
+    return True, ""
+
 def _aggrega_stati_fasi(stati):
     """Applica a un elenco di stati di fase la regola concordata con Marco per
     calcolare uno stato riassuntivo: Completata se TUTTI gli stati sono Completata;
@@ -1611,7 +1676,7 @@ def get_fasi_commessa(commessa, area=None):
     with db_connect() as conn:
         c = conn.cursor()
         if area and area != "Tutte le aree":
-            c.execute("SELECT id, fase, area, ore_stimate, operatore_assegnato, macro_fase, stato FROM fasi_commessa WHERE commessa=? AND area=? ORDER BY fase", (commessa, area))
+            c.execute("SELECT id, fase, area, ore_stimate, operatore_assegnato, macro_fase, stato FROM fasi_commessa WHERE commessa=? AND LOWER(TRIM(area))=LOWER(TRIM(?)) ORDER BY fase", (commessa, area))
         else:
             c.execute("SELECT id, fase, area, ore_stimate, operatore_assegnato, macro_fase, stato FROM fasi_commessa WHERE commessa=? ORDER BY area, fase", (commessa,))
         return [(id_, fase, area_, ore, operatore or "", macro_fase or "", stato or "Da iniziare")
@@ -1638,7 +1703,7 @@ def get_commesse_assegnate_a_operatore(dipendente, area):
         c = conn.cursor()
         c.execute("""SELECT DISTINCT co.nome, co.priorita FROM commesse co
                      JOIN fasi_commessa f ON f.commessa = co.nome
-                     WHERE f.area = ? AND (f.operatore_assegnato IS NULL OR TRIM(f.operatore_assegnato) = '' OR TRIM(f.operatore_assegnato) = TRIM(?))
+                     WHERE LOWER(TRIM(f.area)) = LOWER(TRIM(?)) AND (f.operatore_assegnato IS NULL OR TRIM(f.operatore_assegnato) = '' OR TRIM(f.operatore_assegnato) = TRIM(?))
                        AND co.stato IN ('Da iniziare', 'In corso')""", (area, dipendente or ""))
         righe = c.fetchall()
     righe.sort(key=lambda r: (ordine_priorita.get(r[1], 1), r[0]))
@@ -1730,6 +1795,16 @@ def elimina_fase_commessa(fase_id):
     if row:
         ricalcola_stato_commessa(row[0])
 
+def _stesso_reparto(area_a, area_b):
+    """Confronto fra due nomi di reparto tollerante a maiuscole/minuscole e spazi
+    superflui ('Costi', 'costi' e ' Costi ' sono lo stesso reparto). Il nome del
+    reparto viene digitato a mano in punti diversi dell'app (creazione utente in
+    'Gestione Utenti DB', mappatura macro-fase/reparto in 'Gestione Commesse'): una
+    incoerenza di maiuscole o spazi tra questi due punti non deve nascondere
+    silenziosamente le attività a un utente, come invece succedeva con un confronto
+    esatto."""
+    return (area_a or "").strip().casefold() == (area_b or "").strip().casefold()
+
 def puo_modificare_stato_fase(area_fase, operatore_fase, dipendente, area_dipendente):
     """Vero se un dipendente del reparto area_dipendente può cambiare lo stato di una
     fase del reparto area_fase, assegnata (o meno) a operatore_fase: stessa regola già
@@ -1737,7 +1812,7 @@ def puo_modificare_stato_fase(area_fase, operatore_fase, dipendente, area_dipend
     assegnata a nessuno). Usata sia per decidere cosa mostrare come modificabile in UI
     (su dati eventualmente in cache), sia dentro aggiorna_stato_fase() con una lettura
     fresca dal database, come controllo definitivo."""
-    if (area_fase or "").strip() != (area_dipendente or "").strip():
+    if not _stesso_reparto(area_fase, area_dipendente):
         return False
     operatore_fase = (operatore_fase or "").strip()
     if not operatore_fase:
@@ -1784,7 +1859,7 @@ def get_attivita_assegnate_dipendente(dipendente, area):
                                     co.tipologia_impianto AS 'Tipologia impianto', f.fase AS Fase,
                                     co.priorita AS Priorità, co.stato AS Stato, f.ore_stimate AS 'Ore stimate'
                              FROM fasi_commessa f JOIN commesse co ON co.nome = f.commessa
-                             WHERE f.area = ? AND TRIM(f.operatore_assegnato) = TRIM(?)""", conn, params=(area, dipendente or ""))
+                             WHERE LOWER(TRIM(f.area)) = LOWER(TRIM(?)) AND TRIM(f.operatore_assegnato) = TRIM(?)""", conn, params=(area, dipendente or ""))
     if df.empty:
         return df
     ordine_priorita = {"Alta": 0, "Media": 1, "Bassa": 2}
@@ -1849,6 +1924,224 @@ def get_storico_attivita_commessa(commessa, df):
     if not righe:
         return pd.DataFrame(columns=colonne)
     return pd.DataFrame(righe).sort_values(["Data", "Inizio"]).reset_index(drop=True)
+
+# --- FUNZIONI PIANIFICAZIONE / GANTT COMMESSE ---
+# Calcolano due Gantt per commessa (vedi render_pianificazione_commessa più avanti):
+# - "teorico": calcolato da zero (data di inizio lavori + ore stimate di ogni fase,
+#   8 ore/giorno per operatore), saltando sabati/domeniche, festività italiane e le
+#   ferie/permessi già approvati dell'operatore assegnato;
+# - "effettivo": preso direttamente dalle timbrature reali (Inizio fase/Fine fase),
+#   senza alcuna assunzione di calendario.
+
+def _pasqua(anno):
+    """Data della domenica di Pasqua per l'anno indicato (calendario gregoriano,
+    algoritmo di Meeus/Jones/Butcher): serve per calcolare Pasquetta (Lunedì
+    dell'Angelo), l'unica festività nazionale italiana mobile."""
+    a = anno % 19
+    b = anno // 100
+    c = anno % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    mese = (h + l - 7 * m + 114) // 31
+    giorno = ((h + l - 7 * m + 114) % 31) + 1
+    return datetime.date(anno, mese, giorno)
+
+def festivita_italiane(anno):
+    """Festività nazionali italiane (fisse + Pasquetta) per l'anno indicato, usate dal
+    Gantt teorico per non pianificare lavoro in quei giorni. Non include eventuali
+    festività patronali locali, che variano da comune a comune."""
+    pasquetta = _pasqua(anno) + datetime.timedelta(days=1)
+    return {
+        datetime.date(anno, 1, 1), datetime.date(anno, 1, 6), pasquetta,
+        datetime.date(anno, 4, 25), datetime.date(anno, 5, 1), datetime.date(anno, 6, 2),
+        datetime.date(anno, 8, 15), datetime.date(anno, 11, 1), datetime.date(anno, 12, 8),
+        datetime.date(anno, 12, 25), datetime.date(anno, 12, 26),
+    }
+
+@st.cache_data(ttl=30)
+def get_mappa_assenze_approvate():
+    """Ore bloccate per (dipendente, giorno) dalle richieste di ferie/permessi già
+    approvate: una Ferie blocca l'intera giornata (8 ore), un Permesso blocca solo le
+    ore richieste quel giorno. Usata dal Gantt teorico per non pianificare lavoro nei
+    giorni in cui un operatore è (o sarà) assente. In cache per lo stesso motivo di
+    carica_dati_db(): invalidata da aggiorna_stato_richiesta() quando una richiesta
+    viene approvata/rifiutata."""
+    mappa = {}
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT Dipendente, Tipo, Data_inizio, Data_fine, Ore_permesso FROM richieste WHERE Stato = 'Approvato'")
+        righe = c.fetchall()
+    for dipendente, tipo, data_inizio, data_fine, ore_permesso in righe:
+        dipendente = (dipendente or "").strip()
+        if not dipendente or not data_inizio:
+            continue
+        try:
+            d_inizio = datetime.date.fromisoformat(str(data_inizio)[:10])
+        except ValueError:
+            continue
+        try:
+            d_fine = datetime.date.fromisoformat(str(data_fine)[:10]) if data_fine else d_inizio
+        except ValueError:
+            d_fine = d_inizio
+        if d_fine < d_inizio:
+            d_fine = d_inizio
+        if tipo == "Permesso":
+            try:
+                ore = float(ore_permesso)
+            except (TypeError, ValueError):
+                ore = 8.0
+            chiave = (dipendente, d_inizio)
+            mappa[chiave] = min(8.0, mappa.get(chiave, 0.0) + max(ore, 0.0))
+        else:  # Ferie (o altro tipo non gestito esplicitamente): blocca l'intera giornata
+            giorno = d_inizio
+            while giorno <= d_fine:
+                mappa[(dipendente, giorno)] = 8.0
+                giorno += datetime.timedelta(days=1)
+    return mappa
+
+def _ore_disponibili_operatore(dipendente, giorno, mappa_assenze, cache_festivita):
+    """Ore lavorabili da un operatore in un giorno specifico: 0 se sabato/domenica o
+    festività italiana, altrimenti 8 meno le eventuali ore già bloccate da
+    ferie/permessi approvati quel giorno (mai sotto zero). Per una fase non ancora
+    assegnata a nessuno (dipendente vuoto) contano solo weekend/festività, dato che
+    non c'è una persona specifica di cui controllare le assenze."""
+    if giorno.weekday() >= 5:  # 5=sabato, 6=domenica
+        return 0.0
+    anno = giorno.year
+    if anno not in cache_festivita:
+        cache_festivita[anno] = festivita_italiane(anno)
+    if giorno in cache_festivita[anno]:
+        return 0.0
+    ore_bloccate = mappa_assenze.get(((dipendente or "").strip(), giorno), 0.0)
+    return max(8.0 - ore_bloccate, 0.0)
+
+def _avanza_fase_teorica(data_inizio, ore_da_coprire, dipendente, mappa_assenze, cache_festivita):
+    """A partire da data_inizio, avanza giorno per giorno (saltando i giorni non
+    lavorativi per quel dipendente, vedi _ore_disponibili_operatore) finché non sono
+    state coperte ore_da_coprire ore a un massimo di 8 ore/giorno. Restituisce
+    (data_inizio_effettiva, data_fine): la prima è il primo giorno lavorativo utile a
+    partire da data_inizio (può differire da data_inizio se cade di sabato, domenica,
+    festivo o giorno di assenza), la seconda è il giorno in cui le ore si esauriscono."""
+    giorno = data_inizio
+    ore_rimanenti = max(float(ore_da_coprire or 0), 0.0)
+    data_inizio_effettiva = None
+    ultimo_giorno_lavorato = None
+    for _ in range(3660):  # ~10 anni di margine di sicurezza contro loop infiniti
+        ore_oggi = _ore_disponibili_operatore(dipendente, giorno, mappa_assenze, cache_festivita)
+        if ore_oggi > 0:
+            if data_inizio_effettiva is None:
+                data_inizio_effettiva = giorno
+            ultimo_giorno_lavorato = giorno
+            ore_rimanenti -= ore_oggi
+            if ore_rimanenti <= 0:
+                break
+        giorno += datetime.timedelta(days=1)
+    if data_inizio_effettiva is None:
+        data_inizio_effettiva = giorno
+    if ultimo_giorno_lavorato is None:
+        ultimo_giorno_lavorato = data_inizio_effettiva
+    return data_inizio_effettiva, ultimo_giorno_lavorato
+
+def compute_gantt_teorico_commessa(commessa):
+    """Gantt teorico di una commessa: per ogni fase, la finestra Inizio-Fine prevista
+    calcolata da zero (non da dati reali). Le fasi assegnate allo stesso operatore si
+    susseguono nell'ordine di MACRO_FASI_DISPONIBILI (poi di creazione): fasi di
+    operatori diversi procedono invece in parallelo, tutte a partire dalla data di
+    inizio lavori della commessa. Le fasi non assegnate a nessuno si susseguono a loro
+    volta, una "catena" per reparto (non potendo sapere chi le farà, si assume che sul
+    reparto lavori una persona alla volta su queste). Restituisce (df, messaggio): df è
+    vuoto con un messaggio esplicativo se manca la data di inizio lavori o la commessa
+    non ha ancora fasi."""
+    colonne = ["Fase", "Macro-fase", "Area", "Operatore", "Stato", "Inizio", "Fine", "Ore stimate"]
+    data_inizio_lavori = get_data_inizio_lavori_commessa(commessa)
+    if not data_inizio_lavori:
+        return pd.DataFrame(columns=colonne), "Imposta prima una data di inizio lavori per questa commessa."
+    try:
+        data_inizio_lavori = datetime.date.fromisoformat(str(data_inizio_lavori)[:10])
+    except ValueError:
+        return pd.DataFrame(columns=colonne), "Data di inizio lavori non valida."
+    fasi = get_fasi_commessa(commessa)
+    if not fasi:
+        return pd.DataFrame(columns=colonne), "Questa commessa non ha ancora fasi."
+    ordine_macro_fase = {mf: i for i, mf in enumerate(MACRO_FASI_DISPONIBILI)}
+    catene = {}
+    for id_, fase, area, ore, operatore, macro_fase, stato in fasi:
+        operatore_norm = (operatore or "").strip()
+        chiave_catena = (area, operatore_norm) if operatore_norm else (area, "__non_assegnato__")
+        catene.setdefault(chiave_catena, []).append((id_, fase, area, ore, operatore_norm, macro_fase, stato))
+    mappa_assenze = get_mappa_assenze_approvate()
+    cache_festivita = {}
+    righe = []
+    for fasi_catena in catene.values():
+        fasi_catena.sort(key=lambda r: (ordine_macro_fase.get(r[5], len(MACRO_FASI_DISPONIBILI)), r[0]))
+        cursore = data_inizio_lavori
+        for id_, fase, area_fase, ore, operatore_norm, macro_fase, stato in fasi_catena:
+            inizio_eff, fine_eff = _avanza_fase_teorica(cursore, ore, operatore_norm, mappa_assenze, cache_festivita)
+            righe.append({
+                "Fase": fase, "Macro-fase": macro_fase or "Altro", "Area": area_fase,
+                "Operatore": operatore_norm or "Non assegnato", "Stato": stato,
+                "Inizio": inizio_eff, "Fine": fine_eff, "Ore stimate": ore,
+            })
+            cursore = fine_eff + datetime.timedelta(days=1)
+    df = pd.DataFrame(righe, columns=colonne)
+    if df.empty:
+        return df, "Questa commessa non ha ancora fasi."
+    return df.sort_values(["Inizio", "Macro-fase", "Fase"]).reset_index(drop=True), ""
+
+def compute_gantt_effettivo_commessa(commessa, df):
+    """Gantt effettivo di una commessa: per ogni fase su cui è stata registrata almeno
+    una timbratura 'Inizio fase', la finestra dal primo giorno lavorato all'ultimo
+    (preso direttamente dalle timbrature reali: qui le ore lavorate in un giorno
+    possono anche superare le 8, a differenza del Gantt teorico). Una fase il cui stato
+    non è 'Completata' viene mostrata come ancora in corso, con la finestra estesa fino
+    a oggi. Le fasi non ancora iniziate non compaiono."""
+    colonne = ["Fase", "Macro-fase", "Area", "Operatore", "Stato", "Inizio", "Fine", "In corso", "Ore stimate"]
+    if not commessa:
+        return pd.DataFrame(columns=colonne)
+    fasi = get_fasi_commessa(commessa)
+    if not fasi:
+        return pd.DataFrame(columns=colonne)
+    info_fasi = {fase: (area, ore, (operatore or "").strip(), macro_fase or "Altro", stato)
+                 for _id, fase, area, ore, operatore, macro_fase, stato in fasi}
+    if df is None or df.empty:
+        return pd.DataFrame(columns=colonne)
+    dfn = normalize_datetime(df)
+    dfn = dfn[(dfn["Commessa"] == commessa) & (dfn["Azione"].isin(["Inizio fase", "Fine fase"]))]
+    dfn_inizio = dfn[dfn["Azione"] == "Inizio fase"]
+    dfn_fine = dfn[dfn["Azione"] == "Fine fase"]
+    if dfn_inizio.empty:
+        return pd.DataFrame(columns=colonne)
+    righe = []
+    for fase, gruppo in dfn_inizio.groupby("Fase"):
+        if fase not in info_fasi:
+            continue
+        area, ore, operatore, macro_fase, stato = info_fasi[fase]
+        inizi = gruppo["Timestamp"].dropna()
+        if inizi.empty:
+            continue
+        data_inizio = inizi.min().date()
+        fini = dfn_fine[dfn_fine["Fase"] == fase]["Timestamp"].dropna()
+        data_fine_reale = fini.max().date() if not fini.empty else None
+        in_corso = stato != "Completata"
+        if in_corso:
+            data_fine_visualizzata = max(data_fine_reale, datetime.date.today()) if data_fine_reale else datetime.date.today()
+        else:
+            data_fine_visualizzata = data_fine_reale or data_inizio
+        righe.append({
+            "Fase": fase, "Macro-fase": macro_fase, "Area": area, "Operatore": operatore or "Non assegnato",
+            "Stato": stato, "Inizio": data_inizio, "Fine": data_fine_visualizzata, "In corso": in_corso, "Ore stimate": ore,
+        })
+    dfr = pd.DataFrame(righe, columns=colonne)
+    if dfr.empty:
+        return dfr
+    return dfr.sort_values(["Inizio", "Macro-fase", "Fase"]).reset_index(drop=True)
 
 def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, attore=""):
     """UI di gestione fasi/ore-stimate per commessa. Se scope_area è impostata
@@ -1948,7 +2241,7 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
     else:
         # Il responsabile può gestire solo le macro-fasi mappate sul proprio reparto:
         # se ne mappasse una diversa vedrebbe/creerebbe fasi fuori dalla propria area.
-        macro_fasi_disponibili_qui = [mf for mf, reparto in mappa_macro_reparto.items() if reparto == scope_area]
+        macro_fasi_disponibili_qui = [mf for mf, reparto in mappa_macro_reparto.items() if _stesso_reparto(reparto, scope_area)]
         if not macro_fasi_disponibili_qui:
             st.info(f"Nessuna macro-fase è ancora collegata al reparto '{scope_area}': chiedi all'admin di configurarla in 'Mappatura macro-fasi/reparti'.")
             return
@@ -2212,7 +2505,8 @@ def aggiorna_stato_richiesta(request_id, stato):
         # Aggiorna stato
         c.execute("UPDATE richieste SET Stato = ? WHERE ID = ?", (stato, str(request_id)))
         conn.commit()
-    
+    get_mappa_assenze_approvate.clear()
+
     # 📧 Invia email di notifica al dipendente
     if row:
         dipendente, tipo_richiesta, data_inizio, data_fine = row
@@ -3658,6 +3952,101 @@ def render_gestione_costi(df, key_prefix):
                 st.error(errore)
         st.caption("Il costo del personale in trasferta è calcolato in automatico dalle ore effettivamente lavorate nel periodo della trasferta × il costo orario CCNL del dipendente (lo stesso usato in 'Grafici e Classifiche').")
 
+def render_pianificazione_commessa(df, key_prefix, puo_modificare=False):
+    """Pagina 'Pianificazione' (Gantt): visibile a TUTTI (admin, responsabile, utente
+    semplice) per qualsiasi commessa, con due Gantt - teorico (calcolato da zero, vedi
+    compute_gantt_teorico_commessa) ed effettivo (dalle timbrature reali, vedi
+    compute_gantt_effettivo_commessa) - più le eventuali scadenze previste per
+    macro-fase, impostabili a mano come riferimento. Solo se puo_modificare è True
+    (admin) si possono cambiare la data di inizio lavori e le scadenze: agli altri
+    ruoli la pagina è di sola consultazione, come già per la priorità delle commesse."""
+    st.subheader("📅 Pianificazione commessa (Gantt)")
+    commesse_disponibili = get_commesse_names()
+    if not commesse_disponibili:
+        st.info("Nessuna commessa configurata.")
+        return
+    commessa_scelta = st.selectbox("Commessa", options=commesse_disponibili, key=f"{key_prefix}_pianificazione_commessa")
+    mostra_info_commessa(commessa_scelta)
+
+    data_inizio_attuale = get_data_inizio_lavori_commessa(commessa_scelta)
+    if puo_modificare:
+        valore_default = datetime.date.fromisoformat(data_inizio_attuale) if data_inizio_attuale else datetime.date.today()
+        nuova_data_inizio = st.date_input("Data di inizio lavori (punto di partenza del Gantt teorico)", value=valore_default, key=f"{key_prefix}_pianificazione_data_inizio_{commessa_scelta}")
+        if st.button("💾 Salva data di inizio lavori", key=f"{key_prefix}_pianificazione_btn_salva_inizio_{commessa_scelta}"):
+            ok, errore = aggiorna_data_inizio_lavori_commessa(commessa_scelta, nuova_data_inizio.isoformat())
+            if ok:
+                st.success("Data di inizio lavori aggiornata.")
+                st.rerun()
+            else:
+                st.error(errore)
+    else:
+        st.caption(f"Data di inizio lavori: **{data_inizio_attuale or 'non ancora impostata'}**")
+
+    st.markdown("---")
+    st.markdown("**🎯 Scadenze previste per macro-fase**")
+    st.caption("Obiettivo di riferimento impostato a mano (facoltativo), da confrontare con il Gantt teorico calcolato in automatico e con l'andamento reale.")
+    scadenze_attuali = get_scadenze_macro_fase(commessa_scelta)
+    macro_fasi_commessa = sorted({(row[5] or "Altro") for row in get_fasi_commessa(commessa_scelta)})
+    if not macro_fasi_commessa:
+        st.info("Questa commessa non ha ancora fasi: aggiungile in 'Gestione Commesse' prima di pianificare.")
+    elif puo_modificare:
+        for macro_fase in macro_fasi_commessa:
+            valore_scadenza = scadenze_attuali.get(macro_fase, "")
+            col_nome, col_data, col_azione = st.columns([2, 2, 1])
+            with col_nome:
+                st.write(macro_fase)
+            with col_data:
+                default_scadenza = datetime.date.fromisoformat(valore_scadenza) if valore_scadenza else None
+                nuova_scadenza = st.date_input("Scadenza", value=default_scadenza, key=f"{key_prefix}_scadenza_{commessa_scelta}_{macro_fase}")
+            with col_azione:
+                if st.button("💾", key=f"{key_prefix}_btn_scadenza_{commessa_scelta}_{macro_fase}"):
+                    ok, errore = imposta_scadenza_macro_fase(commessa_scelta, macro_fase, nuova_scadenza.isoformat() if nuova_scadenza else "")
+                    if ok:
+                        st.success(f"Scadenza di '{macro_fase}' aggiornata.")
+                        st.rerun()
+                    else:
+                        st.error(errore)
+    elif scadenze_attuali:
+        st.dataframe(pd.DataFrame([{"Macro-fase": mf, "Scadenza prevista": data} for mf, data in scadenze_attuali.items()]), use_container_width=True)
+    else:
+        st.info("Nessuna scadenza impostata per questa commessa.")
+
+    st.markdown("---")
+    st.markdown("**📐 Gantt teorico**")
+    st.caption("Calcolato dalla data di inizio lavori e dalle ore stimate di ogni fase (8 ore/giorno per l'operatore assegnato), saltando sabati, domeniche, festività italiane e le ferie/permessi già approvati dell'operatore.")
+    gantt_teorico, messaggio_teorico = compute_gantt_teorico_commessa(commessa_scelta)
+    if messaggio_teorico:
+        st.info(messaggio_teorico)
+    else:
+        gantt_teorico_chart = gantt_teorico.copy()
+        gantt_teorico_chart["Fine (esclusa)"] = pd.to_datetime(gantt_teorico_chart["Fine"]) + pd.Timedelta(days=1)
+        chart_teorico = alt.Chart(gantt_teorico_chart).mark_bar().encode(
+            x=alt.X("Inizio:T", title="Data"), x2="Fine (esclusa):T",
+            y=alt.Y("Fase:N", sort=alt.EncodingSortField(field="Inizio", order="ascending")),
+            color=alt.Color("Macro-fase:N"),
+            tooltip=["Fase:N", "Macro-fase:N", "Area:N", "Operatore:N", "Inizio:T", "Fine:T", "Ore stimate:Q"]
+        ).properties(height=32 * len(gantt_teorico_chart) + 80)
+        st.altair_chart(chart_teorico, use_container_width=True)
+        st.dataframe(gantt_teorico, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("**✅ Gantt effettivo**")
+    st.caption("Calcolato dalle timbrature reali (Inizio fase → Fine fase): mostra solo le fasi già iniziate, con la finestra prolungata fino a oggi per quelle non ancora completate.")
+    gantt_effettivo = compute_gantt_effettivo_commessa(commessa_scelta, df)
+    if gantt_effettivo.empty:
+        st.info("Nessuna fase ancora iniziata su questa commessa.")
+    else:
+        gantt_effettivo_chart = gantt_effettivo.copy()
+        gantt_effettivo_chart["Fine (esclusa)"] = pd.to_datetime(gantt_effettivo_chart["Fine"]) + pd.Timedelta(days=1)
+        chart_effettivo = alt.Chart(gantt_effettivo_chart).mark_bar().encode(
+            x=alt.X("Inizio:T", title="Data"), x2="Fine (esclusa):T",
+            y=alt.Y("Fase:N", sort=alt.EncodingSortField(field="Inizio", order="ascending")),
+            color=alt.Color("Stato:N", scale=alt.Scale(domain=list(COLORI_STATO_FASE.keys()), range=list(COLORI_STATO_FASE.values()))),
+            tooltip=["Fase:N", "Macro-fase:N", "Area:N", "Operatore:N", "Stato:N", "Inizio:T", "Fine:T", "In corso:N"]
+        ).properties(height=32 * len(gantt_effettivo_chart) + 80)
+        st.altair_chart(chart_effettivo, use_container_width=True)
+        st.dataframe(gantt_effettivo, use_container_width=True)
+
 def get_parametri_sostenibilita():
     """Coefficienti configurati per la sezione Sostenibilità: quanto si stima che
     l'azienda risparmi (€/h di smart working, in costi di gestione ufficio) e quanta
@@ -4404,7 +4793,7 @@ PAGINE_SENZA_AUTOREFRESH_AUTOMATICO = {
     "Profilo", "Timbrature", "📷 Report Intervento",
     "🧳 Trasferte e Interventi (Service)", "🧳 Trasferte Service",
     "Richiesta ferie/permessi", "Richiesta rettifica",
-    "💰 Costi commesse", "💰 Gestione Costi",
+    "💰 Costi commesse", "💰 Gestione Costi", "📅 Pianificazione",
 }
 
 def pagina_abilitata_per_autorefresh(pagina):
@@ -4458,7 +4847,7 @@ else:
 
         admin_page = render_menu_a_categorie([
             ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
-            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse"]),
+            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione"]),
             ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
             ("🧳 Trasferte e Team", ["🧳 Trasferte e Interventi (Service)", "📅 Disponibilità Team"]),
             ("💰 Costi", ["💰 Costi commesse"]),
@@ -4636,6 +5025,9 @@ else:
                     st.info("Nessuna lavorazione registrata finora su questa commessa.")
                 else:
                     st.dataframe(storico_commessa, use_container_width=True)
+
+        elif admin_page == "📅 Pianificazione":
+            render_pianificazione_commessa(df, key_prefix="admin_pianificazione", puo_modificare=True)
 
         elif admin_page == "💰 Costi commesse":
             render_gestione_costi(df, key_prefix="admin_costi")
@@ -5243,7 +5635,7 @@ else:
 
             resp_page = render_menu_a_categorie([
                 ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature"]),
-                ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa"]),
+                ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione"]),
                 ("📅 Disponibilità", ["📅 Disponibilità Team"]),
             ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
             st.session_state["_ultima_pagina_vista"] = resp_page
@@ -5375,6 +5767,9 @@ else:
             elif resp_page == "📅 Disponibilità Team":
                 render_disponibilita_team(area_default=area_responsabile, forza_area=True, key_prefix="resp")
 
+            elif resp_page == "📅 Pianificazione":
+                render_pianificazione_commessa(df, key_prefix="resp_pianificazione", puo_modificare=False)
+
         elif modalita == "🧳 Trasferte Service":
             st.session_state["_ultima_pagina_vista"] = "🧳 Trasferte Service"
             render_gestione_trasferte_service(user_info["name"], key_prefix="resp_service")
@@ -5399,7 +5794,7 @@ else:
         categorie_utente = [
             ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
             ("👤 Profilo", ["Profilo"]),
-            ("🏭 Le mie Commesse", ["Le mie Commesse"]),
+            ("🏭 Le mie Commesse", ["Le mie Commesse", "📅 Pianificazione"]),
             ("🧳 Service", pagine_service_utente),
             ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
         ]
@@ -5586,6 +5981,9 @@ else:
 
         elif pagina_utente == "Le mie Commesse":
             render_le_mie_commesse(dipendente_scelto, user_info["area"], key_prefix="user")
+
+        elif pagina_utente == "📅 Pianificazione":
+            render_pianificazione_commessa(df, key_prefix="user_pianificazione", puo_modificare=False)
 
         elif pagina_utente == "📷 Report Intervento":
             render_report_intervento(dipendente_scelto, df, key_prefix="user")
