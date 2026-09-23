@@ -239,6 +239,8 @@ def is_legacy_plaintext_password(stored_value):
 MACRO_FASI_DISPONIBILI = [
     "Progettazione Meccanica", "Progettazione Elettrica", "Sviluppo Software",
     "Test Software", "Messa in Servizio", "Collaudo", "Avviamento",
+    "Gestione Costi", "Approvvigionamento Materiale", "Gestione Magazzino",
+    "Montaggio", "Cablaggio", "Gestione Fornitori", "Gestione Contratti",
 ]
 
 @st.cache_resource
