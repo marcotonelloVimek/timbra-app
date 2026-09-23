@@ -526,6 +526,10 @@ def init_db():
             ("commessa", "TEXT"), ("cliente", "TEXT"), ("stato", "TEXT"), ("indirizzo", "TEXT"),
             ("albergo", "TEXT"), ("mezzi", "TEXT"), ("dettaglio_auto", "TEXT"),
             ("dettaglio_treno", "TEXT"), ("dettaglio_aereo", "TEXT"), ("dettaglio_auto_noleggio", "TEXT"),
+            # Costi di alloggio e trasporto della trasferta (inseriti a mano da chi
+            # gestisce l'area Costi): il costo del personale in trasferta invece si
+            # calcola sempre in automatico dalle ore lavorate, non si salva qui.
+            ("costo_alloggio", "REAL DEFAULT 0"), ("costo_trasporto", "REAL DEFAULT 0"),
         ]:
             try:
                 c.execute(f"ALTER TABLE trasferte ADD COLUMN {colonna_trasferta} {tipo_colonna}")
@@ -1772,9 +1776,10 @@ def get_attivita_assegnate_dipendente(dipendente, area):
     incluse le fasi non assegnate a nessuno: questa è la lista di ciò che è
     esplicitamente suo, non di ciò che potrebbe prendere in mano."""
     if not dipendente or not area:
-        return pd.DataFrame(columns=["Commessa", "Cliente", "Fase", "Priorità", "Stato", "Ore stimate"])
+        return pd.DataFrame(columns=["Commessa", "Cliente", "Tipologia impianto", "Fase", "Priorità", "Stato", "Ore stimate"])
     with db_connect() as conn:
-        df = pd.read_sql("""SELECT f.commessa AS Commessa, co.cliente AS Cliente, f.fase AS Fase,
+        df = pd.read_sql("""SELECT f.commessa AS Commessa, co.cliente AS Cliente,
+                                    co.tipologia_impianto AS 'Tipologia impianto', f.fase AS Fase,
                                     co.priorita AS Priorità, co.stato AS Stato, f.ore_stimate AS 'Ore stimate'
                              FROM fasi_commessa f JOIN commesse co ON co.nome = f.commessa
                              WHERE f.area = ? AND TRIM(f.operatore_assegnato) = TRIM(?)""", conn, params=(area, dipendente or ""))
@@ -1794,8 +1799,8 @@ def get_commesse_con_fasi_assegnate(dipendente, area):
     restituisce una riga per commessa invece che una per fase."""
     attivita = get_attivita_assegnate_dipendente(dipendente, area)
     if attivita.empty:
-        return pd.DataFrame(columns=["Commessa", "Cliente", "Priorità", "Stato"])
-    riepilogo = attivita.drop_duplicates(subset=["Commessa"])[["Commessa", "Cliente", "Priorità", "Stato"]].reset_index(drop=True)
+        return pd.DataFrame(columns=["Commessa", "Cliente", "Tipologia impianto", "Priorità", "Stato"])
+    riepilogo = attivita.drop_duplicates(subset=["Commessa"])[["Commessa", "Cliente", "Tipologia impianto", "Priorità", "Stato"]].reset_index(drop=True)
     ordine_priorita = {"Alta": 0, "Media": 1, "Bassa": 2}
     riepilogo["_ordine"] = riepilogo["Priorità"].map(ordine_priorita).fillna(1)
     riepilogo = riepilogo.sort_values(["_ordine", "Commessa"]).drop(columns=["_ordine"]).reset_index(drop=True)
@@ -1905,7 +1910,7 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
         if commesse_dettaglio.empty:
             st.info("Nessuna commessa ancora creata.")
         else:
-            st.dataframe(commesse_dettaglio, use_container_width=True)
+            st.dataframe(evidenzia_stato_e_priorita_commesse(commesse_dettaglio), use_container_width=True)
             st.caption("Lo Stato non si imposta più a mano: si calcola in automatico dagli stati delle fasi (Completata solo quando tutte le fasi sono Completate, In pausa se almeno una fase è in pausa, ecc. - vedi più sotto).")
 
             st.markdown("**Aggiorna priorità**")
@@ -1933,6 +1938,7 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
         return
 
     commessa_sel = st.selectbox("Commessa", options=commesse, key="fase_commessa_select")
+    mostra_info_commessa(commessa_sel)
 
     mappa_macro_reparto = get_mappa_macro_fase_reparto()
     if allow_create_commessa:
@@ -2324,6 +2330,14 @@ def is_area_service(area):
     Service, usata per sbloccare la programmazione trasferte a chiunque ne faccia parte."""
     return str(area or "").strip().lower() == "service"
 
+def is_area_costi(area):
+    """Vero se l'area indicata è l'area Costi, sullo stesso modello di
+    is_area_service: sblocca la pagina 'Costi' (costo delle fasi e delle
+    trasferte per commessa) a chiunque ne faccia parte, oltre che all'admin. Come
+    per il Service, sarà l'admin a creare i dipendenti (responsabile e utenti
+    semplici) con questa area, quando saranno pronti."""
+    return str(area or "").strip().lower() == "costi"
+
 MEZZI_TRASPORTO_DISPONIBILI = ["Auto", "Treno", "Aereo", "Auto a noleggio"]
 
 def get_cliente_commessa(commessa):
@@ -2348,6 +2362,32 @@ def get_paese_commessa(commessa):
         c.execute("SELECT paese FROM commesse WHERE nome = ?", (commessa,))
         row = c.fetchone()
         return row[0] or "" if row else ""
+
+def get_cliente_e_tipologia_commessa(commessa):
+    """Cliente e tipologia impianto di una commessa in un'unica query: usata nella
+    schermata di timbratura per mostrare all'operatore, appena sceglie la
+    commessa, su quale cliente/impianto sta per timbrare (richiesto da Marco per
+    evitare errori quando si lavora su più commesse simili)."""
+    if not commessa:
+        return "", ""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT cliente, tipologia_impianto FROM commesse WHERE nome = ?", (commessa,))
+        row = c.fetchone()
+        if not row:
+            return "", ""
+        return row[0] or "", row[1] or ""
+
+def mostra_info_commessa(commessa):
+    """Mostra cliente e tipologia impianto della commessa appena scelta in una
+    tendina (timbratura, gestione fasi, traccia lavorazioni...), cosi' non serve
+    ricordarli a memoria o andare a controllarli altrove."""
+    if not commessa:
+        return
+    cliente, tipologia = get_cliente_e_tipologia_commessa(commessa)
+    if cliente or tipologia:
+        dettagli = " · ".join(filter(None, [f"Cliente: {cliente}" if cliente else "", f"Impianto: {tipologia}" if tipologia else ""]))
+        st.caption(f"ℹ️ {dettagli}")
 
 def valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati, dettaglio_auto, dettaglio_treno, dettaglio_aereo):
     """Validazione dati di una trasferta prima del salvataggio. Restituisce (ok, errore)."""
@@ -2499,6 +2539,29 @@ def elimina_trasferta(trasferta_id):
             return False, "Questa trasferta ha già un report intervento collegato: elimina prima quello."
         c.execute("DELETE FROM trasferte WHERE id = ?", (trasferta_id,))
         conn.commit()
+    return True, ""
+
+def aggiorna_costi_trasferta(trasferta_id, costo_alloggio, costo_trasporto):
+    """Aggiorna il costo di alloggio e trasporto di una trasferta già programmata
+    (inserito a mano da chi gestisce l'area Costi): il costo del personale non si
+    imposta qui, si calcola sempre in automatico dalle ore effettivamente
+    lavorate nel periodo della trasferta - vedi get_costi_trasferte. Restituisce
+    (ok, errore)."""
+    try:
+        costo_alloggio = float(costo_alloggio)
+        costo_trasporto = float(costo_trasporto)
+    except (TypeError, ValueError):
+        return False, "Costo alloggio e costo trasporto devono essere numeri."
+    if costo_alloggio < 0 or costo_trasporto < 0:
+        return False, "I costi non possono essere negativi."
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE trasferte SET costo_alloggio=?, costo_trasporto=? WHERE id=?",
+                  (costo_alloggio, costo_trasporto, trasferta_id))
+        righe_modificate = c.rowcount
+        conn.commit()
+    if righe_modificate == 0:
+        return False, "Trasferta non trovata (potrebbe essere stata eliminata nel frattempo)."
     return True, ""
 
 def comprimi_immagine_upload(uploaded_file, max_dimensione=1600, qualita=80):
@@ -2924,6 +2987,18 @@ COLORI_STATO_FASE = {
     "Completata": "#16a34a",
 }
 
+# Stessi colori usati anche per lo stato della commessa (stessi valori possibili -
+# vedi STATI_COMMESSA_DISPONIBILI), e una palette analoga per la priorità: usati
+# per i badge colorati nelle liste/schede delle commesse (Gestione Commesse,
+# Resoconto Commesse, Le mie Commesse), come chiesto da Marco per distinguerle a
+# colpo d'occhio invece che solo per testo.
+COLORI_STATO_COMMESSA = COLORI_STATO_FASE
+COLORI_PRIORITA_COMMESSA = {
+    "Bassa": "#16a34a",
+    "Media": "#d97706",
+    "Alta": "#dc2626",
+}
+
 def _render_tag_pills(coppie_etichetta_colore):
     """Disegna una riga di 'tag' colorati (etichetta, colore esadecimale), come le
     etichette colorate per fase viste nell'esempio di Marco: usata per mostrare a
@@ -2937,6 +3012,25 @@ def _render_tag_pills(coppie_etichetta_colore):
         for etichetta, colore in coppie_etichetta_colore
     )
     st.markdown(html, unsafe_allow_html=True)
+
+VISTE_LE_MIE_COMMESSE = ["📋 Da fare", "▶️ In corso", "⏸️ In pausa", "✅ Completate"]
+_STATO_PER_VISTA_LE_MIE_COMMESSE = {
+    "📋 Da fare": "Da iniziare",
+    "▶️ In corso": "In corso",
+    "⏸️ In pausa": "In pausa",
+    "✅ Completate": "Completata",
+}
+
+def filtra_commesse_per_vista(riepilogo, vista_scelta):
+    """Filtra il riepilogo di 'Le mie Commesse' in base alla vista scelta col radio
+    (Da fare/In corso/In pausa/Completate): ogni vista mostra solo le commesse con
+    quello specifico stato, uno a uno (a differenza di prima, dove 'Da fare'
+    includeva anche le commesse già 'In corso', che invece Marco ha chiesto di
+    vedere in una scheda separata)."""
+    stato_cercato = _STATO_PER_VISTA_LE_MIE_COMMESSE.get(vista_scelta)
+    if stato_cercato is None or riepilogo.empty:
+        return riepilogo.iloc[0:0]
+    return riepilogo[riepilogo["Stato"] == stato_cercato]
 
 def render_le_mie_commesse(dipendente_nome, area, key_prefix):
     """Le commesse (non le singole fasi) in cui questo dipendente ha almeno una fase
@@ -2954,13 +3048,8 @@ def render_le_mie_commesse(dipendente_nome, area, key_prefix):
         st.info("Nessuna fase è ancora stata assegnata specificamente a te. Le fasi non assegnate a nessuno restano comunque disponibili nella scheda Timbrature.")
         return
 
-    vista_scelta = st.radio("Vista", ["📋 Da fare", "⏸️ In pausa", "✅ Completate"], horizontal=True, key=f"{key_prefix}_commesse_vista")
-    if vista_scelta == "📋 Da fare":
-        filtrate = riepilogo[riepilogo["Stato"].isin(["Da iniziare", "In corso"])]
-    elif vista_scelta == "⏸️ In pausa":
-        filtrate = riepilogo[riepilogo["Stato"] == "In pausa"]
-    else:
-        filtrate = riepilogo[riepilogo["Stato"] == "Completata"]
+    vista_scelta = st.radio("Vista", VISTE_LE_MIE_COMMESSE, horizontal=True, key=f"{key_prefix}_commesse_vista")
+    filtrate = filtra_commesse_per_vista(riepilogo, vista_scelta)
 
     if filtrate.empty:
         st.info("Nessuna commessa in questa categoria.")
@@ -2969,9 +3058,18 @@ def render_le_mie_commesse(dipendente_nome, area, key_prefix):
     for _, riga_commessa in filtrate.iterrows():
         commessa = riga_commessa["Commessa"]
         cliente = riga_commessa["Cliente"] if pd.notna(riga_commessa["Cliente"]) and riga_commessa["Cliente"] else ""
+        tipologia = riga_commessa["Tipologia impianto"] if pd.notna(riga_commessa["Tipologia impianto"]) and riga_commessa["Tipologia impianto"] else ""
         with st.container(border=True):
-            st.write(f"**{commessa}**" + (f" — {cliente}" if cliente else ""))
-            st.caption(f"Priorità: {riga_commessa['Priorità']} · Stato: {riga_commessa['Stato']}")
+            titolo = f"**{commessa}**"
+            if cliente:
+                titolo += f" — {cliente}"
+            if tipologia:
+                titolo += f" ({tipologia})"
+            st.write(titolo)
+            _render_tag_pills([
+                (riga_commessa["Priorità"], COLORI_PRIORITA_COMMESSA.get(riga_commessa["Priorità"], "#6b7280")),
+                (riga_commessa["Stato"], COLORI_STATO_COMMESSA.get(riga_commessa["Stato"], "#6b7280")),
+            ])
 
             # Tutte le fasi della commessa, di ogni reparto: per avere visibilità
             # sull'intero processo produttivo, non solo sulla propria parte.
@@ -3338,6 +3436,225 @@ def compute_costo_per_area(df, start_date, end_date, area_filter=None):
     agg["Ore_lavorate"] = agg["Ore_lavorate"].round(2)
     agg["Costo_totale"] = agg["Costo_totale"].round(2)
     return agg.sort_values("Costo_totale", ascending=False).reset_index(drop=True)
+
+def _costo_orario_dipendente(dipendente, mappa_livelli, mappa_costi_livello):
+    """Costo orario (€/h) di un dipendente in base al suo livello CCNL, con lo
+    stesso fallback sul costo aziendale di default usato in tutta l'app (vedi
+    compute_costo_dipendenti). Se 'dipendente' è vuoto/None (fase non ancora
+    assegnata a nessuno), usa direttamente il costo di default."""
+    if not dipendente:
+        return float(DEFAULT_COSTO_ORARIO)
+    return mappa_costi_livello.get(mappa_livelli.get(dipendente), float(DEFAULT_COSTO_ORARIO))
+
+def get_costi_trasferte(df):
+    """Costo di ogni trasferta programmata, per la pagina 'Costi': costo di
+    alloggio e trasporto (inseriti a mano da chi gestisce l'area Costi - vedi
+    aggiorna_costi_trasferta) più il costo del personale in trasferta, calcolato
+    in automatico dalle ore effettivamente lavorate (Ingresso->Uscita) nel
+    periodo della trasferta, moltiplicate per il costo orario CCNL del
+    dipendente (stessa logica di compute_costo_dipendenti, qui applicata al solo
+    periodo/dipendente di quella trasferta)."""
+    with db_connect() as conn:
+        trasferte = pd.read_sql("""SELECT id AS ID, dipendente AS Dipendente, data_inizio AS Dal,
+                                           data_fine AS Al, commessa AS Commessa, cliente AS Cliente,
+                                           costo_alloggio AS Costo_alloggio, costo_trasporto AS Costo_trasporto
+                                    FROM trasferte ORDER BY data_inizio DESC, id DESC""", conn)
+    colonne = ["ID", "Dipendente", "Dal", "Al", "Commessa", "Cliente",
+               "Costo_alloggio", "Costo_trasporto", "Costo_personale", "Costo_totale"]
+    if trasferte.empty:
+        return pd.DataFrame(columns=colonne)
+
+    trasferte["Costo_alloggio"] = trasferte["Costo_alloggio"].fillna(0.0)
+    trasferte["Costo_trasporto"] = trasferte["Costo_trasporto"].fillna(0.0)
+
+    ore_giornaliere = compute_daily_work(df)  # Dipendente, Data, Ore_lavorate
+    mappa_livelli = get_users_livello_map()
+    mappa_costi_livello = get_livelli_costo_orario_map()
+
+    def _costo_personale(riga):
+        if ore_giornaliere.empty:
+            return 0.0
+        try:
+            inizio = datetime.date.fromisoformat(str(riga["Dal"])[:10])
+            fine = datetime.date.fromisoformat(str(riga["Al"])[:10])
+        except ValueError:
+            return 0.0
+        sotto_periodo = ore_giornaliere[(ore_giornaliere["Dipendente"] == riga["Dipendente"]) &
+                                         (ore_giornaliere["Data"] >= inizio) & (ore_giornaliere["Data"] <= fine)]
+        if sotto_periodo.empty:
+            return 0.0
+        costo_orario = _costo_orario_dipendente(riga["Dipendente"], mappa_livelli, mappa_costi_livello)
+        return float(sotto_periodo["Ore_lavorate"].sum()) * costo_orario
+
+    trasferte["Costo_personale"] = trasferte.apply(_costo_personale, axis=1).round(2)
+    trasferte["Costo_totale"] = (trasferte["Costo_alloggio"] + trasferte["Costo_trasporto"] + trasferte["Costo_personale"]).round(2)
+    return trasferte[colonne]
+
+def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None):
+    """Costo ipotetico (preventivo) e costo reale di ogni fase configurata, con lo
+    stesso costo orario CCNL già usato altrove nell'app (vedi
+    compute_costo_dipendenti):
+    - Costo_ipotetico = ore stimate della fase x costo orario dell'operatore
+      assegnato (o il costo orario aziendale di default se la fase non è ancora
+      assegnata a nessuno);
+    - Costo_reale = somma, per ogni dipendente che ha davvero lavorato quella
+      fase (Inizio fase -> Fine fase, su tutta la storia della fase, non solo un
+      periodo: una fase può durare mesi e va confrontata nel suo complesso),
+      delle sue ore effettive x il SUO costo orario (non necessariamente quello
+      dell'assegnatario, per riflettere chi ha davvero lavorato)."""
+    with db_connect() as conn:
+        fasi = pd.read_sql("""SELECT commessa AS Commessa, fase AS Fase, area AS Area,
+                                      macro_fase AS 'Macro-fase', stato AS Stato,
+                                      ore_stimate AS Ore_stimate, operatore_assegnato AS Operatore
+                               FROM fasi_commessa""", conn)
+    colonne = ["Commessa", "Fase", "Area", "Macro-fase", "Stato", "Ore_stimate",
+               "Costo_ipotetico", "Ore_effettive", "Costo_reale"]
+    if fasi.empty:
+        return pd.DataFrame(columns=colonne)
+    if commessa_filter and commessa_filter != "Tutte le commesse":
+        fasi = fasi[fasi["Commessa"] == commessa_filter]
+    if area_filter and area_filter != "Tutte le aree":
+        fasi = fasi[fasi["Area"] == area_filter]
+    if fasi.empty:
+        return pd.DataFrame(columns=colonne)
+    fasi = fasi.copy()
+
+    mappa_livelli = get_users_livello_map()
+    mappa_costi_livello = get_livelli_costo_orario_map()
+    fasi["Costo_ipotetico"] = fasi.apply(
+        lambda r: round(float(r["Ore_stimate"] or 0) * _costo_orario_dipendente(r["Operatore"], mappa_livelli, mappa_costi_livello), 2),
+        axis=1)
+
+    dfn = normalize_datetime(df)
+    righe_reali = []
+    if not dfn.empty:
+        dfn = dfn.copy()
+        # Come in compute_fasi_commessa_ore_effettive: l'area della lavorazione si
+        # ricava dal reparto del dipendente che l'ha eseguita, non salvata sulla
+        # singola timbratura.
+        dfn["Area"] = dfn["Dipendente"].map(get_users_area_map()).fillna("Unknown")
+        dfn = dfn[dfn["Azione"].isin(["Inizio fase", "Fine fase"])]
+        for (dip, commessa, fase, area), gruppo in dfn.groupby(["Dipendente", "Commessa", "Fase", "Area"]):
+            if not commessa or not fase:
+                continue
+            gruppo = gruppo.sort_values("Timestamp")
+            coda = []
+            for _, riga in gruppo.iterrows():
+                if riga["Azione"] == "Inizio fase":
+                    coda.append(riga["Timestamp"])
+                elif riga["Azione"] == "Fine fase" and coda:
+                    inizio_ts = coda.pop(0)
+                    if pd.notna(inizio_ts) and pd.notna(riga["Timestamp"]) and riga["Timestamp"] > inizio_ts:
+                        ore = (riga["Timestamp"] - inizio_ts).total_seconds() / 3600
+                        righe_reali.append({"Dipendente": dip, "Commessa": commessa, "Fase": fase, "Area": area, "Ore": ore})
+
+    if righe_reali:
+        reale_df = pd.DataFrame(righe_reali)
+        reale_df["Costo"] = reale_df.apply(
+            lambda r: r["Ore"] * _costo_orario_dipendente(r["Dipendente"], mappa_livelli, mappa_costi_livello), axis=1)
+        aggregato = reale_df.groupby(["Commessa", "Fase", "Area"], as_index=False).agg({"Ore": "sum", "Costo": "sum"})
+        aggregato = aggregato.rename(columns={"Ore": "Ore_effettive", "Costo": "Costo_reale"})
+    else:
+        aggregato = pd.DataFrame(columns=["Commessa", "Fase", "Area", "Ore_effettive", "Costo_reale"])
+
+    risultato = fasi.merge(aggregato, on=["Commessa", "Fase", "Area"], how="left")
+    risultato["Ore_effettive"] = risultato["Ore_effettive"].fillna(0.0).round(2)
+    risultato["Costo_reale"] = risultato["Costo_reale"].fillna(0.0).round(2)
+    return risultato[colonne]
+
+def get_riepilogo_costi_commesse(df):
+    """Riepilogo dei costi di ogni commessa, per la pagina 'Costi': costo
+    ipotetico e reale delle sue fasi (compute_costi_fasi_commessa) e costo delle
+    trasferte legate ad essa (get_costi_trasferte), con un totale. Il costo
+    ipotetico resta un riferimento (preventivo vs reale) e non entra nel totale,
+    per non sommare una stima insieme a costi reali."""
+    commesse_dettaglio = get_commesse_dettaglio()
+    colonne = ["Commessa", "Cliente", "Costo_ipotetico_fasi", "Costo_reale_fasi", "Costo_trasferte", "Costo_totale"]
+    if commesse_dettaglio.empty:
+        return pd.DataFrame(columns=colonne)
+
+    fasi_costi = compute_costi_fasi_commessa(df)
+    if not fasi_costi.empty:
+        agg_fasi = fasi_costi.groupby("Commessa", as_index=False).agg(
+            Costo_ipotetico_fasi=("Costo_ipotetico", "sum"), Costo_reale_fasi=("Costo_reale", "sum"))
+    else:
+        agg_fasi = pd.DataFrame(columns=["Commessa", "Costo_ipotetico_fasi", "Costo_reale_fasi"])
+
+    trasferte_costi = get_costi_trasferte(df)
+    trasferte_con_commessa = trasferte_costi[trasferte_costi["Commessa"].astype(bool)] if not trasferte_costi.empty else trasferte_costi
+    if not trasferte_con_commessa.empty:
+        agg_trasferte = trasferte_con_commessa.groupby("Commessa", as_index=False).agg(Costo_trasferte=("Costo_totale", "sum"))
+    else:
+        agg_trasferte = pd.DataFrame(columns=["Commessa", "Costo_trasferte"])
+
+    risultato = commesse_dettaglio[["Nome", "Cliente"]].rename(columns={"Nome": "Commessa"})
+    risultato = risultato.merge(agg_fasi, on="Commessa", how="left").merge(agg_trasferte, on="Commessa", how="left")
+    for colonna in ["Costo_ipotetico_fasi", "Costo_reale_fasi", "Costo_trasferte"]:
+        risultato[colonna] = risultato[colonna].fillna(0.0).round(2)
+    risultato["Costo_totale"] = (risultato["Costo_reale_fasi"] + risultato["Costo_trasferte"]).round(2)
+    return risultato.sort_values("Costo_totale", ascending=False).reset_index(drop=True)[colonne]
+
+def render_gestione_costi(df, key_prefix):
+    """Pagina 'Costi': visibile all'amministratore e a chi fa parte dell'area
+    Costi (responsabile o utente semplice), sullo stesso modello dell'area
+    Service. Per ogni commessa mostra il costo ipotetico e reale delle sue fasi
+    (ore stimate/effettive x costo orario CCNL - vedi compute_costi_fasi_commessa)
+    e il costo delle trasferte legate ad essa (alloggio + trasporto inseriti qui
+    a mano, più il costo del personale in trasferta calcolato in automatico -
+    vedi get_costi_trasferte)."""
+    st.subheader("💰 Costi per commessa")
+    st.caption("Il costo ipotetico delle fasi è una stima (ore stimate × costo orario CCNL dell'assegnatario, o quello aziendale di default se non ancora assegnata): resta un riferimento e non è sommato nel totale, che invece somma i costi reali (fasi + trasferte).")
+    riepilogo = get_riepilogo_costi_commesse(df)
+    if riepilogo.empty:
+        st.info("Nessuna commessa configurata.")
+        return
+    st.dataframe(riepilogo, use_container_width=True)
+
+    st.markdown("---")
+    commesse_options_costi = ["Tutte le commesse"] + get_commesse_names()
+    commessa_filtro_costi = st.selectbox("Filtra per commessa", options=commesse_options_costi, key=f"{key_prefix}_costi_commessa_filtro")
+    mostra_info_commessa(None if commessa_filtro_costi == "Tutte le commesse" else commessa_filtro_costi)
+
+    st.subheader("🧩 Costo delle fasi")
+    fasi_costi = compute_costi_fasi_commessa(df, commessa_filter=None if commessa_filtro_costi == "Tutte le commesse" else commessa_filtro_costi)
+    if fasi_costi.empty:
+        st.info("Nessuna fase configurata.")
+    else:
+        st.dataframe(fasi_costi, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("🧳 Costo delle trasferte")
+    trasferte_costi = get_costi_trasferte(df)
+    if commessa_filtro_costi != "Tutte le commesse":
+        trasferte_costi = trasferte_costi[trasferte_costi["Commessa"] == commessa_filtro_costi]
+    if trasferte_costi.empty:
+        st.info("Nessuna trasferta trovata.")
+    else:
+        st.dataframe(trasferte_costi, use_container_width=True)
+
+        st.markdown("**Aggiorna costi di una trasferta**")
+        opzioni_trasferta = {
+            f"#{riga['ID']} - {riga['Dipendente']} ({riga['Dal']} → {riga['Al']})" + (f" - {riga['Commessa']}" if riga['Commessa'] else ""): riga["ID"]
+            for _, riga in trasferte_costi.iterrows()
+        }
+        trasferta_scelta_label = st.selectbox("Trasferta", options=list(opzioni_trasferta.keys()), key=f"{key_prefix}_costi_trasferta_select")
+        trasferta_id_scelta = opzioni_trasferta[trasferta_scelta_label]
+        riga_scelta = trasferte_costi[trasferte_costi["ID"] == trasferta_id_scelta].iloc[0]
+        col_alloggio, col_trasporto = st.columns(2)
+        with col_alloggio:
+            nuovo_costo_alloggio = st.number_input("Costo alloggio (€)", min_value=0.0, step=10.0,
+                                                     value=float(riga_scelta["Costo_alloggio"]), key=f"{key_prefix}_costo_alloggio_{trasferta_id_scelta}")
+        with col_trasporto:
+            nuovo_costo_trasporto = st.number_input("Costo trasporto (€)", min_value=0.0, step=10.0,
+                                                       value=float(riga_scelta["Costo_trasporto"]), key=f"{key_prefix}_costo_trasporto_{trasferta_id_scelta}")
+        if st.button("💾 Salva costi trasferta", key=f"{key_prefix}_btn_salva_costi_trasferta_{trasferta_id_scelta}"):
+            ok, errore = aggiorna_costi_trasferta(trasferta_id_scelta, nuovo_costo_alloggio, nuovo_costo_trasporto)
+            if ok:
+                st.success("Costi trasferta aggiornati.")
+                st.rerun()
+            else:
+                st.error(errore)
+        st.caption("Il costo del personale in trasferta è calcolato in automatico dalle ore effettivamente lavorate nel periodo della trasferta × il costo orario CCNL del dipendente (lo stesso usato in 'Grafici e Classifiche').")
 
 def get_parametri_sostenibilita():
     """Coefficienti configurati per la sezione Sostenibilità: quanto si stima che
@@ -3938,6 +4255,28 @@ def evidenzia_richieste_per_stato(df):
 
     return df.style.apply(_stile_riga, axis=1)
 
+def evidenzia_stato_e_priorita_commesse(df):
+    """Restituisce uno Styler che colora le celle delle colonne 'Stato' e
+    'Priorità' di una tabella di commesse (vedi COLORI_STATO_COMMESSA/
+    COLORI_PRIORITA_COMMESSA), per distinguerle a colpo d'occhio invece che solo
+    per testo, come chiesto da Marco. Colora solo le colonne effettivamente
+    presenti nel DataFrame; se non ce n'è nessuna, o il DataFrame è vuoto, viene
+    restituito invariato."""
+    if df is None or df.empty:
+        return df
+
+    def _colora_con_mappa(mappa_colori):
+        def _colora_colonna(colonna):
+            return [f'background-color: {mappa_colori[v]}22; color: {mappa_colori[v]}; font-weight: 600' if v in mappa_colori else '' for v in colonna]
+        return _colora_colonna
+
+    styler = df.style
+    if "Stato" in df.columns:
+        styler = styler.apply(_colora_con_mappa(COLORI_STATO_COMMESSA), subset=["Stato"])
+    if "Priorità" in df.columns:
+        styler = styler.apply(_colora_con_mappa(COLORI_PRIORITA_COMMESSA), subset=["Priorità"])
+    return styler
+
 def render_report_mensile(nome_dipendente, df, key_prefix):
     """Report/cartellino mensile personale: giorno per giorno orari, fasi lavorate e
     luogo di lavoro, ore ordinarie/straordinarie, più il saldo di ferie e permessi
@@ -4063,6 +4402,7 @@ PAGINE_SENZA_AUTOREFRESH_AUTOMATICO = {
     "Profilo", "Timbrature", "📷 Report Intervento",
     "🧳 Trasferte e Interventi (Service)", "🧳 Trasferte Service",
     "Richiesta ferie/permessi", "Richiesta rettifica",
+    "💰 Costi commesse", "💰 Gestione Costi",
 }
 
 def pagina_abilitata_per_autorefresh(pagina):
@@ -4119,6 +4459,7 @@ else:
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse"]),
             ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
             ("🧳 Trasferte e Team", ["🧳 Trasferte e Interventi (Service)", "📅 Disponibilità Team"]),
+            ("💰 Costi", ["💰 Costi commesse"]),
             ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
         ], key_prefix="admin_menu", titolo_categoria="Sezione amministratore")
         st.session_state["_ultima_pagina_vista"] = admin_page
@@ -4287,11 +4628,15 @@ else:
                 st.info("Nessuna commessa configurata.")
             else:
                 commessa_traccia = st.selectbox("Commessa", options=commesse_per_traccia, key="resoconto_commessa_traccia")
+                mostra_info_commessa(commessa_traccia)
                 storico_commessa = get_storico_attivita_commessa(commessa_traccia, df)
                 if storico_commessa.empty:
                     st.info("Nessuna lavorazione registrata finora su questa commessa.")
                 else:
                     st.dataframe(storico_commessa, use_container_width=True)
+
+        elif admin_page == "💰 Costi commesse":
+            render_gestione_costi(df, key_prefix="admin_costi")
 
         elif admin_page == "Grafici e Classifiche":
             st.write("### 📈 Grafici e Classifiche per Area")
@@ -4702,14 +5047,16 @@ else:
         opzioni_modalita = ["Mie funzioni personali", "Gestione Team"]
         if is_area_service(user_info["area"]):
             opzioni_modalita.append("🧳 Trasferte Service")
+        if is_area_costi(user_info["area"]):
+            opzioni_modalita.append("💰 Gestione Costi")
         modalita = st.sidebar.radio("📌 Modalità", opzioni_modalita)
 
         if modalita == "Mie funzioni personali":
             # *** REPLICA DELLA SEZIONE UTENTE PER IL RESPONSABILE ***
             dipendente_scelto = user_info["name"]
             pagina_utente = render_menu_a_categorie([
-                ("👤 Profilo", ["Profilo"]),
                 ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
+                ("👤 Profilo", ["Profilo"]),
                 ("🏭 Le mie Commesse", ["Le mie Commesse"]),
                 ("🧳 Service", ["📷 Report Intervento"]),
                 ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
@@ -4784,6 +5131,7 @@ else:
                     commessa_scelta, fase_scelta = None, None
                 else:
                     commessa_scelta = st.selectbox("🏗️ Commessa", commesse_disponibili_resp, key="resp_commessa_timbra")
+                    mostra_info_commessa(commessa_scelta)
                     fasi_disponibili_resp = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto)
                     if not fasi_disponibili_resp:
                         st.warning(f"Nessuna fase disponibile per te su '{commessa_scelta}' nel tuo reparto. Aggiungila in 'Gestione fasi commessa'.")
@@ -5036,19 +5384,29 @@ else:
             else:
                 st.dataframe(report_area_service, use_container_width=True)
 
+        elif modalita == "💰 Gestione Costi":
+            st.session_state["_ultima_pagina_vista"] = "💰 Gestione Costi"
+            render_gestione_costi(df, key_prefix="resp_costi")
+
     else:
         # --- LATO UTENTE ---
         dipendente_scelto = user_info["name"]
         pagine_service_utente = ["📷 Report Intervento"]
         if is_area_service(user_info["area"]):
             pagine_service_utente.append("🧳 Trasferte Service")
-        pagina_utente = render_menu_a_categorie([
-            ("👤 Profilo", ["Profilo"]),
+        categorie_utente = [
             ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
+            ("👤 Profilo", ["Profilo"]),
             ("🏭 Le mie Commesse", ["Le mie Commesse"]),
             ("🧳 Service", pagine_service_utente),
             ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
-        ], key_prefix="user_menu", titolo_categoria="Funzione utente")
+        ]
+        # La categoria Costi compare solo per chi fa parte dell'area Costi, come il
+        # Service: per tutti gli altri utenti non c'è alcuna voce sui costi.
+        if is_area_costi(user_info["area"]):
+            categorie_utente.append(("💰 Costi", ["💰 Costi commesse"]))
+        pagina_utente = render_menu_a_categorie(
+            categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
 
         if pagina_utente == "Profilo":
@@ -5119,6 +5477,7 @@ else:
                 commessa_scelta, fase_scelta = None, None
             else:
                 commessa_scelta = st.selectbox("🏗️ Commessa", commesse_disponibili_utente, key="utente_commessa_timbra")
+                mostra_info_commessa(commessa_scelta)
                 fasi_disponibili_utente = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto)
                 if not fasi_disponibili_utente:
                     st.warning(f"Nessuna fase disponibile per te su '{commessa_scelta}' nel tuo reparto. Chiedi al tuo responsabile di aggiungerla.")
@@ -5238,6 +5597,9 @@ else:
                 st.info("Nessun report intervento inviato finora.")
             else:
                 st.dataframe(report_utente_service, use_container_width=True)
+
+        elif pagina_utente == "💰 Costi commesse":
+            render_gestione_costi(df, key_prefix="user_costi")
 
         elif pagina_utente == "Richiesta ferie/permessi":
             st.subheader("Richiesta ferie / permessi")
