@@ -243,6 +243,17 @@ MACRO_FASI_DISPONIBILI = [
     "Montaggio", "Cablaggio", "Gestione Fornitori", "Gestione Contratti",
 ]
 
+# Voce sempre disponibile a tutti nella pagina 'Timbrature', per registrare
+# un'attività che non riguarda nessuna commessa specifica (es. pulizie,
+# riunioni, manutenzione reparto) - richiesta di Marco: "se un dipendente
+# vuole timbrare un'attività che non c'è puoi aggiungere una voce varie?".
+# Non è una commessa vera (non esiste nella tabella commesse/fasi_commessa),
+# quindi non compare nella pagina Costi né nella Pianificazione/Gantt per
+# commessa: resta però visibile come una normale "commessa" nei riepiloghi
+# ore-per-commessa già esistenti (Riepilogo personale, report PDF), dato che
+# quelli si basano sulle timbrature reali, non sull'anagrafica delle commesse.
+ATTIVITA_VARIE = "Varie"
+
 @st.cache_resource
 def init_db():
     """Inizializza il database e crea le tabelle se non esistono. Il decoratore
@@ -2746,6 +2757,54 @@ def mostra_info_commessa(commessa):
     if cliente or tipologia:
         dettagli = " · ".join(filter(None, [f"Cliente: {cliente}" if cliente else "", f"Impianto: {tipologia}" if tipologia else ""]))
         st.caption(f"ℹ️ {dettagli}")
+
+def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, last_action, key_prefix):
+    """Blocco '🧩 Fase Lavorativa' della pagina Timbrature, condiviso tra la vista
+    del responsabile (quando timbra per sé stesso) e quella dell'utente
+    semplice - erano due copie identiche. Oltre alle commesse/fasi assegnate al
+    dipendente nel suo reparto, mostra sempre anche l'opzione 'Varie', per chi
+    deve timbrare un'attività che non riguarda nessuna commessa (vedi
+    ATTIVITA_VARIE): in quel caso Commessa e Fase diventano entrambe 'Varie' e
+    si può aggiungere una breve descrizione libera facoltativa (salvata in
+    Dettaglio Fase, colonna già esistente ma finora inutilizzata)."""
+    st.subheader("🧩 Fase Lavorativa")
+    fase_aperta = get_fase_aperta(dipendente_scelto)
+    if fase_aperta:
+        st.info(f"Fase attualmente aperta: **{fase_aperta[0]} → {fase_aperta[1]}**")
+
+    e_varie = st.checkbox("🔧 Varie (attività non legata a una commessa specifica)", key=f"{key_prefix}_varie_timbra")
+    dettaglio_fase = ""
+    if e_varie:
+        commessa_scelta, fase_scelta = ATTIVITA_VARIE, ATTIVITA_VARIE
+        dettaglio_fase = st.text_input("Cosa stai facendo? (facoltativo)", key=f"{key_prefix}_varie_dettaglio_timbra")
+    else:
+        # Solo le commesse 'Da iniziare'/'In corso' che hanno, nel suo reparto,
+        # almeno una fase assegnata a lui o non ancora assegnata a nessuno:
+        # ordinate per priorità, cosi' si vede subito cosa prendere in mano prima.
+        commesse_disponibili = get_commesse_assegnate_a_operatore(dipendente_scelto, user_info["area"])
+        if not commesse_disponibili:
+            st.warning("Nessuna commessa disponibile per il tuo reparto al momento. Chiedi all'admin di crearne una o di assegnartela.")
+            commessa_scelta, fase_scelta = None, None
+        else:
+            commessa_scelta = st.selectbox("🏗️ Commessa", commesse_disponibili, key=f"{key_prefix}_commessa_timbra")
+            mostra_info_commessa(commessa_scelta)
+            fasi_disponibili = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto)
+            if not fasi_disponibili:
+                st.warning(f"Nessuna fase disponibile per te su '{commessa_scelta}' nel tuo reparto. Chiedi al tuo responsabile di aggiungerla.")
+                fase_scelta = None
+            else:
+                fase_scelta = st.selectbox("Fase", fasi_disponibili, key=f"{key_prefix}_fase_timbra")
+
+    # Fase - disabilitata se non c'è un ingresso, o se manca una commessa/fase valida
+    fase_enabled = last_action in ["Ingresso", "Fine fase"] and bool(commessa_scelta) and bool(fase_scelta)
+    fine_fase_enabled = last_action == "Inizio fase" and fase_aperta is not None
+
+    col3, col4 = st.columns(2)
+    if col3.button("▶️ AVVIA FASE", use_container_width=True, disabled=not fase_enabled, help="Registra inizio fase", key=f"{key_prefix}_btn_avvia_fase"):
+        registra_orario(dipendente_scelto, "Inizio fase", luogo_scelto, dove_trasferta, commessa_scelta, fase_scelta, dettaglio_fase)
+    if col4.button("⏹️ CHIUDI FASE", use_container_width=True, disabled=not fine_fase_enabled, help="Registra fine fase", key=f"{key_prefix}_btn_chiudi_fase"):
+        commessa_chiudi, fase_chiudi = fase_aperta
+        registra_orario(dipendente_scelto, "Fine fase", luogo_scelto, dove_trasferta, commessa_chiudi, fase_chiudi)
 
 def valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati, dettaglio_auto, dettaglio_treno, dettaglio_aereo):
     """Validazione dati di una trasferta prima del salvataggio. Restituisce (ok, errore)."""
@@ -5705,38 +5764,7 @@ else:
                     registra_orario(dipendente_scelto, "Fine Pausa", luogo_scelto, dove_trasferta)
 
                 st.markdown("---")
-                st.subheader("🧩 Fase Lavorativa")
-                fase_aperta_resp = get_fase_aperta(dipendente_scelto)
-                if fase_aperta_resp:
-                    st.info(f"Fase attualmente aperta: **{fase_aperta_resp[0]} → {fase_aperta_resp[1]}**")
-
-                # Solo le commesse 'Da iniziare'/'In corso' che hanno, nel suo reparto,
-                # almeno una fase assegnata a lui o non ancora assegnata a nessuno:
-                # ordinate per priorità, cosi' si vede subito cosa prendere in mano prima.
-                commesse_disponibili_resp = get_commesse_assegnate_a_operatore(dipendente_scelto, user_info["area"])
-                if not commesse_disponibili_resp:
-                    st.warning("Nessuna commessa disponibile per il tuo reparto al momento. Chiedi all'admin di crearne una o di assegnartela.")
-                    commessa_scelta, fase_scelta = None, None
-                else:
-                    commessa_scelta = st.selectbox("🏗️ Commessa", commesse_disponibili_resp, key="resp_commessa_timbra")
-                    mostra_info_commessa(commessa_scelta)
-                    fasi_disponibili_resp = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto)
-                    if not fasi_disponibili_resp:
-                        st.warning(f"Nessuna fase disponibile per te su '{commessa_scelta}' nel tuo reparto. Aggiungila in 'Gestione fasi commessa'.")
-                        fase_scelta = None
-                    else:
-                        fase_scelta = st.selectbox("Fase", fasi_disponibili_resp, key="resp_fase_timbra")
-
-                # Fase - disabilitata se non c'è un ingresso, o se manca una commessa/fase valida
-                fase_enabled = last_action in ["Ingresso", "Fine fase"] and bool(commessa_scelta) and bool(fase_scelta)
-                fine_fase_enabled = last_action == "Inizio fase" and fase_aperta_resp is not None
-
-                col3, col4 = st.columns(2)
-                if col3.button("▶️ AVVIA FASE", use_container_width=True, disabled=not fase_enabled, help="Registra inizio fase"):
-                    registra_orario(dipendente_scelto, "Inizio fase", luogo_scelto, dove_trasferta, commessa_scelta, fase_scelta)
-                if col4.button("⏹️ CHIUDI FASE", use_container_width=True, disabled=not fine_fase_enabled, help="Registra fine fase"):
-                    commessa_chiudi_resp, fase_chiudi_resp = fase_aperta_resp
-                    registra_orario(dipendente_scelto, "Fine fase", luogo_scelto, dove_trasferta, commessa_chiudi_resp, fase_chiudi_resp)
+                render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, last_action, key_prefix="resp")
 
                 st.markdown("---")
                 st.write("Le tue timbrature di oggi:")
@@ -6047,38 +6075,7 @@ else:
                 registra_orario(dipendente_scelto, "Fine Pausa", luogo_scelto, dove_trasferta)
 
             st.markdown("---")
-            st.subheader("🧩 Fase Lavorativa")
-            fase_aperta_utente = get_fase_aperta(dipendente_scelto)
-            if fase_aperta_utente:
-                st.info(f"Fase attualmente aperta: **{fase_aperta_utente[0]} → {fase_aperta_utente[1]}**")
-
-            # Solo le commesse 'Da iniziare'/'In corso' che hanno, nel suo reparto,
-            # almeno una fase assegnata a lui o non ancora assegnata a nessuno:
-            # ordinate per priorità, cosi' si vede subito cosa prendere in mano prima.
-            commesse_disponibili_utente = get_commesse_assegnate_a_operatore(dipendente_scelto, user_info["area"])
-            if not commesse_disponibili_utente:
-                st.warning("Nessuna commessa disponibile per il tuo reparto al momento. Chiedi all'admin di crearne una o di assegnartela.")
-                commessa_scelta, fase_scelta = None, None
-            else:
-                commessa_scelta = st.selectbox("🏗️ Commessa", commesse_disponibili_utente, key="utente_commessa_timbra")
-                mostra_info_commessa(commessa_scelta)
-                fasi_disponibili_utente = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto)
-                if not fasi_disponibili_utente:
-                    st.warning(f"Nessuna fase disponibile per te su '{commessa_scelta}' nel tuo reparto. Chiedi al tuo responsabile di aggiungerla.")
-                    fase_scelta = None
-                else:
-                    fase_scelta = st.selectbox("Fase", fasi_disponibili_utente, key="utente_fase_timbra")
-
-            # Fase - disabilitata se non c'è un ingresso, o se manca una commessa/fase valida
-            fase_enabled = last_action in ["Ingresso", "Fine fase"] and bool(commessa_scelta) and bool(fase_scelta)
-            fine_fase_enabled = last_action == "Inizio fase" and fase_aperta_utente is not None
-
-            col3, col4 = st.columns(2)
-            if col3.button("▶️ AVVIA FASE", use_container_width=True, disabled=not fase_enabled, help="Registra inizio fase"):
-                registra_orario(dipendente_scelto, "Inizio fase", luogo_scelto, dove_trasferta, commessa_scelta, fase_scelta)
-            if col4.button("⏹️ CHIUDI FASE", use_container_width=True, disabled=not fine_fase_enabled, help="Registra fine fase"):
-                commessa_chiudi_utente, fase_chiudi_utente = fase_aperta_utente
-                registra_orario(dipendente_scelto, "Fine fase", luogo_scelto, dove_trasferta, commessa_chiudi_utente, fase_chiudi_utente)
+            render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, last_action, key_prefix="utente")
 
             st.markdown("---")
             st.write("Le tue timbrature di oggi:")
