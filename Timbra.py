@@ -729,12 +729,16 @@ def send_email(destinatario, oggetto, corpo):
         st.error(f"Errore nell'invio email: {e}")
         return False
 
-def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, _df_requests=None, df_ore_commessa=None):
-    """Genera un rapporto PDF professionale. df_ore_commessa (facoltativo) è il
-    riepilogo ore-per-commessa già calcolato da compute_hours_by_commessa: se passato,
-    il PDF include anche questa tabella (le stesse ore mostrate nella pagina
-    'Riepilogo personale' sotto 'Dettaglio commesse (ore)'), non solo l'elenco grezzo
-    delle timbrature."""
+def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, _df_requests=None, df_ore_fasi_commessa=None):
+    """Genera un rapporto PDF professionale. df_ore_fasi_commessa (facoltativo, da
+    compute_ore_fasi_per_commessa) è il dettaglio ore per fase raggruppato per
+    commessa: se passato, il PDF mostra una tabella per commessa (con il totale ore e
+    le sue fasi) invece dell'elenco grezzo delle timbrature (ingresso/uscita/pausa
+    pranzo compresi) di df_timbrature, su richiesta esplicita di Marco perché quel
+    dettaglio grezzo lo interessa poco: gli interessano le fasi lavorate e le
+    commesse. Se df_ore_fasi_commessa non è passato (es. il report generale
+    multi-dipendente dell'admin), il comportamento resta quello di sempre con
+    l'elenco grezzo delle timbrature."""
     if not PDF_AVAILABLE:
         st.error("❌ Libreria ReportLab non installata. Installa con: pip install reportlab")
         return None
@@ -774,32 +778,37 @@ def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, 
         story.append(Paragraph(f"<b>Data generazione:</b> {datetime.date.today().isoformat()}", info_style))
         story.append(Spacer(1, 0.3*inch))
 
-        # Riepilogo ore per commessa (stessa tabella di "Dettaglio commesse (ore)"
-        # nella pagina Riepilogo personale): messo prima del dettaglio grezzo delle
-        # timbrature per rispondere subito a "quante ore ho lavorato e su quale
-        # commessa".
-        if df_ore_commessa is not None and not df_ore_commessa.empty:
-            story.append(Paragraph("<b>Ore per Commessa</b>", styles['Heading2']))
-            tabella_commesse_data = [["Commessa", "Ore lavorate"]]
-            for _, riga_commessa in df_ore_commessa.sort_values("Ore_lavorate", ascending=False).iterrows():
-                tabella_commesse_data.append([str(riga_commessa["Commessa"])[:40], f"{riga_commessa['Ore_lavorate']:.2f} h"])
-            tabella_commesse = Table(tabella_commesse_data, colWidths=[3.5*inch, 1.5*inch])
-            tabella_commesse.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(VIMEK_NAVY)),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#c9d3dc')),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#eef3f8')),
-            ]))
-            story.append(tabella_commesse)
-            story.append(Spacer(1, 0.3*inch))
-
-        # Tabella timbrature
-        if not df_timbrature.empty:
+        if df_ore_fasi_commessa is not None:
+            # Vista richiesta da Marco: niente timbrature grezze di ingresso/uscita/
+            # pausa pranzo, solo le fasi lavorate raggruppate per commessa, con il
+            # totale ore di ciascuna commessa e, dentro, le sue fasi con le ore.
+            if df_ore_fasi_commessa.empty:
+                story.append(Paragraph("Nessuna fase lavorata nel periodo selezionato.", styles['Normal']))
+            else:
+                for commessa in df_ore_fasi_commessa["Commessa"].unique():
+                    fasi_commessa_pdf = df_ore_fasi_commessa[df_ore_fasi_commessa["Commessa"] == commessa]
+                    ore_totali_commessa = fasi_commessa_pdf["Ore"].sum()
+                    story.append(Paragraph(f"<b>Commessa {commessa} — Totale: {ore_totali_commessa:.2f} h</b>", styles['Heading2']))
+                    tabella_fasi_data = [["Fase", "Ore"]]
+                    for _, riga_fase in fasi_commessa_pdf.iterrows():
+                        tabella_fasi_data.append([str(riga_fase["Fase"])[:45], f"{riga_fase['Ore']:.2f} h"])
+                    tabella_fasi = Table(tabella_fasi_data, colWidths=[4*inch, 1.5*inch])
+                    tabella_fasi.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(VIMEK_NAVY)),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 9),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#c9d3dc')),
+                        ('FONTSIZE', (0, 1), (-1, -1), 8),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#eef3f8')),
+                    ]))
+                    story.append(tabella_fasi)
+                    story.append(Spacer(1, 0.25*inch))
+        elif not df_timbrature.empty:
+            # Comportamento invariato per chi non passa df_ore_fasi_commessa (es. il
+            # report generale multi-dipendente dell'admin): elenco grezzo timbrature.
             story.append(Paragraph("<b>Dettaglio Timbrature</b>", styles['Heading2']))
 
             # Se il report copre più dipendenti, aggiungi la colonna Dipendente e
@@ -855,7 +864,7 @@ def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, 
                         styles['Normal']
                     ))
                 story.append(Spacer(1, 0.2*inch))
-        
+
         doc.build(story)
         buffer.seek(0)
         return buffer
@@ -4493,6 +4502,28 @@ def compute_commessa_gantt_segments(df, start_date, end_date, employee_name):
         return pd.DataFrame(columns=colonne)
     return pd.DataFrame(righe, columns=colonne).sort_values(["Data", "start"]).reset_index(drop=True)
 
+def compute_ore_fasi_per_commessa(df, start_date, end_date, employee_name):
+    """Ore lavorate per fase, raggruppate per commessa, nel periodo indicato: usato
+    dal rapporto PDF (generate_pdf_report), che mostra le fasi lavorate per commessa
+    invece delle timbrature grezze di ingresso/uscita/pausa pranzo. Derivato dagli
+    stessi segmenti di compute_commessa_gantt_segments (una riga per sessione Inizio
+    fase -> Fine fase), sommati per (Commessa, Fase). Restituisce un DataFrame
+    [Commessa, Fase, Ore] già ordinato: prima le commesse con più ore totali, e dentro
+    ciascuna commessa prima le fasi con più ore."""
+    colonne = ["Commessa", "Fase", "Ore"]
+    segmenti = compute_commessa_gantt_segments(df, start_date, end_date, employee_name)
+    if segmenti.empty:
+        return pd.DataFrame(columns=colonne)
+    segmenti = segmenti.copy()
+    segmenti["Ore"] = (segmenti["end"] - segmenti["start"]).dt.total_seconds() / 3600
+    per_fase = segmenti.groupby(["Commessa", "Fase"], as_index=False)["Ore"].sum()
+    per_fase["Ore"] = per_fase["Ore"].round(2)
+    totali_commessa = per_fase.groupby("Commessa")["Ore"].sum().sort_values(ascending=False)
+    ordine_commessa = {commessa: indice for indice, commessa in enumerate(totali_commessa.index)}
+    per_fase["_ordine_commessa"] = per_fase["Commessa"].map(ordine_commessa)
+    per_fase = per_fase.sort_values(["_ordine_commessa", "Ore"], ascending=[True, False]).drop(columns=["_ordine_commessa"]).reset_index(drop=True)
+    return per_fase[colonne]
+
 def render_dettaglio_commesse_periodo(df, start_date, end_date, dipendente):
     """Sezione 'Dettaglio commesse (ore)' della pagina 'Riepilogo personale': indica
     esplicitamente, commessa per commessa, quante ore sono state lavorate nel periodo
@@ -5665,7 +5696,7 @@ else:
 
                 if st.button("Scarica report PDF"):
                     if PDF_AVAILABLE:
-                        pdf_buffer = generate_pdf_report(f"Report {dipendente_scelto}", up_start, up_end, prepare_registro_for_export(df, selected_user=dipendente_scelto, start_date=up_start, end_date=up_end), df_ore_commessa=compute_hours_by_commessa(df, up_start, up_end, employee_name=dipendente_scelto))
+                        pdf_buffer = generate_pdf_report(f"Report {dipendente_scelto}", up_start, up_end, prepare_registro_for_export(df, selected_user=dipendente_scelto, start_date=up_start, end_date=up_end), df_ore_fasi_commessa=compute_ore_fasi_per_commessa(df, up_start, up_end, dipendente_scelto))
                         if pdf_buffer:
                             st.download_button("📄 SCARICA REPORT PDF", data=pdf_buffer.getvalue(), file_name=f"rapporto_{dipendente_scelto}_{up_end}.pdf", mime="application/pdf")
                     else:
@@ -6049,7 +6080,7 @@ else:
                 st.markdown("---")
                 st.subheader("📥 Esportazione Rapporto")
                 if PDF_AVAILABLE:
-                    pdf_buffer = generate_pdf_report(user_name, up_start, up_end, prepare_registro_for_export(df, selected_user=user_name, start_date=up_start, end_date=up_end), df_ore_commessa=compute_hours_by_commessa(df, up_start, up_end, employee_name=user_name))
+                    pdf_buffer = generate_pdf_report(user_name, up_start, up_end, prepare_registro_for_export(df, selected_user=user_name, start_date=up_start, end_date=up_end), df_ore_fasi_commessa=compute_ore_fasi_per_commessa(df, up_start, up_end, user_name))
                     if pdf_buffer:
                         st.download_button("📄 SCARICA RAPPORTO PDF", data=pdf_buffer.getvalue(), file_name=f"rapporto_{user_name}_{datetime.date.today()}.pdf", mime="application/pdf")
                 else:
