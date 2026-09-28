@@ -1375,6 +1375,28 @@ def get_commesse_names():
         return [row[0] for row in c.fetchall()]
 
 @st.cache_data(ttl=30)
+def get_anni_produzione_disponibili():
+    """Anni di produzione già usati in almeno una commessa, dal più recente al più
+    vecchio: per il filtro 'Anno di produzione' della pagina Costi (fasi e
+    trasferte), utile a chi si occupa di fatturazione. In cache per lo stesso motivo
+    di get_commesse_names(): invalidata da crea_commessa/aggiorna_anagrafica_commessa
+    (qualunque funzione tocchi anno_produzione)."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT anno_produzione FROM commesse WHERE anno_produzione IS NOT NULL ORDER BY anno_produzione DESC")
+        return [row[0] for row in c.fetchall()]
+
+@st.cache_data(ttl=30)
+def get_fase_names_disponibili():
+    """Nomi distinti di fase già usati in almeno una commessa, in ordine alfabetico:
+    per il filtro 'Fase' della pagina Costi. In cache per lo stesso motivo di
+    get_commesse_names(): invalidata da aggiungi_fase_commessa/elimina_fase_commessa."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT fase FROM fasi_commessa ORDER BY fase")
+        return [row[0] for row in c.fetchall()]
+
+@st.cache_data(ttl=30)
 def get_commesse_dettaglio():
     """Tutte le commesse con la loro anagrafica completa (inclusi priorità e stato),
     per la vista d'insieme dell'admin. In cache per lo stesso motivo di
@@ -1409,6 +1431,7 @@ def crea_commessa(nome, descrizione, creata_da, cliente="", tipologia_impianto="
             conn.commit()
             get_commesse_names.clear()
             get_commesse_dettaglio.clear()
+            get_anni_produzione_disponibili.clear()
             return True, ""
         except db_error_classes("IntegrityError"):
             return False, "Esiste già una commessa con questo nome."
@@ -1790,6 +1813,7 @@ def aggiungi_fase_commessa(commessa, macro_fase, fase, ore_stimate, creata_da, o
                        (operatore_assegnato or "").strip(), macro_fase, "Da iniziare"))
             conn.commit()
             get_fasi_commessa.clear()
+            get_fase_names_disponibili.clear()
             ricalcola_stato_commessa(commessa)
             return True, ""
         except db_error_classes("IntegrityError"):
@@ -1829,6 +1853,7 @@ def elimina_fase_commessa(fase_id):
         c.execute("DELETE FROM fasi_commessa WHERE id=?", (fase_id,))
         conn.commit()
     get_fasi_commessa.clear()
+    get_fase_names_disponibili.clear()
     if row:
         ricalcola_stato_commessa(row[0])
 
@@ -3786,17 +3811,22 @@ def get_costi_trasferte(df):
     in automatico dalle ore effettivamente lavorate (Ingresso->Uscita) nel
     periodo della trasferta, moltiplicate per il costo orario CCNL del
     dipendente (stessa logica di compute_costo_dipendenti, qui applicata al solo
-    periodo/dipendente di quella trasferta)."""
+    periodo/dipendente di quella trasferta). Include anche il reparto del
+    dipendente (Area, non salvata sulla trasferta: si ricava dalla sua utenza, come
+    altrove nell'app) e l'anno di produzione della commessa collegata, se c'è, per
+    poterle filtrare come le fasi."""
     with db_connect() as conn:
-        trasferte = pd.read_sql("""SELECT id AS ID, dipendente AS Dipendente, data_inizio AS Dal,
-                                           data_fine AS Al, commessa AS Commessa, cliente AS Cliente,
-                                           costo_alloggio AS Costo_alloggio, costo_trasporto AS Costo_trasporto
-                                    FROM trasferte ORDER BY data_inizio DESC, id DESC""", conn)
-    colonne = ["ID", "Dipendente", "Dal", "Al", "Commessa", "Cliente",
+        trasferte = pd.read_sql("""SELECT t.id AS ID, t.dipendente AS Dipendente, t.data_inizio AS Dal,
+                                           t.data_fine AS Al, t.commessa AS Commessa, co.anno_produzione AS Anno_produzione,
+                                           t.cliente AS Cliente, t.costo_alloggio AS Costo_alloggio, t.costo_trasporto AS Costo_trasporto
+                                    FROM trasferte t LEFT JOIN commesse co ON co.nome = t.commessa
+                                    ORDER BY t.data_inizio DESC, t.id DESC""", conn)
+    colonne = ["ID", "Dipendente", "Area", "Dal", "Al", "Commessa", "Anno_produzione", "Cliente",
                "Costo_alloggio", "Costo_trasporto", "Costo_personale", "Costo_totale"]
     if trasferte.empty:
         return pd.DataFrame(columns=colonne)
 
+    trasferte["Area"] = trasferte["Dipendente"].map(get_users_area_map()).fillna("Unknown")
     trasferte["Costo_alloggio"] = trasferte["Costo_alloggio"].fillna(0.0)
     trasferte["Costo_trasporto"] = trasferte["Costo_trasporto"].fillna(0.0)
 
@@ -3823,7 +3853,8 @@ def get_costi_trasferte(df):
     trasferte["Costo_totale"] = (trasferte["Costo_alloggio"] + trasferte["Costo_trasporto"] + trasferte["Costo_personale"]).round(2)
     return trasferte[colonne]
 
-def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None):
+def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase_filter=None,
+                                 macro_fase_filter=None, anno_produzione_filter=None):
     """Costo ipotetico (preventivo) e costo reale di ogni fase configurata, con lo
     stesso costo orario CCNL già usato altrove nell'app (vedi
     compute_costo_dipendenti):
@@ -3834,13 +3865,17 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None):
       fase (Inizio fase -> Fine fase, su tutta la storia della fase, non solo un
       periodo: una fase può durare mesi e va confrontata nel suo complesso),
       delle sue ore effettive x il SUO costo orario (non necessariamente quello
-      dell'assegnatario, per riflettere chi ha davvero lavorato)."""
+      dell'assegnatario, per riflettere chi ha davvero lavorato).
+    Include anche l'anno di produzione della commessa (utile a chi si occupa di
+    fatturazione) e si può filtrare, oltre che per commessa e area, anche per fase,
+    macro-fase e anno di produzione."""
     with db_connect() as conn:
-        fasi = pd.read_sql("""SELECT commessa AS Commessa, fase AS Fase, area AS Area,
-                                      macro_fase AS 'Macro-fase', stato AS Stato,
-                                      ore_stimate AS Ore_stimate, operatore_assegnato AS Operatore
-                               FROM fasi_commessa""", conn)
-    colonne = ["Commessa", "Fase", "Area", "Macro-fase", "Stato", "Ore_stimate",
+        fasi = pd.read_sql("""SELECT f.commessa AS Commessa, co.anno_produzione AS Anno_produzione,
+                                      f.fase AS Fase, f.area AS Area,
+                                      f.macro_fase AS 'Macro-fase', f.stato AS Stato,
+                                      f.ore_stimate AS Ore_stimate, f.operatore_assegnato AS Operatore
+                               FROM fasi_commessa f LEFT JOIN commesse co ON co.nome = f.commessa""", conn)
+    colonne = ["Commessa", "Anno_produzione", "Fase", "Area", "Macro-fase", "Stato", "Ore_stimate",
                "Costo_ipotetico", "Ore_effettive", "Costo_reale"]
     if fasi.empty:
         return pd.DataFrame(columns=colonne)
@@ -3848,6 +3883,12 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None):
         fasi = fasi[fasi["Commessa"] == commessa_filter]
     if area_filter and area_filter != "Tutte le aree":
         fasi = fasi[fasi["Area"] == area_filter]
+    if fase_filter and fase_filter != "Tutte le fasi":
+        fasi = fasi[fasi["Fase"] == fase_filter]
+    if macro_fase_filter and macro_fase_filter != "Tutte le macro-fasi":
+        fasi = fasi[fasi["Macro-fase"] == macro_fase_filter]
+    if anno_produzione_filter and anno_produzione_filter != "Tutti gli anni":
+        fasi = fasi[fasi["Anno_produzione"] == anno_produzione_filter]
     if fasi.empty:
         return pd.DataFrame(columns=colonne)
     fasi = fasi.copy()
@@ -3934,7 +3975,11 @@ def render_gestione_costi(df, key_prefix):
     (ore stimate/effettive x costo orario CCNL - vedi compute_costi_fasi_commessa)
     e il costo delle trasferte legate ad essa (alloggio + trasporto inseriti qui
     a mano, più il costo del personale in trasferta calcolato in automatico -
-    vedi get_costi_trasferte)."""
+    vedi get_costi_trasferte). Oltre al filtro per commessa, la tabella 'Costo
+    delle fasi' ha anche i filtri per Area, Macro-fase, Fase e Anno di
+    produzione (utile a chi fa fatturazione); la tabella 'Costo delle
+    trasferte' ha i filtri Area e Anno di produzione (una trasferta non è
+    legata a una singola fase, quindi niente filtro Fase/Macro-fase lì)."""
     st.subheader("💰 Costi per commessa")
     st.caption("Il costo ipotetico delle fasi è una stima (ore stimate × costo orario CCNL dell'assegnatario, o quello aziendale di default se non ancora assegnata): resta un riferimento e non è sommato nel totale, che invece somma i costi reali (fasi + trasferte).")
     riepilogo = get_riepilogo_costi_commesse(df)
@@ -3949,7 +3994,23 @@ def render_gestione_costi(df, key_prefix):
     mostra_info_commessa(None if commessa_filtro_costi == "Tutte le commesse" else commessa_filtro_costi)
 
     st.subheader("🧩 Costo delle fasi")
-    fasi_costi = compute_costi_fasi_commessa(df, commessa_filter=None if commessa_filtro_costi == "Tutte le commesse" else commessa_filtro_costi)
+    col_area_fasi, col_macro_fasi, col_fase_fasi, col_anno_fasi = st.columns(4)
+    with col_area_fasi:
+        area_filtro_fasi = st.selectbox("Area", options=get_area_names(), key=f"{key_prefix}_costi_fasi_area_filtro")
+    with col_macro_fasi:
+        macro_fase_filtro_fasi = st.selectbox("Macro-fase", options=["Tutte le macro-fasi"] + MACRO_FASI_DISPONIBILI, key=f"{key_prefix}_costi_fasi_macro_filtro")
+    with col_fase_fasi:
+        fase_filtro_fasi = st.selectbox("Fase", options=["Tutte le fasi"] + get_fase_names_disponibili(), key=f"{key_prefix}_costi_fasi_fase_filtro")
+    with col_anno_fasi:
+        anno_filtro_fasi = st.selectbox("Anno di produzione", options=["Tutti gli anni"] + get_anni_produzione_disponibili(), key=f"{key_prefix}_costi_fasi_anno_filtro")
+    fasi_costi = compute_costi_fasi_commessa(
+        df,
+        commessa_filter=None if commessa_filtro_costi == "Tutte le commesse" else commessa_filtro_costi,
+        area_filter=None if area_filtro_fasi == "Tutte le aree" else area_filtro_fasi,
+        fase_filter=None if fase_filtro_fasi == "Tutte le fasi" else fase_filtro_fasi,
+        macro_fase_filter=None if macro_fase_filtro_fasi == "Tutte le macro-fasi" else macro_fase_filtro_fasi,
+        anno_produzione_filter=None if anno_filtro_fasi == "Tutti gli anni" else anno_filtro_fasi,
+    )
     if fasi_costi.empty:
         st.info("Nessuna fase configurata.")
     else:
@@ -3957,9 +4018,18 @@ def render_gestione_costi(df, key_prefix):
 
     st.markdown("---")
     st.subheader("🧳 Costo delle trasferte")
+    col_area_trasferte, col_anno_trasferte = st.columns(2)
+    with col_area_trasferte:
+        area_filtro_trasferte = st.selectbox("Area", options=get_area_names(), key=f"{key_prefix}_costi_trasferte_area_filtro")
+    with col_anno_trasferte:
+        anno_filtro_trasferte = st.selectbox("Anno di produzione", options=["Tutti gli anni"] + get_anni_produzione_disponibili(), key=f"{key_prefix}_costi_trasferte_anno_filtro")
     trasferte_costi = get_costi_trasferte(df)
     if commessa_filtro_costi != "Tutte le commesse":
         trasferte_costi = trasferte_costi[trasferte_costi["Commessa"] == commessa_filtro_costi]
+    if area_filtro_trasferte != "Tutte le aree":
+        trasferte_costi = trasferte_costi[trasferte_costi["Area"] == area_filtro_trasferte]
+    if anno_filtro_trasferte != "Tutti gli anni":
+        trasferte_costi = trasferte_costi[trasferte_costi["Anno_produzione"] == anno_filtro_trasferte]
     if trasferte_costi.empty:
         st.info("Nessuna trasferta trovata.")
     else:
