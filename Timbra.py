@@ -4434,6 +4434,71 @@ def compute_hours_by_commessa(df, start_date, end_date, employee_name=None):
     if not rows: return pd.DataFrame(columns=["Dipendente", "Commessa", "Ore_lavorate"])
     return pd.DataFrame(rows).groupby(["Dipendente", "Commessa"], as_index=False).agg({"Ore_lavorate": "sum"}).assign(Ore_lavorate=lambda d: d["Ore_lavorate"].round(2))
 
+def compute_commessa_gantt_segments(df, start_date, end_date, employee_name):
+    """Segmenti (Commessa, Fase, giorno, inizio, fine) dalle sessioni Inizio fase ->
+    Fine fase di un dipendente nel periodo indicato: a differenza del Gantt presenze
+    (colorato/raggruppato per Luogo di lavoro), qui il colore è la Commessa, per
+    rispondere visivamente a 'quando ho lavorato su quale commessa'. Usato nella
+    pagina 'Riepilogo personale' insieme a compute_hours_by_commessa (che dà invece il
+    totale ore per commessa, senza la dimensione temporale)."""
+    colonne = ["Dipendente", "Commessa", "Fase", "Data", "start", "end"]
+    if df is None or df.empty or not employee_name:
+        return pd.DataFrame(columns=colonne)
+    dfn = normalize_datetime(df)
+    dfn = dfn[(dfn["Dipendente"] == employee_name) & (dfn["Data"] >= start_date) & (dfn["Data"] <= end_date)
+              & (dfn["Azione"].isin(["Inizio fase", "Fine fase"])) & (dfn["Commessa"].astype(str) != "")]
+    if dfn.empty:
+        return pd.DataFrame(columns=colonne)
+    righe = []
+    for (commessa, data_lavoro), gruppo in dfn.groupby(["Commessa", "Data"]):
+        gruppo = gruppo.sort_values("Timestamp")
+        coda_inizio = []
+        for _, riga in gruppo.iterrows():
+            if riga["Azione"] == "Inizio fase":
+                coda_inizio.append((riga["Timestamp"], riga["Fase"]))
+            elif riga["Azione"] == "Fine fase" and coda_inizio:
+                inizio_ts, fase = coda_inizio.pop(0)
+                if pd.notna(inizio_ts) and pd.notna(riga["Timestamp"]) and riga["Timestamp"] > inizio_ts:
+                    righe.append({"Dipendente": employee_name, "Commessa": commessa, "Fase": fase,
+                                  "Data": data_lavoro, "start": inizio_ts, "end": riga["Timestamp"]})
+    if not righe:
+        return pd.DataFrame(columns=colonne)
+    return pd.DataFrame(righe, columns=colonne).sort_values(["Data", "start"]).reset_index(drop=True)
+
+def render_dettaglio_commesse_periodo(df, start_date, end_date, dipendente):
+    """Sezione 'Dettaglio commesse (ore)' della pagina 'Riepilogo personale': indica
+    esplicitamente, commessa per commessa, quante ore sono state lavorate nel periodo
+    (es. 'Commessa N321: 18.00 ore'), oltre alla tabella riassuntiva già presente e a
+    un Gantt giorno per giorno di quando si è lavorato su quale commessa (con la
+    tabella dei suoi dati). Condivisa fra la pagina personale del responsabile e
+    quella dell'utente semplice, per avere lo stesso identico riepilogo in entrambe."""
+    st.markdown("**Dettaglio commesse (ore)**")
+    commessa_user = compute_hours_by_commessa(df, start_date, end_date, employee_name=dipendente)
+    if commessa_user.empty:
+        st.info("Nessuna commessa registrata nel periodo.")
+        return
+    for _, riga in commessa_user.sort_values("Ore_lavorate", ascending=False).iterrows():
+        st.write(f"🏭 Commessa **{riga['Commessa']}**: {riga['Ore_lavorate']:.2f} ore")
+    st.dataframe(commessa_user, use_container_width=True)
+    bar_comm = alt.Chart(commessa_user).mark_bar().encode(
+        x=alt.X("Ore_lavorate:Q"), y=alt.Y("Commessa:N", sort='-x'),
+        tooltip=[alt.Tooltip("Commessa:N"), alt.Tooltip("Ore_lavorate:Q")]
+    ).properties(height=300)
+    st.altair_chart(bar_comm, use_container_width=True)
+
+    st.markdown("**Gantt: quando hai lavorato su quale commessa**")
+    segmenti_commessa = compute_commessa_gantt_segments(df, start_date, end_date, dipendente)
+    if segmenti_commessa.empty:
+        st.info("Nessuna sessione 'Inizio fase' → 'Fine fase' registrata nel periodo.")
+    else:
+        gantt_commesse = alt.Chart(segmenti_commessa).mark_bar().encode(
+            x="start:T", x2="end:T", y=alt.Y("Data:T", axis=alt.Axis(title="Data")),
+            color=alt.Color("Commessa:N"),
+            tooltip=["Commessa:N", "Fase:N", "Data:T", "start:T", "end:T"]
+        ).properties(height=40 * len(segmenti_commessa["Data"].unique()) + 100)
+        st.altair_chart(gantt_commesse, use_container_width=True)
+        st.dataframe(segmenti_commessa, use_container_width=True)
+
 def compute_phase_hours_by_employee(df, start_date, end_date, employee_name=None):
     """Ore totali passate con una fase/commessa attiva (Inizio fase -> Fine fase),
     per dipendente, nel periodo indicato. È il tempo "tracciato" su un'attività
@@ -5565,18 +5630,11 @@ else:
                     else:
                         st.info("Nessuna timbratura nel periodo.")
                         
-                    st.markdown("**Dettaglio commesse (ore)**")
-                    commessa_user = compute_hours_by_commessa(df, up_start, up_end, employee_name=dipendente_scelto)
-                    if commessa_user.empty:
-                        st.info("Nessuna commessa registrata nel periodo.")
-                    else:
-                        st.dataframe(commessa_user, use_container_width=True)
-                        bar_comm = alt.Chart(commessa_user).mark_bar().encode(x=alt.X("Ore_lavorate:Q"), y=alt.Y("Commessa:N", sort='-x'), tooltip=[alt.Tooltip("Commessa:N"), alt.Tooltip("Ore_lavorate:Q")]).properties(height=300)
-                        st.altair_chart(bar_comm, use_container_width=True)
-                
+                    render_dettaglio_commesse_periodo(df, up_start, up_end, dipendente_scelto)
+
                 st.markdown("---")
                 st.subheader("📥 Esportazione Rapporto")
-                
+
                 if st.button("Scarica report PDF"):
                     if PDF_AVAILABLE:
                         pdf_buffer = generate_pdf_report(f"Report {dipendente_scelto}", up_start, up_end, prepare_registro_for_export(df, selected_user=dipendente_scelto, start_date=up_start, end_date=up_end))
@@ -5958,15 +6016,8 @@ else:
                 c3.metric("Media ore/giorno", f"{avg_hours}")
                 c4.metric("Timbrature/azioni", f"{timbrature_count}")
 
-                st.markdown("**Dettaglio commesse (ore)**")
-                commessa_user = compute_hours_by_commessa(df, up_start, up_end, employee_name=user_name)
-                if commessa_user.empty:
-                    st.info("Nessuna commessa registrata nel periodo.")
-                else:
-                    st.dataframe(commessa_user, use_container_width=True)
-                    bar_comm = alt.Chart(commessa_user).mark_bar().encode(x=alt.X("Ore_lavorate:Q"), y=alt.Y("Commessa:N", sort='-x'), tooltip=[alt.Tooltip("Commessa:N"), alt.Tooltip("Ore_lavorate:Q")]).properties(height=300)
-                    st.altair_chart(bar_comm, use_container_width=True)
-                
+                render_dettaglio_commesse_periodo(df, up_start, up_end, user_name)
+
                 st.markdown("---")
                 st.subheader("📥 Esportazione Rapporto")
                 if PDF_AVAILABLE:
