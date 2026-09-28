@@ -729,8 +729,12 @@ def send_email(destinatario, oggetto, corpo):
         st.error(f"Errore nell'invio email: {e}")
         return False
 
-def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, _df_requests=None):
-    """Genera un rapporto PDF professionale."""
+def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, _df_requests=None, df_ore_commessa=None):
+    """Genera un rapporto PDF professionale. df_ore_commessa (facoltativo) è il
+    riepilogo ore-per-commessa già calcolato da compute_hours_by_commessa: se passato,
+    il PDF include anche questa tabella (le stesse ore mostrate nella pagina
+    'Riepilogo personale' sotto 'Dettaglio commesse (ore)'), non solo l'elenco grezzo
+    delle timbrature."""
     if not PDF_AVAILABLE:
         st.error("❌ Libreria ReportLab non installata. Installa con: pip install reportlab")
         return None
@@ -769,7 +773,31 @@ def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, 
         story.append(Paragraph(f"<b>Periodo:</b> {period_start.isoformat()} → {period_end.isoformat()}", info_style))
         story.append(Paragraph(f"<b>Data generazione:</b> {datetime.date.today().isoformat()}", info_style))
         story.append(Spacer(1, 0.3*inch))
-        
+
+        # Riepilogo ore per commessa (stessa tabella di "Dettaglio commesse (ore)"
+        # nella pagina Riepilogo personale): messo prima del dettaglio grezzo delle
+        # timbrature per rispondere subito a "quante ore ho lavorato e su quale
+        # commessa".
+        if df_ore_commessa is not None and not df_ore_commessa.empty:
+            story.append(Paragraph("<b>Ore per Commessa</b>", styles['Heading2']))
+            tabella_commesse_data = [["Commessa", "Ore lavorate"]]
+            for _, riga_commessa in df_ore_commessa.sort_values("Ore_lavorate", ascending=False).iterrows():
+                tabella_commesse_data.append([str(riga_commessa["Commessa"])[:40], f"{riga_commessa['Ore_lavorate']:.2f} h"])
+            tabella_commesse = Table(tabella_commesse_data, colWidths=[3.5*inch, 1.5*inch])
+            tabella_commesse.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(VIMEK_NAVY)),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#c9d3dc')),
+                ('FONTSIZE', (0, 1), (-1, -1), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#eef3f8')),
+            ]))
+            story.append(tabella_commesse)
+            story.append(Spacer(1, 0.3*inch))
+
         # Tabella timbrature
         if not df_timbrature.empty:
             story.append(Paragraph("<b>Dettaglio Timbrature</b>", styles['Heading2']))
@@ -5637,7 +5665,7 @@ else:
 
                 if st.button("Scarica report PDF"):
                     if PDF_AVAILABLE:
-                        pdf_buffer = generate_pdf_report(f"Report {dipendente_scelto}", up_start, up_end, prepare_registro_for_export(df, selected_user=dipendente_scelto, start_date=up_start, end_date=up_end))
+                        pdf_buffer = generate_pdf_report(f"Report {dipendente_scelto}", up_start, up_end, prepare_registro_for_export(df, selected_user=dipendente_scelto, start_date=up_start, end_date=up_end), df_ore_commessa=compute_hours_by_commessa(df, up_start, up_end, employee_name=dipendente_scelto))
                         if pdf_buffer:
                             st.download_button("📄 SCARICA REPORT PDF", data=pdf_buffer.getvalue(), file_name=f"rapporto_{dipendente_scelto}_{up_end}.pdf", mime="application/pdf")
                     else:
@@ -6021,7 +6049,7 @@ else:
                 st.markdown("---")
                 st.subheader("📥 Esportazione Rapporto")
                 if PDF_AVAILABLE:
-                    pdf_buffer = generate_pdf_report(user_name, up_start, up_end, prepare_registro_for_export(df, selected_user=user_name, start_date=up_start, end_date=up_end))
+                    pdf_buffer = generate_pdf_report(user_name, up_start, up_end, prepare_registro_for_export(df, selected_user=user_name, start_date=up_start, end_date=up_end), df_ore_commessa=compute_hours_by_commessa(df, up_start, up_end, employee_name=user_name))
                     if pdf_buffer:
                         st.download_button("📄 SCARICA RAPPORTO PDF", data=pdf_buffer.getvalue(), file_name=f"rapporto_{user_name}_{datetime.date.today()}.pdf", mime="application/pdf")
                 else:
