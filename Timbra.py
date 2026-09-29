@@ -652,60 +652,96 @@ def get_last_timbratura(nome_dipendente):
         return None
     return azione
 
+def is_clocked_in(nome_dipendente):
+    """True se il dipendente ha fatto un Ingresso senza ancora la relativa
+    Uscita, a prescindere da fasi/pause di mezzo (che NON contano come
+    un'uscita). Rispetta la stessa soglia di 'dimenticanza' di
+    get_last_timbratura (TIMBRATURA_STALE_HOURS)."""
+    return get_last_timbratura(nome_dipendente) not in (None, "Uscita")
+
 def get_fase_aperta(nome_dipendente):
-    """Se il dipendente ha in questo momento una fase aperta (ultima azione valida =
-    'Inizio fase'), restituisce (Commessa, Fase) di quella fase; altrimenti None.
-    Usata per far chiudere sempre la fase giusta con 'Fine fase', senza dipendere
-    da cosa è selezionato nelle tendine al momento del click."""
-    if get_last_timbratura(nome_dipendente) != "Inizio fase":
+    """Se il dipendente ha in questo momento una fase aperta, restituisce
+    (Commessa, Fase) di quella fase; altrimenti None. 'Aperta' vuol dire che,
+    tra le sole timbrature Inizio/Fine fase, l'ultima è stata un 'Inizio
+    fase': una pausa pranzo di mezzo NON la chiude più (prima sì, per errore:
+    segnalato da Marco - "se uno va in pausa pranzo e non chiude la fase si
+    deve mantenere l'ultima fase che era stata timbrata"), cosi' 'CHIUDI FASE'
+    dopo la pausa continua a chiudere quella giusta, senza dover ripartire
+    dalla tendina Commessa/Fase. Se il dipendente risulta comunque non più
+    "dentro" (Uscita fatta, o l'ultima timbratura è troppo vecchia - vedi
+    is_clocked_in), la fase non è più considerata aperta."""
+    if not is_clocked_in(nome_dipendente):
         return None
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("""SELECT Commessa, Fase FROM timbrature
-                     WHERE Dipendente = ? AND Azione = 'Inizio fase'
+        c.execute("""SELECT Azione, Commessa, Fase FROM timbrature
+                     WHERE Dipendente = ? AND Azione IN ('Inizio fase', 'Fine fase')
                      ORDER BY Data DESC, Ora DESC, id DESC LIMIT 1""", (nome_dipendente,))
         row = c.fetchone()
-    return (row[0], row[1]) if row else None
+    if not row or row[0] != "Inizio fase":
+        return None
+    return (row[1], row[2])
+
+def is_pausa_attiva(nome_dipendente):
+    """True se il dipendente è in questo momento in pausa pranzo (tra le sole
+    timbrature Inizio/Fine Pausa, l'ultima è stata un 'Inizio Pausa').
+    Serve, insieme a get_fase_aperta, a rendere pausa e fase due stati
+    indipendenti che possono essere aperti insieme (si può timbrare la pausa
+    pranzo senza dover prima chiudere la fase in corso)."""
+    if not is_clocked_in(nome_dipendente):
+        return False
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT Azione FROM timbrature
+                     WHERE Dipendente = ? AND Azione IN ('Inizio Pausa', 'Fine Pausa')
+                     ORDER BY Data DESC, Ora DESC, id DESC LIMIT 1""", (nome_dipendente,))
+        row = c.fetchone()
+    return bool(row) and row[0] == "Inizio Pausa"
 
 def validate_timbratura(nome_dipendente, tipo_azione):
     """
     Valida se la timbratura è logica.
     Restituisce (valida: bool, messaggio: str, stato: str)
     """
-    last_action = get_last_timbratura(nome_dipendente)
-    
+    clocked_in = is_clocked_in(nome_dipendente)
+
     # Validazione Ingresso/Uscita
     if tipo_azione == "Ingresso":
-        if last_action in ["Ingresso", "Inizio fase"]:
+        if clocked_in:
             return False, "❌ Hai già fatto un ingresso! Registra un'uscita prima di un nuovo ingresso.", "Anomalia"
         return True, "", "Valida"
-    
+
     elif tipo_azione == "Uscita":
-        if last_action in ["Uscita", None]:
+        if not clocked_in:
             return False, "❌ Non puoi registrare un'uscita senza aver fatto un ingresso!", "Anomalia"
         return True, "", "Valida"
-    
-    # Validazione Fasi
+
+    # Validazione Fasi - basata su get_fase_aperta (non più sul solo last_action),
+    # cosi' una pausa pranzo timbrata a metà di una fase non fa perdere il
+    # riferimento alla fase ancora aperta (vedi get_fase_aperta).
     elif tipo_azione == "Inizio fase":
-        if last_action == "Inizio fase":
-            return False, "❌ Hai già iniziato una fase! Termina la fase attuale prima di iniziarne una nuova.", "Anomalia"
-        if last_action is None:
+        if not clocked_in:
             return False, "❌ Devi fare un INGRESSO prima di iniziare una fase!", "Anomalia"
+        if get_fase_aperta(nome_dipendente) is not None:
+            return False, "❌ Hai già iniziato una fase! Termina la fase attuale prima di iniziarne una nuova.", "Anomalia"
         return True, "", "Valida"
-    
+
     elif tipo_azione == "Fine fase":
-        if last_action not in ["Inizio fase"]:
+        if get_fase_aperta(nome_dipendente) is None:
             return False, "❌ Non puoi terminare una fase se non l'hai ancora iniziata!", "Anomalia"
         return True, "", "Valida"
-    
-    # Pausa Pranzo
+
+    # Pausa Pranzo - indipendente dalla fase: si può timbrare anche con una
+    # fase aperta, senza doverla chiudere prima (vedi is_pausa_attiva).
     elif tipo_azione == "Inizio Pausa":
-        if last_action not in ["Ingresso", "Fine fase"]:
-            return False, "❌ Devi fare un ingresso o terminare una fase prima della pausa.", "Anomalia"
+        if not clocked_in:
+            return False, "❌ Devi fare un ingresso prima della pausa.", "Anomalia"
+        if is_pausa_attiva(nome_dipendente):
+            return False, "❌ Sei già in pausa pranzo!", "Anomalia"
         return True, "", "Valida"
     
     elif tipo_azione == "Fine Pausa":
-        if last_action != "Inizio Pausa":
+        if not is_pausa_attiva(nome_dipendente):
             return False, "❌ Non puoi terminare la pausa se non l'hai ancora iniziata!", "Anomalia"
         return True, "", "Valida"
     
@@ -885,8 +921,9 @@ def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, 
 
 def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, totali, saldo):
     """Genera il PDF del cartellino mensile di un dipendente: una riga per ogni giorno
-    (ingresso/uscita, pausa pranzo, commesse/fasi lavorate, luogo, ore ordinarie/
-    straordinarie), seguita dai totali del mese e dal saldo ferie/permessi maturato."""
+    (ingresso/uscita, pausa pranzo, luogo, ore ordinarie/straordinarie), seguita dai
+    totali del mese e dal saldo ferie/permessi maturato. Non elenca più le commesse/
+    fasi lavorate (vedi compute_cartellino_mensile: tolta su richiesta di Marco)."""
     if not PDF_AVAILABLE:
         st.error("❌ Libreria ReportLab non installata. Installa con: pip install reportlab")
         return None
@@ -919,7 +956,7 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
         story.append(Spacer(1, 0.2*inch))
 
         if not cartellino_df.empty:
-            intestazione = ["Giorno", "Ingresso", "Uscita", "Inizio\nPausa", "Fine\nPausa", "Commesse/Fasi", "Dove", "Ore\nord.", "Ore\nstraord."]
+            intestazione = ["Giorno", "Ingresso", "Uscita", "Inizio\nPausa", "Fine\nPausa", "Dove", "Ore\nord.", "Ore\nstraord."]
             table_data = [intestazione]
             for _, row in cartellino_df.iterrows():
                 table_data.append([
@@ -928,12 +965,11 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
                     str(row.get("Uscita", "-")),
                     str(row.get("Inizio Pausa", "-")),
                     str(row.get("Fine Pausa", "-")),
-                    str(row.get("Commesse/Fasi", "-"))[:60],
                     str(row.get("Dove", "-"))[:20],
                     str(row.get("Ore ordinarie", 0)),
                     str(row.get("Ore straordinarie", 0)),
                 ])
-            col_widths = [0.85*inch, 0.65*inch, 0.65*inch, 0.65*inch, 0.65*inch, 3.1*inch, 1.0*inch, 0.55*inch, 0.6*inch]
+            col_widths = [1.1*inch, 0.85*inch, 0.85*inch, 0.85*inch, 0.85*inch, 2.0*inch, 0.75*inch, 0.85*inch]
             table = Table(table_data, colWidths=col_widths, repeatRows=1)
             stile_tabella = [
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(VIMEK_NAVY)),
@@ -2216,6 +2252,54 @@ def compute_gantt_effettivo_commessa(commessa, df):
         return dfr
     return dfr.sort_values(["Inizio", "Macro-fase", "Fase"]).reset_index(drop=True)
 
+def compute_gantt_teorico_tutte_commesse():
+    """Vista d'insieme del Gantt teorico: una riga per COMMESSA (non per singola
+    fase come compute_gantt_teorico_commessa), con l'intervallo Inizio-Fine
+    complessivo ottenuto dal Gantt teorico di ciascuna - richiesta di Marco:
+    prima si poteva vedere il Gantt teorico solo di una commessa alla volta,
+    non tutte insieme. Le commesse senza data di inizio lavori o senza fasi
+    (per cui compute_gantt_teorico_commessa non calcola nulla) non compaiono
+    qui: restano comunque consultabili singolarmente, con il relativo
+    messaggio esplicativo."""
+    dettaglio = get_commesse_dettaglio()
+    mappa_stato = dict(zip(dettaglio["Nome"], dettaglio["Stato"])) if not dettaglio.empty else {}
+    righe = []
+    for commessa in get_commesse_names():
+        gantt, _ = compute_gantt_teorico_commessa(commessa)
+        if gantt.empty:
+            continue
+        righe.append({
+            "Commessa": commessa, "Stato": mappa_stato.get(commessa) or "-",
+            "Inizio": gantt["Inizio"].min(), "Fine": gantt["Fine"].max(), "N. fasi": len(gantt),
+        })
+    colonne = ["Commessa", "Stato", "Inizio", "Fine", "N. fasi"]
+    if not righe:
+        return pd.DataFrame(columns=colonne)
+    return pd.DataFrame(righe, columns=colonne).sort_values("Inizio").reset_index(drop=True)
+
+def compute_gantt_effettivo_tutte_commesse(df):
+    """Vista d'insieme del Gantt effettivo: una riga per COMMESSA (non per
+    singola fase come compute_gantt_effettivo_commessa), con l'intervallo
+    Inizio-Fine complessivo ottenuto dalle timbrature reali di ciascuna.
+    'In corso' è True se almeno una delle sue fasi lavorate risulta ancora in
+    corso. Le commesse senza alcuna fase ancora iniziata non compaiono qui."""
+    dettaglio = get_commesse_dettaglio()
+    mappa_stato = dict(zip(dettaglio["Nome"], dettaglio["Stato"])) if not dettaglio.empty else {}
+    righe = []
+    for commessa in get_commesse_names():
+        gantt = compute_gantt_effettivo_commessa(commessa, df)
+        if gantt.empty:
+            continue
+        righe.append({
+            "Commessa": commessa, "Stato": mappa_stato.get(commessa) or "-",
+            "Inizio": gantt["Inizio"].min(), "Fine": gantt["Fine"].max(),
+            "In corso": bool(gantt["In corso"].any()), "N. fasi lavorate": len(gantt),
+        })
+    colonne = ["Commessa", "Stato", "Inizio", "Fine", "In corso", "N. fasi lavorate"]
+    if not righe:
+        return pd.DataFrame(columns=colonne)
+    return pd.DataFrame(righe, columns=colonne).sort_values("Inizio").reset_index(drop=True)
+
 def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, attore=""):
     """UI di gestione fasi/ore-stimate per commessa. Se scope_area è impostata
     (caso responsabile), l'area è fissa e non modificabile: il responsabile può
@@ -2758,7 +2842,7 @@ def mostra_info_commessa(commessa):
         dettagli = " · ".join(filter(None, [f"Cliente: {cliente}" if cliente else "", f"Impianto: {tipologia}" if tipologia else ""]))
         st.caption(f"ℹ️ {dettagli}")
 
-def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, last_action, key_prefix):
+def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, key_prefix):
     """Blocco '🧩 Fase Lavorativa' della pagina Timbrature, condiviso tra la vista
     del responsabile (quando timbra per sé stesso) e quella dell'utente
     semplice - erano due copie identiche. Oltre alle commesse/fasi assegnate al
@@ -2795,9 +2879,14 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
             else:
                 fase_scelta = st.selectbox("Fase", fasi_disponibili, key=f"{key_prefix}_fase_timbra")
 
-    # Fase - disabilitata se non c'è un ingresso, o se manca una commessa/fase valida
-    fase_enabled = last_action in ["Ingresso", "Fine fase"] and bool(commessa_scelta) and bool(fase_scelta)
-    fine_fase_enabled = last_action == "Inizio fase" and fase_aperta is not None
+    # Fase - disabilitata se non c'è un ingresso attivo, se si è già in pausa
+    # pranzo (prima va chiusa quella), se c'è già una fase aperta, o se manca
+    # una commessa/fase valida. 'Chiudi fase' invece dipende solo dal fatto che
+    # ce ne sia una aperta (get_fase_aperta): resta disponibile anche durante o
+    # dopo una pausa pranzo timbrata senza aver chiuso la fase.
+    fase_enabled = (is_clocked_in(dipendente_scelto) and not is_pausa_attiva(dipendente_scelto)
+                     and fase_aperta is None and bool(commessa_scelta) and bool(fase_scelta))
+    fine_fase_enabled = fase_aperta is not None
 
     col3, col4 = st.columns(2)
     if col3.button("▶️ AVVIA FASE", use_container_width=True, disabled=not fase_enabled, help="Registra inizio fase", key=f"{key_prefix}_btn_avvia_fase"):
@@ -3121,16 +3210,14 @@ def compute_disponibilita_giornaliera(data_riferimento, area_filter=None):
                           "Stato": "In sede", "Dettaglio": ""})
     return pd.DataFrame(righe)
 
-def render_gestione_trasferte_service(attore_nome, key_prefix):
-    """Pagina di programmazione trasferte: scelta dell'operatore tra tutti i
-    dipendenti, della commessa (da cui si ricava il cliente), del luogo di lavoro
-    (stato/indirizzo, dato che l'azienda lavora in tutto il mondo), dell'albergo, e
-    di uno o più mezzi di trasporto insieme (es. aereo per arrivare + auto a
-    noleggio per muoversi sul posto). Accessibile all'amministratore e a chiunque
-    faccia parte dell'area Service."""
-    st.subheader("🧳 Programmazione Trasferte (Service)")
-
-    st.markdown("**Nuova trasferta**")
+def render_nuova_trasferta(attore_nome, key_prefix):
+    """Sotto-pagina 'Programmazione nuova Trasferta': scelta dell'operatore tra
+    tutti i dipendenti, della commessa (da cui si ricava il cliente), del luogo di
+    lavoro (stato/indirizzo, dato che l'azienda lavora in tutto il mondo),
+    dell'albergo, e di uno o più mezzi di trasporto insieme (es. aereo per
+    arrivare + auto a noleggio per muoversi sul posto). Accessibile
+    all'amministratore e a chiunque faccia parte dell'area Service."""
+    st.subheader("🧳 Programmazione nuova Trasferta")
     operatori_disponibili = get_user_names()
     if not operatori_disponibili:
         st.warning("Nessun dipendente disponibile.")
@@ -3193,8 +3280,14 @@ def render_gestione_trasferte_service(attore_nome, key_prefix):
         else:
             st.error(errore)
 
-    st.markdown("---")
-    st.markdown("**Trasferte programmate**")
+
+def render_trasferte_programmate(key_prefix):
+    """Sotto-pagina 'Trasferte programmate': elenco di tutte le trasferte già
+    programmate, con la possibilità di modificarle (utile anche dopo che hanno
+    già un report intervento collegato) o eliminarle (se non hanno ancora un
+    report collegato)."""
+    st.subheader("🧳 Trasferte programmate")
+    commesse_disponibili_trasf = get_commesse_names()
     trasferte_df = get_trasferte_dettaglio()
     if trasferte_df.empty:
         st.info("Nessuna trasferta programmata.")
@@ -3290,6 +3383,40 @@ def render_gestione_trasferte_service(attore_nome, key_prefix):
                     st.rerun()
                 else:
                     st.error(errore)
+
+
+def render_report_interventi_ricevuti(key_prefix):
+    """Sotto-pagina 'Report interventi ricevuti': elenco di tutti i report
+    intervento inviati dai dipendenti in trasferta, con la possibilità di vedere
+    le foto eventualmente allegate a ciascuno."""
+    st.subheader("📷 Report interventi ricevuti")
+    report_tutti = get_report_interventi_dettaglio()
+    if report_tutti.empty:
+        st.info("Nessun report intervento inviato finora.")
+        return
+    st.dataframe(report_tutti, use_container_width=True)
+    opzioni_foto = [f"#{id_} - {dip} ({data_rep})" for id_, dip, data_rep in
+                     zip(report_tutti["ID"], report_tutti["Dipendente"], report_tutti["Data report"])]
+    mappa_report_id = dict(zip(opzioni_foto, report_tutti["ID"].tolist()))
+    report_da_vedere = st.selectbox("Vedi foto del report", ["(nessuno)"] + opzioni_foto, key=f"{key_prefix}_report_foto_select")
+    if report_da_vedere != "(nessuno)":
+        foto_report = get_foto_report(mappa_report_id[report_da_vedere])
+        if not foto_report:
+            st.info("Nessuna foto allegata a questo report.")
+        else:
+            for nome_file, dati_foto in foto_report:
+                st.image(dati_foto, caption=nome_file, use_container_width=True)
+
+
+def render_gestione_trasferte_service(attore_nome, key_prefix):
+    """Vista combinata usata da responsabile e utente semplice dell'area Service:
+    mostra insieme, come un'unica pagina, le due sotto-pagine 'Nuova trasferta' e
+    'Trasferte programmate' - la suddivisione in sotto-menu separati è stata
+    richiesta da Marco solo per la pagina dell'amministratore."""
+    render_nuova_trasferta(attore_nome, key_prefix)
+    st.markdown("---")
+    render_trasferte_programmate(key_prefix)
+
 
 def render_report_intervento(dipendente_nome, df, key_prefix):
     """Il dipendente compila il report di un intervento svolto durante una propria
@@ -4125,13 +4252,66 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False):
     compute_gantt_effettivo_commessa) - più le eventuali scadenze previste per
     macro-fase, impostabili a mano come riferimento. Solo se puo_modificare è True
     (admin) si possono cambiare la data di inizio lavori e le scadenze: agli altri
-    ruoli la pagina è di sola consultazione, come già per la priorità delle commesse."""
+    ruoli la pagina è di sola consultazione, come già per la priorità delle commesse.
+    La tendina Commessa include anche 'Tutte le commesse (vista d'insieme)' - prima
+    mancava, segnalato da Marco - che mostra un Gantt con un intervallo per commessa
+    (non fase per fase, vedi compute_gantt_teorico_tutte_commesse/
+    compute_gantt_effettivo_tutte_commesse), sola consultazione per tutti."""
     st.subheader("📅 Pianificazione commessa (Gantt)")
     commesse_disponibili = get_commesse_names()
     if not commesse_disponibili:
         st.info("Nessuna commessa configurata.")
         return
-    commessa_scelta = st.selectbox("Commessa", options=commesse_disponibili, key=f"{key_prefix}_pianificazione_commessa")
+
+    OPZIONE_TUTTE_LE_COMMESSE = "📊 Tutte le commesse (vista d'insieme)"
+    commessa_scelta = st.selectbox("Commessa", options=[OPZIONE_TUTTE_LE_COMMESSE] + commesse_disponibili, key=f"{key_prefix}_pianificazione_commessa")
+
+    if commessa_scelta == OPZIONE_TUTTE_LE_COMMESSE:
+        # Vista d'insieme richiesta da Marco ("non è possibile visualizzare il
+        # gantt con tutte le commesse, posso vederle solo singolarmente"): un
+        # intervallo per commessa (non fase per fase, altrimenti con molte
+        # commesse diventerebbe illeggibile). Data di inizio lavori, scadenze
+        # per macro-fase e dettaglio fase per fase restano disponibili solo
+        # scegliendo una singola commessa dalla tendina sopra.
+        st.caption("Un intervallo per commessa, non fase per fase: per la data di inizio lavori, le scadenze e il dettaglio fase per fase di una singola commessa, selezionala dalla tendina sopra.")
+
+        st.markdown("---")
+        st.markdown("**📐 Gantt teorico — tutte le commesse**")
+        st.caption("Calcolato dalla data di inizio lavori e dalle ore stimate delle fasi di ogni commessa (vedi Gantt teorico della singola commessa per i dettagli).")
+        gantt_teorico_tutte = compute_gantt_teorico_tutte_commesse()
+        if gantt_teorico_tutte.empty:
+            st.info("Nessuna commessa ha ancora sia una data di inizio lavori sia delle fasi: imposta questi due dati sulla singola commessa per vederla comparire qui.")
+        else:
+            gantt_chart_tutte = gantt_teorico_tutte.copy()
+            gantt_chart_tutte["Fine (esclusa)"] = pd.to_datetime(gantt_chart_tutte["Fine"]) + pd.Timedelta(days=1)
+            chart_tutte = alt.Chart(gantt_chart_tutte).mark_bar().encode(
+                x=alt.X("Inizio:T", title="Data"), x2="Fine (esclusa):T",
+                y=alt.Y("Commessa:N", sort=alt.EncodingSortField(field="Inizio", order="ascending")),
+                color=alt.Color("Stato:N", scale=alt.Scale(domain=list(COLORI_STATO_COMMESSA.keys()), range=list(COLORI_STATO_COMMESSA.values()))),
+                tooltip=["Commessa:N", "Stato:N", "Inizio:T", "Fine:T", "N. fasi:Q"]
+            ).properties(height=32 * len(gantt_chart_tutte) + 80)
+            st.altair_chart(chart_tutte, use_container_width=True)
+            st.dataframe(gantt_teorico_tutte, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("**✅ Gantt effettivo — tutte le commesse**")
+        st.caption("Dalle timbrature reali: per ogni commessa, dal primo giorno lavorato all'ultimo (prolungato fino a oggi per quelle ancora in corso).")
+        gantt_effettivo_tutte = compute_gantt_effettivo_tutte_commesse(df)
+        if gantt_effettivo_tutte.empty:
+            st.info("Nessuna commessa ha ancora fasi lavorate.")
+        else:
+            gantt_chart_eff_tutte = gantt_effettivo_tutte.copy()
+            gantt_chart_eff_tutte["Fine (esclusa)"] = pd.to_datetime(gantt_chart_eff_tutte["Fine"]) + pd.Timedelta(days=1)
+            chart_eff_tutte = alt.Chart(gantt_chart_eff_tutte).mark_bar().encode(
+                x=alt.X("Inizio:T", title="Data"), x2="Fine (esclusa):T",
+                y=alt.Y("Commessa:N", sort=alt.EncodingSortField(field="Inizio", order="ascending")),
+                color=alt.Color("Stato:N", scale=alt.Scale(domain=list(COLORI_STATO_COMMESSA.keys()), range=list(COLORI_STATO_COMMESSA.values()))),
+                tooltip=["Commessa:N", "Stato:N", "Inizio:T", "Fine:T", "In corso:N", "N. fasi lavorate:Q"]
+            ).properties(height=32 * len(gantt_chart_eff_tutte) + 80)
+            st.altair_chart(chart_eff_tutte, use_container_width=True)
+            st.dataframe(gantt_effettivo_tutte, use_container_width=True)
+        return
+
     mostra_info_commessa(commessa_scelta)
 
     data_inizio_attuale = get_data_inizio_lavori_commessa(commessa_scelta)
@@ -4374,11 +4554,13 @@ GIORNI_SETTIMANA_IT = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 
 def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None):
     """Cartellino mensile di un dipendente: una riga per ogni giorno del mese con
-    ingresso/uscita, inizio/fine pausa pranzo, tutte le commesse/fasi lavorate (un
-    dipendente può lavorare su più commesse diverse nella stessa giornata), luogo di
-    lavoro, ore ordinarie e ore straordinarie (oltre ORE_ORDINARIE_GIORNALIERE ore/
-    giorno, al netto della pausa pranzo). I giorni coperti da una richiesta di ferie/
-    permesso approvata vengono marcati come tali."""
+    ingresso/uscita, inizio/fine pausa pranzo, luogo di lavoro, ore ordinarie e ore
+    straordinarie (oltre ORE_ORDINARIE_GIORNALIERE ore/giorno, al netto della pausa
+    pranzo). I giorni coperti da una richiesta di ferie/permesso approvata vengono
+    marcati come tali. Non elenca più le commesse/fasi lavorate giorno per giorno
+    (c'era una colonna 'Commesse/Fasi'): tolta su richiesta di Marco, che quel
+    dettaglio lo consulta già nella pagina 'Riepilogo personale' e qui, nel
+    cartellino mensile, non gli interessa."""
     dfn = normalize_datetime(df) if df is not None else pd.DataFrame()
     if not dfn.empty:
         dfn = dfn[dfn["Dipendente"] == nome_dipendente]
@@ -4407,7 +4589,7 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
         gruppo = dfn[dfn["Data"] == data_corrente] if not dfn.empty else pd.DataFrame()
         gruppo = gruppo.sort_values("Timestamp") if not gruppo.empty else gruppo
 
-        ingresso_txt, uscita_txt, fasi_txt, dove_txt = "-", "-", "-", "-"
+        ingresso_txt, uscita_txt, dove_txt = "-", "-", "-"
         inizio_pausa_txt, fine_pausa_txt = "-", "-"
         ore_ordinarie, ore_straordinarie = 0.0, 0.0
 
@@ -4425,17 +4607,6 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
                 inizio_pausa_txt = str(inizio_pause.iloc[0]["Ora"])[:8]
             if not fine_pause.empty:
                 fine_pausa_txt = str(fine_pause.iloc[-1]["Ora"])[:8]
-
-            # Commesse e fasi lavorate nel giorno: un dipendente può lavorare su più
-            # commesse/fasi diverse nella stessa giornata, quindi si elencano tutte le
-            # combinazioni distinte Commessa/Fase registrate (con la commessa in
-            # evidenza per primo), non solo l'ultima.
-            fasi_lavorate = sorted(set(
-                f"{r['Commessa']}: {r['Fase']}" for _, r in gruppo.iterrows()
-                if r["Azione"] in ("Inizio fase", "Fine fase") and r.get("Fase") and r.get("Commessa")
-            ))
-            if fasi_lavorate:
-                fasi_txt = ", ".join(fasi_lavorate)
 
             luoghi = sorted(set(str(l) for l in gruppo["Luogo"].tolist() if l and str(l) != "nan"))
             if luoghi:
@@ -4478,7 +4649,6 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
             "Uscita": uscita_txt,
             "Inizio Pausa": inizio_pausa_txt,
             "Fine Pausa": fine_pausa_txt,
-            "Commesse/Fasi": fasi_txt,
             "Dove": dove_txt,
             "Ore ordinarie": ore_ordinarie,
             "Ore straordinarie": ore_straordinarie,
@@ -5011,6 +5181,249 @@ def render_area_personale(username, key_prefix):
                 st.error(errore)
 
 
+def render_grafici_classifiche(df, key_prefix):
+    """Grafici e classifiche per Area: ore lavorate, costo del personale stimato,
+    classifica annuale reparti più produttivi, produttività per reparto e
+    riepilogo dettagliato per singolo utente. Vista dell'amministratore, ora
+    condivisa anche con i responsabili/utenti dell'area Costi."""
+    st.write("### 📈 Grafici e Classifiche per Area")
+    g_start = st.date_input("Inizio periodo", value=datetime.date.today().replace(day=1), key=f"{key_prefix}_g_start")
+    g_end = st.date_input("Fine periodo", value=datetime.date.today(), key=f"{key_prefix}_g_end")
+    st.caption("Il costo del personale qui sotto è calcolato automaticamente in base alle ore lavorate da ciascun dipendente e al costo orario del suo livello CCNL (configurabile in 'Gestione Utenti DB' → 'Livelli CCNL'). È una stima, non un dato di paga ufficiale.")
+
+    def compute_hours_by_area(df_all, start_date, end_date, area_filter=None):
+        df_hours = compute_daily_work(df_all)
+        if df_hours.empty:
+            return pd.DataFrame(columns=["Area", "Ore_lavorate"])
+        df_hours = df_hours[(df_hours["Data"] >= start_date) & (df_hours["Data"] <= end_date)]
+        if df_hours.empty:
+            return pd.DataFrame(columns=["Area", "Ore_lavorate"])
+        df_hours["Area"] = df_hours["Dipendente"].map(get_users_area_map()).fillna("Unknown")
+        if area_filter and area_filter != "Tutte le aree":
+            df_hours = df_hours[df_hours["Area"] == area_filter]
+        agg = df_hours.groupby("Area", as_index=False).agg({"Ore_lavorate": "sum"})
+        agg["Ore_lavorate"] = agg["Ore_lavorate"].round(2)
+        return agg.sort_values("Ore_lavorate", ascending=False)
+
+    hours_by_area = compute_hours_by_area(df, g_start, g_end)
+    if hours_by_area.empty:
+        st.info("Nessuna timbratura valida nel periodo selezionato.")
+    else:
+        st.subheader("Ore lavorate per Area")
+        st.dataframe(hours_by_area, use_container_width=True)
+
+        # Grafico a torta ore
+        pie_hours = alt.Chart(hours_by_area).mark_arc().encode(
+            theta=alt.Theta(field="Ore_lavorate", type="quantitative"),
+            color=alt.Color(field="Area", type="nominal"),
+            tooltip=[alt.Tooltip("Area:N"), alt.Tooltip("Ore_lavorate:Q")]
+        ).properties(height=400)
+        st.altair_chart(pie_hours, use_container_width=True)
+
+        # Calcolo automatico dei costi per area, in base a ore lavorate x costo orario del livello CCNL
+        costi_per_area = compute_costo_per_area(df, g_start, g_end)
+        st.subheader("Costi del personale stimati per Area")
+        if costi_per_area.empty:
+            st.info("Nessun costo calcolabile nel periodo selezionato.")
+        else:
+            st.dataframe(costi_per_area, use_container_width=True)
+            pie_costs = alt.Chart(costi_per_area).mark_arc().encode(
+                theta=alt.Theta(field="Costo_totale", type="quantitative"),
+                color=alt.Color(field="Area", type="nominal"),
+                tooltip=[alt.Tooltip("Area:N"), alt.Tooltip("Costo_totale:Q", format=".2f")]
+            ).properties(height=400)
+            st.altair_chart(pie_costs, use_container_width=True)
+
+        with st.expander("Dettaglio costo stimato per dipendente"):
+            costi_dipendenti = compute_costo_dipendenti(df, g_start, g_end)
+            if costi_dipendenti.empty:
+                st.info("Nessun dato nel periodo selezionato.")
+            else:
+                st.dataframe(costi_dipendenti, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Classifica annuale reparti più produttivi")
+        sel_year = st.number_input("Seleziona anno per classifica", min_value=2000, max_value=datetime.date.today().year, value=datetime.date.today().year, key=f"{key_prefix}_sel_year")
+        year_start = datetime.date(sel_year, 1, 1)
+        year_end = datetime.date(sel_year, 12, 31)
+        ranking = compute_hours_by_area(df, year_start, year_end)
+        if ranking.empty:
+            st.info("Nessun dato per l'anno selezionato.")
+        else:
+            st.write("Classifica ore totali per Area (anno selezionato):")
+            st.dataframe(ranking, use_container_width=True)
+            bar = alt.Chart(ranking).mark_bar().encode(
+                x=alt.X("Ore_lavorate:Q"), y=alt.Y("Area:N", sort="-x"), tooltip=[alt.Tooltip("Area:N"), alt.Tooltip("Ore_lavorate:Q")]
+            ).properties(height=400)
+            st.altair_chart(bar, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("📈 Produttività per reparto")
+        st.caption("Rapporto tra ore stimate e ore effettivamente lavorate sulle fasi delle commesse, nel periodo selezionato sopra. Sopra 100% = si è finito prima del previsto (bene); sotto 100% = si è sforato (male). Calcolata solo sulle fasi con ore stimate configurate (vedi 'Gestione Commesse').")
+        produttivita_dettaglio_area = compute_produttivita_commesse(df, g_start, g_end)
+        productivity_by_area = compute_produttivita_per_area(produttivita_dettaglio_area)
+        if productivity_by_area.empty:
+            st.info("Nessuna fase con ore stimate lavorata nel periodo selezionato. Configura le ore stimate in 'Gestione Commesse'.")
+        else:
+            top_area = productivity_by_area.iloc[0]
+            st.success(f"🏆 Reparto più produttivo nel periodo: **{top_area['Area']}** ({top_area['Produttivita_%']:.1f}% — ore stimate su ore effettive)")
+            st.dataframe(productivity_by_area, use_container_width=True)
+            bar_prod = alt.Chart(productivity_by_area).mark_bar().encode(
+                x=alt.X("Produttivita_%:Q", title="% ore stimate su ore effettive"),
+                y=alt.Y("Area:N", sort="-x"),
+                tooltip=[alt.Tooltip("Area:N"), alt.Tooltip("Ore_stimate:Q"), alt.Tooltip("Ore_effettive:Q"), alt.Tooltip("Produttivita_%:Q", title="Produttività %")]
+            ).properties(height=40 * len(productivity_by_area) + 100)
+            st.altair_chart(bar_prod, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Riepilogo per singolo utente (visualizzazione)")
+        user_list = ["Tutti"] + get_user_names()
+        sel_user = st.selectbox("Seleziona utente", options=user_list, key=f"{key_prefix}_sel_user")
+        u_start = st.date_input("Inizio periodo (utente)", value=g_start, key=f"{key_prefix}_u_start")
+        u_end = st.date_input("Fine periodo (utente)", value=g_end, key=f"{key_prefix}_u_end")
+
+        def build_user_gantt(df_all, start_date, end_date, user_name):
+            dfn = normalize_datetime(df_all)
+            if dfn.empty: return pd.DataFrame(columns=["Dipendente", "start", "end", "Data", "Luogo"])
+            if user_name and user_name != "Tutti": dfn = dfn[dfn["Dipendente"] == user_name]
+            dfn = dfn[(dfn["Data"] >= start_date) & (dfn["Data"] <= end_date)]
+            if dfn.empty: return pd.DataFrame(columns=["Dipendente", "start", "end", "Data", "Luogo"])
+            rows = []
+            for (user, date), group in dfn.groupby(["Dipendente", "Data"]):
+                group = group.sort_values("Timestamp")
+                ingressi = group[group["Azione"] == "Ingresso"]["Timestamp"]
+                uscite = group[group["Azione"] == "Uscita"]["Timestamp"]
+                if ingressi.empty or uscite.empty: continue
+                start = ingressi.iloc[0]; end = uscite.iloc[-1]
+                if pd.isna(start) or pd.isna(end) or end <= start: continue
+                luogo = ", ".join(sorted(set(group["Luogo"].astype(str).replace("nan", "-").tolist())))
+                rows.append({"Dipendente": user, "start": start, "end": end, "Data": date, "Luogo": luogo})
+            return pd.DataFrame(rows)
+
+        user_gantt = build_user_gantt(df, u_start, u_end, sel_user)
+        if user_gantt.empty:
+            st.info("Nessun dato timbrature per l'utente nel periodo selezionato.")
+        else:
+            st.markdown("**Gantt temporale per utente**")
+            gantt_chart_user = alt.Chart(user_gantt).mark_bar().encode(
+                x="start:T", x2="end:T", y=alt.Y("Data:T", axis=alt.Axis(title="Data")),
+                color=alt.Color("Luogo:N"), tooltip=["Dipendente:N", "Data:T", "start:T", "end:T", "Luogo:N"]
+            ).properties(height=40 * len(user_gantt["Data"].unique()) + 100)
+            st.altair_chart(gantt_chart_user, use_container_width=True)
+
+            # Statistiche riepilogo
+            df_daily = compute_daily_work(df)
+            df_user_daily = df_daily[(df_daily["Data"] >= u_start) & (df_daily["Data"] <= u_end)]
+            if sel_user != "Tutti":
+                df_user_daily = df_user_daily[df_user_daily["Dipendente"] == sel_user]
+
+            total_hours = round(df_user_daily["Ore_lavorate"].sum(), 2) if not df_user_daily.empty else 0.0
+            days_worked = int(df_user_daily.shape[0])
+            avg_hours = round(df_user_daily["Ore_lavorate"].mean(), 2) if days_worked else 0.0
+            timbrature_count = 0
+            phases_started = 0
+            if sel_user != "Tutti":
+                dfn_all = normalize_datetime(df)
+                tmp = dfn_all[(dfn_all["Data"] >= u_start) & (dfn_all["Data"] <= u_end) & (dfn_all["Dipendente"] == sel_user)]
+                timbrature_count = tmp.shape[0]
+                phases_started = tmp[tmp["Azione"] == "Inizio fase"].shape[0]
+
+            st.markdown("**Statistiche riepilogo**")
+            col_a, col_b, col_c, col_d = st.columns(4)
+            col_a.metric("Ore totali", f"{total_hours}")
+            col_b.metric("Giorni lavorati", f"{days_worked}")
+            col_c.metric("Media ore/giorno", f"{avg_hours}")
+            col_d.metric("Timbrature/azioni", f"{timbrature_count}")
+
+            st.markdown("**Dettaglio commesse (ore)**")
+            commessa_user = compute_hours_by_commessa(df, u_start, u_end, employee_name=None if sel_user == "Tutti" else sel_user)
+            if commessa_user.empty:
+                st.info("Nessuna commessa registrata per l'utente nel periodo.")
+            else:
+                st.dataframe(commessa_user, use_container_width=True)
+                bar_comm = alt.Chart(commessa_user).mark_bar().encode(x=alt.X("Ore_lavorate:Q"), y=alt.Y("Commessa:N", sort='-x'), tooltip=[alt.Tooltip("Commessa:N"), alt.Tooltip("Ore_lavorate:Q")]).properties(height=300)
+                st.altair_chart(bar_comm, use_container_width=True)
+
+
+def render_sostenibilita(df, key_prefix):
+    """Confronto Vimek / Smart Working / Trasferta con stima del risparmio sui
+    costi di gestione della sede e della CO2 evitata grazie allo smart working.
+    Vista dell'amministratore, ora condivisa anche con i responsabili/utenti
+    dell'area Costi."""
+    st.write("### 🌱 Sostenibilità: Vimek vs Smart Working vs Trasferta")
+    st.caption("Confronto tra le ore lavorate in sede (Vimek, sia ufficio che officina), in smart working e in trasferta, con una stima di quanto lo smart working fa risparmiare all'azienda in costi di gestione della sede (energia, riscaldamento, climatizzazione, servizi igienici) e di quanta CO2 evita. La modalità di ciascuna sessione è quella scelta dal dipendente all'Ingresso.")
+
+    sost_start = st.date_input("Inizio periodo", value=datetime.date.today().replace(day=1), key=f"{key_prefix}_sost_start")
+    sost_end = st.date_input("Fine periodo", value=datetime.date.today(), key=f"{key_prefix}_sost_end")
+    aree_disponibili_sost = ["Tutte le aree"] + get_area_names()
+    sost_area = st.selectbox("Area", options=aree_disponibili_sost, key=f"{key_prefix}_sost_area")
+
+    ore_per_luogo = compute_ore_per_luogo(df, sost_start, sost_end, area_filter=sost_area)
+
+    if ore_per_luogo.empty:
+        st.info("Nessuna timbratura valida nel periodo selezionato.")
+    else:
+        mappa_ore = dict(zip(ore_per_luogo["Luogo"], ore_per_luogo["Ore_lavorate"]))
+        ore_vimek = mappa_ore.get("Vimek", 0.0)
+        ore_smart = mappa_ore.get("Smart", 0.0)
+        ore_trasferta = mappa_ore.get("Trasferta", 0.0)
+        ore_totali = ore_vimek + ore_smart + ore_trasferta
+
+        costo_orario_evitato, co2_kg_orario_evitato = get_parametri_sostenibilita()
+        risparmio_euro, _ = compute_risparmio_smart_working(ore_smart, costo_orario_evitato, co2_kg_orario_evitato)
+
+        co2_kg_per_km = get_co2_kg_per_km_pendolarismo()
+        dettaglio_co2_pendolarismo, co2_evitata_kg_pendolarismo = compute_co2_risparmiata_pendolarismo(
+            df, sost_start, sost_end, area_filter=sost_area, co2_kg_per_km=co2_kg_per_km)
+        # La stima basata sulla distanza casa-lavoro richiede che i dipendenti
+        # l'abbiano impostata in "Area Personale": se nessuno l'ha ancora fatto,
+        # si usa come ripiego la stima generica per ora di smart working.
+        usa_stima_precisa = co2_evitata_kg_pendolarismo > 0
+        if usa_stima_precisa:
+            co2_evitata_kg = co2_evitata_kg_pendolarismo
+        else:
+            _, co2_evitata_kg = compute_risparmio_smart_working(ore_smart, costo_orario_evitato, co2_kg_orario_evitato)
+
+        st.markdown("#### 📊 Ore lavorate per modalità")
+        col_o1, col_o2, col_o3 = st.columns(3)
+        col_o1.metric("🏭 Vimek", f"{ore_vimek:.1f} h", f"{(ore_vimek/ore_totali*100):.0f}%" if ore_totali else None)
+        col_o2.metric("🏠 Smart", f"{ore_smart:.1f} h", f"{(ore_smart/ore_totali*100):.0f}%" if ore_totali else None)
+        col_o3.metric("🚗 Trasferta", f"{ore_trasferta:.1f} h", f"{(ore_trasferta/ore_totali*100):.0f}%" if ore_totali else None)
+
+        pie_luoghi = alt.Chart(ore_per_luogo).mark_arc().encode(
+            theta=alt.Theta(field="Ore_lavorate", type="quantitative"),
+            color=alt.Color(field="Luogo", type="nominal"),
+            tooltip=[alt.Tooltip("Luogo:N"), alt.Tooltip("Ore_lavorate:Q")]
+        ).properties(height=350)
+        st.altair_chart(pie_luoghi, use_container_width=True)
+
+        st.markdown("#### 🌱 Zona Green: risparmio stimato dallo Smart Working")
+        col_g1, col_g2 = st.columns(2)
+        col_g1.metric("💶 Risparmio stimato costi sede", f"{risparmio_euro:.2f} €")
+        col_g2.metric("🌍 CO2 evitata stimata", f"{co2_evitata_kg:.2f} kg")
+        if usa_stima_precisa:
+            st.caption(f"CO2 calcolata sui giorni di smart working effettivi x la distanza casa-lavoro (andata e ritorno) che ogni dipendente ha impostato in 'Area Personale' x {co2_kg_per_km:g} kg CO2/km (fattore di emissione medio). Risparmio in € calcolato come {ore_smart:.1f} ore di smart working × {costo_orario_evitato:g} €/h evitati in costi di gestione della sede.")
+            with st.expander("Dettaglio CO2 evitata per dipendente"):
+                st.dataframe(dettaglio_co2_pendolarismo, use_container_width=True)
+        else:
+            st.caption(f"Nessun dipendente ha ancora impostato la propria distanza casa-lavoro in 'Area Personale': la CO2 è quindi stimata in modo generico come {ore_smart:.1f} ore di smart working × {co2_kg_orario_evitato:g} kg CO2/h evitati. Una volta impostate le distanze, la stima diventerà più precisa (basata sui km di tragitto casa-lavoro realmente risparmiati).")
+
+        with st.expander("⚙️ Personalizza i coefficienti di stima"):
+            st.caption("Valori di partenza derivati (in modo approssimativo) dai dati dell'Osservatorio Smart Working del Politecnico di Milano (risparmio energetico) e ISPRA (emissioni medie auto) su risparmio e riduzione di CO2 per giornata di smart working. Sono medie nazionali, non i costi/dati reali della tua azienda: personalizzale in base alle tue bollette (energia, riscaldamento, climatizzazione, servizi igienici) e al parco mezzi realmente usato dai dipendenti per il tragitto casa-lavoro.")
+            nuovo_costo_evitato = st.number_input("Risparmio stimato (€ per ora di smart working)", min_value=0.0, step=0.01, value=costo_orario_evitato, format="%.2f", key=f"{key_prefix}_sost_costo_evitato")
+            nuovo_co2_evitato = st.number_input("CO2 evitata stimata (kg per ora di smart working, usata se nessuno ha impostato la distanza)", min_value=0.0, step=0.01, value=co2_kg_orario_evitato, format="%.2f", key=f"{key_prefix}_sost_co2_evitato")
+            nuovo_co2_km = st.number_input("Fattore di emissione (kg CO2 per km percorso in auto)", min_value=0.0, step=0.001, value=co2_kg_per_km, format="%.3f", key=f"{key_prefix}_sost_co2_km",
+                                            help="Usato insieme alla distanza casa-lavoro di ciascun dipendente (impostata in 'Area Personale') per stimare la CO2 evitata nei giorni di smart working.")
+            if st.button("💾 Salva coefficienti", key=f"{key_prefix}_btn_salva_sostenibilita"):
+                ok1, errore1 = aggiorna_parametri_sostenibilita(nuovo_costo_evitato, nuovo_co2_evitato)
+                ok2, errore2 = aggiorna_co2_kg_per_km_pendolarismo(nuovo_co2_km)
+                if ok1 and ok2:
+                    st.success("Coefficienti aggiornati.")
+                    st.rerun()
+                else:
+                    st.error(errore1 or errore2)
+
+
 def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
     """Menu di navigazione della sidebar organizzato per categorie invece di un unico
     lungo elenco piatto: prima si sceglie la categoria (poche voci, facili da
@@ -5044,7 +5457,7 @@ def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
 PAGINE_SENZA_AUTOREFRESH_AUTOMATICO = {
     "Gestione Commesse", "Gestione fasi commessa", "Gestione Utenti DB",
     "Profilo", "Timbrature", "📷 Report Intervento",
-    "🧳 Trasferte e Interventi (Service)", "🧳 Trasferte Service",
+    "Programmazione nuova Trasferta", "Trasferte programmate", "🧳 Trasferte Service",
     "Richiesta ferie/permessi", "Richiesta rettifica",
     "💰 Costi commesse", "💰 Gestione Costi", "📅 Pianificazione",
 }
@@ -5102,7 +5515,7 @@ else:
             ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione"]),
             ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
-            ("🧳 Trasferte e Team", ["🧳 Trasferte e Interventi (Service)", "📅 Disponibilità Team"]),
+            ("🧳 Trasferte e Team", ["Programmazione nuova Trasferta", "Trasferte programmate", "Report interventi ricevuti", "📅 Disponibilità Team"]),
             ("💰 Costi", ["💰 Costi commesse"]),
             ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
         ], key_prefix="admin_menu", titolo_categoria="Sezione amministratore")
@@ -5286,237 +5699,10 @@ else:
             render_gestione_costi(df, key_prefix="admin_costi")
 
         elif admin_page == "Grafici e Classifiche":
-            st.write("### 📈 Grafici e Classifiche per Area")
-            g_start = st.date_input("Inizio periodo", value=datetime.date.today().replace(day=1), key="g_start")
-            g_end = st.date_input("Fine periodo", value=datetime.date.today(), key="g_end")
-            st.caption("Il costo del personale qui sotto è calcolato automaticamente in base alle ore lavorate da ciascun dipendente e al costo orario del suo livello CCNL (configurabile in 'Gestione Utenti DB' → 'Livelli CCNL'). È una stima, non un dato di paga ufficiale.")
-
-            def compute_hours_by_area(df_all, start_date, end_date, area_filter=None):
-                df_hours = compute_daily_work(df_all)
-                if df_hours.empty:
-                    return pd.DataFrame(columns=["Area", "Ore_lavorate"])
-                df_hours = df_hours[(df_hours["Data"] >= start_date) & (df_hours["Data"] <= end_date)]
-                if df_hours.empty:
-                    return pd.DataFrame(columns=["Area", "Ore_lavorate"])
-                df_hours["Area"] = df_hours["Dipendente"].map(get_users_area_map()).fillna("Unknown")
-                if area_filter and area_filter != "Tutte le aree":
-                    df_hours = df_hours[df_hours["Area"] == area_filter]
-                agg = df_hours.groupby("Area", as_index=False).agg({"Ore_lavorate": "sum"})
-                agg["Ore_lavorate"] = agg["Ore_lavorate"].round(2)
-                return agg.sort_values("Ore_lavorate", ascending=False)
-
-            hours_by_area = compute_hours_by_area(df, g_start, g_end)
-            if hours_by_area.empty:
-                st.info("Nessuna timbratura valida nel periodo selezionato.")
-            else:
-                st.subheader("Ore lavorate per Area")
-                st.dataframe(hours_by_area, use_container_width=True)
-
-                # Grafico a torta ore
-                pie_hours = alt.Chart(hours_by_area).mark_arc().encode(
-                    theta=alt.Theta(field="Ore_lavorate", type="quantitative"),
-                    color=alt.Color(field="Area", type="nominal"),
-                    tooltip=[alt.Tooltip("Area:N"), alt.Tooltip("Ore_lavorate:Q")]
-                ).properties(height=400)
-                st.altair_chart(pie_hours, use_container_width=True)
-
-                # Calcolo automatico dei costi per area, in base a ore lavorate x costo orario del livello CCNL
-                costi_per_area = compute_costo_per_area(df, g_start, g_end)
-                st.subheader("Costi del personale stimati per Area")
-                if costi_per_area.empty:
-                    st.info("Nessun costo calcolabile nel periodo selezionato.")
-                else:
-                    st.dataframe(costi_per_area, use_container_width=True)
-                    pie_costs = alt.Chart(costi_per_area).mark_arc().encode(
-                        theta=alt.Theta(field="Costo_totale", type="quantitative"),
-                        color=alt.Color(field="Area", type="nominal"),
-                        tooltip=[alt.Tooltip("Area:N"), alt.Tooltip("Costo_totale:Q", format=".2f")]
-                    ).properties(height=400)
-                    st.altair_chart(pie_costs, use_container_width=True)
-
-                with st.expander("Dettaglio costo stimato per dipendente"):
-                    costi_dipendenti = compute_costo_dipendenti(df, g_start, g_end)
-                    if costi_dipendenti.empty:
-                        st.info("Nessun dato nel periodo selezionato.")
-                    else:
-                        st.dataframe(costi_dipendenti, use_container_width=True)
-
-                st.markdown("---")
-                st.subheader("Classifica annuale reparti più produttivi")
-                sel_year = st.number_input("Seleziona anno per classifica", min_value=2000, max_value=datetime.date.today().year, value=datetime.date.today().year)
-                year_start = datetime.date(sel_year, 1, 1)
-                year_end = datetime.date(sel_year, 12, 31)
-                ranking = compute_hours_by_area(df, year_start, year_end)
-                if ranking.empty:
-                    st.info("Nessun dato per l'anno selezionato.")
-                else:
-                    st.write("Classifica ore totali per Area (anno selezionato):")
-                    st.dataframe(ranking, use_container_width=True)
-                    bar = alt.Chart(ranking).mark_bar().encode(
-                        x=alt.X("Ore_lavorate:Q"), y=alt.Y("Area:N", sort="-x"), tooltip=[alt.Tooltip("Area:N"), alt.Tooltip("Ore_lavorate:Q")]
-                    ).properties(height=400)
-                    st.altair_chart(bar, use_container_width=True)
-
-                st.markdown("---")
-                st.subheader("📈 Produttività per reparto")
-                st.caption("Rapporto tra ore stimate e ore effettivamente lavorate sulle fasi delle commesse, nel periodo selezionato sopra. Sopra 100% = si è finito prima del previsto (bene); sotto 100% = si è sforato (male). Calcolata solo sulle fasi con ore stimate configurate (vedi 'Gestione Commesse').")
-                produttivita_dettaglio_area = compute_produttivita_commesse(df, g_start, g_end)
-                productivity_by_area = compute_produttivita_per_area(produttivita_dettaglio_area)
-                if productivity_by_area.empty:
-                    st.info("Nessuna fase con ore stimate lavorata nel periodo selezionato. Configura le ore stimate in 'Gestione Commesse'.")
-                else:
-                    top_area = productivity_by_area.iloc[0]
-                    st.success(f"🏆 Reparto più produttivo nel periodo: **{top_area['Area']}** ({top_area['Produttivita_%']:.1f}% — ore stimate su ore effettive)")
-                    st.dataframe(productivity_by_area, use_container_width=True)
-                    bar_prod = alt.Chart(productivity_by_area).mark_bar().encode(
-                        x=alt.X("Produttivita_%:Q", title="% ore stimate su ore effettive"),
-                        y=alt.Y("Area:N", sort="-x"),
-                        tooltip=[alt.Tooltip("Area:N"), alt.Tooltip("Ore_stimate:Q"), alt.Tooltip("Ore_effettive:Q"), alt.Tooltip("Produttivita_%:Q", title="Produttività %")]
-                    ).properties(height=40 * len(productivity_by_area) + 100)
-                    st.altair_chart(bar_prod, use_container_width=True)
-
-                st.markdown("---")
-                st.subheader("Riepilogo per singolo utente (visualizzazione)")
-                user_list = ["Tutti"] + get_user_names()
-                sel_user = st.selectbox("Seleziona utente", options=user_list)
-                u_start = st.date_input("Inizio periodo (utente)", value=g_start, key="u_start")
-                u_end = st.date_input("Fine periodo (utente)", value=g_end, key="u_end")
-
-                def build_user_gantt(df_all, start_date, end_date, user_name):
-                    dfn = normalize_datetime(df_all)
-                    if dfn.empty: return pd.DataFrame(columns=["Dipendente", "start", "end", "Data", "Luogo"])
-                    if user_name and user_name != "Tutti": dfn = dfn[dfn["Dipendente"] == user_name]
-                    dfn = dfn[(dfn["Data"] >= start_date) & (dfn["Data"] <= end_date)]
-                    if dfn.empty: return pd.DataFrame(columns=["Dipendente", "start", "end", "Data", "Luogo"])
-                    rows = []
-                    for (user, date), group in dfn.groupby(["Dipendente", "Data"]):
-                        group = group.sort_values("Timestamp")
-                        ingressi = group[group["Azione"] == "Ingresso"]["Timestamp"]
-                        uscite = group[group["Azione"] == "Uscita"]["Timestamp"]
-                        if ingressi.empty or uscite.empty: continue
-                        start = ingressi.iloc[0]; end = uscite.iloc[-1]
-                        if pd.isna(start) or pd.isna(end) or end <= start: continue
-                        luogo = ", ".join(sorted(set(group["Luogo"].astype(str).replace("nan", "-").tolist())))
-                        rows.append({"Dipendente": user, "start": start, "end": end, "Data": date, "Luogo": luogo})
-                    return pd.DataFrame(rows)
-
-                user_gantt = build_user_gantt(df, u_start, u_end, sel_user)
-                if user_gantt.empty:
-                    st.info("Nessun dato timbrature per l'utente nel periodo selezionato.")
-                else:
-                    st.markdown("**Gantt temporale per utente**")
-                    gantt_chart_user = alt.Chart(user_gantt).mark_bar().encode(
-                        x="start:T", x2="end:T", y=alt.Y("Data:T", axis=alt.Axis(title="Data")),
-                        color=alt.Color("Luogo:N"), tooltip=["Dipendente:N", "Data:T", "start:T", "end:T", "Luogo:N"]
-                    ).properties(height=40 * len(user_gantt["Data"].unique()) + 100)
-                    st.altair_chart(gantt_chart_user, use_container_width=True)
-
-                    # Statistiche riepilogo
-                    df_daily = compute_daily_work(df)
-                    df_user_daily = df_daily[(df_daily["Data"] >= u_start) & (df_daily["Data"] <= u_end)]
-                    if sel_user != "Tutti":
-                        df_user_daily = df_user_daily[df_user_daily["Dipendente"] == sel_user]
-
-                    total_hours = round(df_user_daily["Ore_lavorate"].sum(), 2) if not df_user_daily.empty else 0.0
-                    days_worked = int(df_user_daily.shape[0])
-                    avg_hours = round(df_user_daily["Ore_lavorate"].mean(), 2) if days_worked else 0.0
-                    timbrature_count = 0
-                    phases_started = 0
-                    if sel_user != "Tutti":
-                        dfn_all = normalize_datetime(df)
-                        tmp = dfn_all[(dfn_all["Data"] >= u_start) & (dfn_all["Data"] <= u_end) & (dfn_all["Dipendente"] == sel_user)]
-                        timbrature_count = tmp.shape[0]
-                        phases_started = tmp[tmp["Azione"] == "Inizio fase"].shape[0]
-
-                    st.markdown("**Statistiche riepilogo**")
-                    col_a, col_b, col_c, col_d = st.columns(4)
-                    col_a.metric("Ore totali", f"{total_hours}")
-                    col_b.metric("Giorni lavorati", f"{days_worked}")
-                    col_c.metric("Media ore/giorno", f"{avg_hours}")
-                    col_d.metric("Timbrature/azioni", f"{timbrature_count}")
-
-                    st.markdown("**Dettaglio commesse (ore)**")
-                    commessa_user = compute_hours_by_commessa(df, u_start, u_end, employee_name=None if sel_user == "Tutti" else sel_user)
-                    if commessa_user.empty:
-                        st.info("Nessuna commessa registrata per l'utente nel periodo.")
-                    else:
-                        st.dataframe(commessa_user, use_container_width=True)
-                        bar_comm = alt.Chart(commessa_user).mark_bar().encode(x=alt.X("Ore_lavorate:Q"), y=alt.Y("Commessa:N", sort='-x'), tooltip=[alt.Tooltip("Commessa:N"), alt.Tooltip("Ore_lavorate:Q")]).properties(height=300)
-                        st.altair_chart(bar_comm, use_container_width=True)
+            render_grafici_classifiche(df, key_prefix="admin_grafici")
 
         elif admin_page == "🌱 Sostenibilità (Smart Working)":
-            st.write("### 🌱 Sostenibilità: Vimek vs Smart Working vs Trasferta")
-            st.caption("Confronto tra le ore lavorate in sede (Vimek, sia ufficio che officina), in smart working e in trasferta, con una stima di quanto lo smart working fa risparmiare all'azienda in costi di gestione della sede (energia, riscaldamento, climatizzazione, servizi igienici) e di quanta CO2 evita. La modalità di ciascuna sessione è quella scelta dal dipendente all'Ingresso.")
-
-            sost_start = st.date_input("Inizio periodo", value=datetime.date.today().replace(day=1), key="sost_start")
-            sost_end = st.date_input("Fine periodo", value=datetime.date.today(), key="sost_end")
-            aree_disponibili_sost = ["Tutte le aree"] + get_area_names()
-            sost_area = st.selectbox("Area", options=aree_disponibili_sost, key="sost_area")
-
-            ore_per_luogo = compute_ore_per_luogo(df, sost_start, sost_end, area_filter=sost_area)
-
-            if ore_per_luogo.empty:
-                st.info("Nessuna timbratura valida nel periodo selezionato.")
-            else:
-                mappa_ore = dict(zip(ore_per_luogo["Luogo"], ore_per_luogo["Ore_lavorate"]))
-                ore_vimek = mappa_ore.get("Vimek", 0.0)
-                ore_smart = mappa_ore.get("Smart", 0.0)
-                ore_trasferta = mappa_ore.get("Trasferta", 0.0)
-                ore_totali = ore_vimek + ore_smart + ore_trasferta
-
-                costo_orario_evitato, co2_kg_orario_evitato = get_parametri_sostenibilita()
-                risparmio_euro, _ = compute_risparmio_smart_working(ore_smart, costo_orario_evitato, co2_kg_orario_evitato)
-
-                co2_kg_per_km = get_co2_kg_per_km_pendolarismo()
-                dettaglio_co2_pendolarismo, co2_evitata_kg_pendolarismo = compute_co2_risparmiata_pendolarismo(
-                    df, sost_start, sost_end, area_filter=sost_area, co2_kg_per_km=co2_kg_per_km)
-                # La stima basata sulla distanza casa-lavoro richiede che i dipendenti
-                # l'abbiano impostata in "Area Personale": se nessuno l'ha ancora fatto,
-                # si usa come ripiego la stima generica per ora di smart working.
-                usa_stima_precisa = co2_evitata_kg_pendolarismo > 0
-                if usa_stima_precisa:
-                    co2_evitata_kg = co2_evitata_kg_pendolarismo
-                else:
-                    _, co2_evitata_kg = compute_risparmio_smart_working(ore_smart, costo_orario_evitato, co2_kg_orario_evitato)
-
-                st.markdown("#### 📊 Ore lavorate per modalità")
-                col_o1, col_o2, col_o3 = st.columns(3)
-                col_o1.metric("🏭 Vimek", f"{ore_vimek:.1f} h", f"{(ore_vimek/ore_totali*100):.0f}%" if ore_totali else None)
-                col_o2.metric("🏠 Smart", f"{ore_smart:.1f} h", f"{(ore_smart/ore_totali*100):.0f}%" if ore_totali else None)
-                col_o3.metric("🚗 Trasferta", f"{ore_trasferta:.1f} h", f"{(ore_trasferta/ore_totali*100):.0f}%" if ore_totali else None)
-
-                pie_luoghi = alt.Chart(ore_per_luogo).mark_arc().encode(
-                    theta=alt.Theta(field="Ore_lavorate", type="quantitative"),
-                    color=alt.Color(field="Luogo", type="nominal"),
-                    tooltip=[alt.Tooltip("Luogo:N"), alt.Tooltip("Ore_lavorate:Q")]
-                ).properties(height=350)
-                st.altair_chart(pie_luoghi, use_container_width=True)
-
-                st.markdown("#### 🌱 Zona Green: risparmio stimato dallo Smart Working")
-                col_g1, col_g2 = st.columns(2)
-                col_g1.metric("💶 Risparmio stimato costi sede", f"{risparmio_euro:.2f} €")
-                col_g2.metric("🌍 CO2 evitata stimata", f"{co2_evitata_kg:.2f} kg")
-                if usa_stima_precisa:
-                    st.caption(f"CO2 calcolata sui giorni di smart working effettivi x la distanza casa-lavoro (andata e ritorno) che ogni dipendente ha impostato in 'Area Personale' x {co2_kg_per_km:g} kg CO2/km (fattore di emissione medio). Risparmio in € calcolato come {ore_smart:.1f} ore di smart working × {costo_orario_evitato:g} €/h evitati in costi di gestione della sede.")
-                    with st.expander("Dettaglio CO2 evitata per dipendente"):
-                        st.dataframe(dettaglio_co2_pendolarismo, use_container_width=True)
-                else:
-                    st.caption(f"Nessun dipendente ha ancora impostato la propria distanza casa-lavoro in 'Area Personale': la CO2 è quindi stimata in modo generico come {ore_smart:.1f} ore di smart working × {co2_kg_orario_evitato:g} kg CO2/h evitati. Una volta impostate le distanze, la stima diventerà più precisa (basata sui km di tragitto casa-lavoro realmente risparmiati).")
-
-                with st.expander("⚙️ Personalizza i coefficienti di stima"):
-                    st.caption("Valori di partenza derivati (in modo approssimativo) dai dati dell'Osservatorio Smart Working del Politecnico di Milano (risparmio energetico) e ISPRA (emissioni medie auto) su risparmio e riduzione di CO2 per giornata di smart working. Sono medie nazionali, non i costi/dati reali della tua azienda: personalizzale in base alle tue bollette (energia, riscaldamento, climatizzazione, servizi igienici) e al parco mezzi realmente usato dai dipendenti per il tragitto casa-lavoro.")
-                    nuovo_costo_evitato = st.number_input("Risparmio stimato (€ per ora di smart working)", min_value=0.0, step=0.01, value=costo_orario_evitato, format="%.2f", key="sost_costo_evitato")
-                    nuovo_co2_evitato = st.number_input("CO2 evitata stimata (kg per ora di smart working, usata se nessuno ha impostato la distanza)", min_value=0.0, step=0.01, value=co2_kg_orario_evitato, format="%.2f", key="sost_co2_evitato")
-                    nuovo_co2_km = st.number_input("Fattore di emissione (kg CO2 per km percorso in auto)", min_value=0.0, step=0.001, value=co2_kg_per_km, format="%.3f", key="sost_co2_km",
-                                                    help="Usato insieme alla distanza casa-lavoro di ciascun dipendente (impostata in 'Area Personale') per stimare la CO2 evitata nei giorni di smart working.")
-                    if st.button("💾 Salva coefficienti", key="btn_salva_sostenibilita"):
-                        ok1, errore1 = aggiorna_parametri_sostenibilita(nuovo_costo_evitato, nuovo_co2_evitato)
-                        ok2, errore2 = aggiorna_co2_kg_per_km_pendolarismo(nuovo_co2_km)
-                        if ok1 and ok2:
-                            st.success("Coefficienti aggiornati.")
-                            st.rerun()
-                        else:
-                            st.error(errore1 or errore2)
+            render_sostenibilita(df, key_prefix="admin_sostenibilita")
 
         elif admin_page == "Gestione Utenti DB":
             st.write("### 👥 Aggiungi o Modifica Utenti nel Database")
@@ -5644,26 +5830,14 @@ else:
                         st.success(f"Livello '{livello_sel}' eliminato. Gli utenti con questo livello useranno i valori di default aziendali.")
                         st.rerun()
 
-        if admin_page == "🧳 Trasferte e Interventi (Service)":
-            render_gestione_trasferte_service(user_info["name"], key_prefix="admin")
-            st.markdown("---")
-            st.markdown("**Report interventi ricevuti**")
-            report_tutti = get_report_interventi_dettaglio()
-            if report_tutti.empty:
-                st.info("Nessun report intervento inviato finora.")
-            else:
-                st.dataframe(report_tutti, use_container_width=True)
-                opzioni_foto = [f"#{id_} - {dip} ({data_rep})" for id_, dip, data_rep in
-                                 zip(report_tutti["ID"], report_tutti["Dipendente"], report_tutti["Data report"])]
-                mappa_report_id = dict(zip(opzioni_foto, report_tutti["ID"].tolist()))
-                report_da_vedere = st.selectbox("Vedi foto del report", ["(nessuno)"] + opzioni_foto, key="admin_report_foto_select")
-                if report_da_vedere != "(nessuno)":
-                    foto_report = get_foto_report(mappa_report_id[report_da_vedere])
-                    if not foto_report:
-                        st.info("Nessuna foto allegata a questo report.")
-                    else:
-                        for nome_file, dati_foto in foto_report:
-                            st.image(dati_foto, caption=nome_file, use_container_width=True)
+        if admin_page == "Programmazione nuova Trasferta":
+            render_nuova_trasferta(user_info["name"], key_prefix="admin")
+
+        if admin_page == "Trasferte programmate":
+            render_trasferte_programmate(key_prefix="admin")
+
+        if admin_page == "Report interventi ricevuti":
+            render_report_interventi_ricevuti(key_prefix="admin")
 
         if admin_page == "📅 Disponibilità Team":
             render_disponibilita_team(key_prefix="admin")
@@ -5735,27 +5909,31 @@ else:
 
                 # Verifica stato dell'ultima timbratura per disabilitare pulsanti illogici
                 last_action = get_last_timbratura(dipendente_scelto)
-                
+                clocked_in = is_clocked_in(dipendente_scelto)
+
                 # Ingresso - disabilitato se c'è già un ingresso attivo
-                ingresso_enabled = last_action not in ["Ingresso", "Inizio fase"]
+                ingresso_enabled = not clocked_in
                 ingresso_help = "✅ Pronto" if ingresso_enabled else "❌ Hai già un ingresso attivo"
-                
+
                 # Uscita - disabilitato se non c'è un ingresso
-                uscita_enabled = last_action not in ["Uscita", None]
+                uscita_enabled = clocked_in
                 uscita_help = "✅ Pronto" if uscita_enabled else "❌ Fai prima un ingresso"
-                
+
                 col1, col2 = st.columns(2)
-                if col1.button("🚀 INGRESSO", use_container_width=True, disabled=not ingresso_enabled, help=ingresso_help): 
+                if col1.button("🚀 INGRESSO", use_container_width=True, disabled=not ingresso_enabled, help=ingresso_help):
                     registra_orario(dipendente_scelto, "Ingresso", luogo_scelto, dove_trasferta)
-                if col2.button("🛑 USCITA", use_container_width=True, disabled=not uscita_enabled, help=uscita_help): 
+                if col2.button("🛑 USCITA", use_container_width=True, disabled=not uscita_enabled, help=uscita_help):
                     registra_orario(dipendente_scelto, "Uscita", luogo_scelto, dove_trasferta)
 
                 st.markdown("---")
                 st.subheader("☕ Pausa Pranzo")
-                
-                # Pausa - disabilitata se non c'è un ingresso o fase attiva
-                pausa_enabled = last_action in ["Ingresso", "Fine fase"]
-                fine_pausa_enabled = last_action == "Inizio Pausa"
+
+                # Pausa - disabilitata se non c'è un ingresso attivo o se si è già in
+                # pausa: si può timbrare la pausa anche con una fase aperta, senza
+                # doverla chiudere prima (vedi is_pausa_attiva/get_fase_aperta).
+                pausa_gia_attiva = is_pausa_attiva(dipendente_scelto)
+                pausa_enabled = clocked_in and not pausa_gia_attiva
+                fine_pausa_enabled = pausa_gia_attiva
                 
                 col_pausa1, col_pausa2 = st.columns(2)
                 if col_pausa1.button("▶️ INIZIO PAUSA", use_container_width=True, disabled=not pausa_enabled, help="Inizia la pausa pranzo"):
@@ -5764,7 +5942,7 @@ else:
                     registra_orario(dipendente_scelto, "Fine Pausa", luogo_scelto, dove_trasferta)
 
                 st.markdown("---")
-                render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, last_action, key_prefix="resp")
+                render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, key_prefix="resp")
 
                 st.markdown("---")
                 st.write("Le tue timbrature di oggi:")
@@ -5997,8 +6175,20 @@ else:
                 st.dataframe(report_area_service, use_container_width=True)
 
         elif modalita == "💰 Gestione Costi":
-            st.session_state["_ultima_pagina_vista"] = "💰 Gestione Costi"
-            render_gestione_costi(df, key_prefix="resp_costi")
+            costi_page = render_menu_a_categorie([
+                ("💰 Costi", ["💰 Costi commesse"]),
+                ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
+            ], key_prefix="resp_costi_menu", titolo_categoria="Sezione Costi")
+            st.session_state["_ultima_pagina_vista"] = costi_page
+
+            if costi_page == "💰 Costi commesse":
+                render_gestione_costi(df, key_prefix="resp_costi")
+
+            elif costi_page == "Grafici e Classifiche":
+                render_grafici_classifiche(df, key_prefix="resp_grafici")
+
+            elif costi_page == "🌱 Sostenibilità (Smart Working)":
+                render_sostenibilita(df, key_prefix="resp_sostenibilita")
 
     else:
         # --- LATO UTENTE ---
@@ -6017,6 +6207,7 @@ else:
         # Service: per tutti gli altri utenti non c'è alcuna voce sui costi.
         if is_area_costi(user_info["area"]):
             categorie_utente.append(("💰 Costi", ["💰 Costi commesse"]))
+            categorie_utente.append(("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]))
         pagina_utente = render_menu_a_categorie(
             categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
@@ -6046,27 +6237,31 @@ else:
 
             # Verifica stato dell'ultima timbratura per disabilitare pulsanti illogici
             last_action = get_last_timbratura(dipendente_scelto)
-            
+            clocked_in = is_clocked_in(dipendente_scelto)
+
             # Ingresso - disabilitato se c'è già un ingresso attivo
-            ingresso_enabled = last_action not in ["Ingresso", "Inizio fase"]
+            ingresso_enabled = not clocked_in
             ingresso_help = "✅ Pronto" if ingresso_enabled else "❌ Hai già un ingresso attivo"
-            
+
             # Uscita - disabilitato se non c'è un ingresso
-            uscita_enabled = last_action not in ["Uscita", None]
+            uscita_enabled = clocked_in
             uscita_help = "✅ Pronto" if uscita_enabled else "❌ Fai prima un ingresso"
-            
+
             col1, col2 = st.columns(2)
-            if col1.button("🚀 INGRESSO", use_container_width=True, disabled=not ingresso_enabled, help=ingresso_help): 
+            if col1.button("🚀 INGRESSO", use_container_width=True, disabled=not ingresso_enabled, help=ingresso_help):
                 registra_orario(dipendente_scelto, "Ingresso", luogo_scelto, dove_trasferta)
-            if col2.button("🛑 USCITA", use_container_width=True, disabled=not uscita_enabled, help=uscita_help): 
+            if col2.button("🛑 USCITA", use_container_width=True, disabled=not uscita_enabled, help=uscita_help):
                 registra_orario(dipendente_scelto, "Uscita", luogo_scelto, dove_trasferta)
 
             st.markdown("---")
             st.subheader("☕ Pausa Pranzo")
-            
-            # Pausa - disabilitata se non c'è un ingresso o fase attiva
-            pausa_enabled = last_action in ["Ingresso", "Fine fase"]
-            fine_pausa_enabled = last_action == "Inizio Pausa"
+
+            # Pausa - disabilitata se non c'è un ingresso attivo o se si è già in
+            # pausa: si può timbrare la pausa anche con una fase aperta, senza
+            # doverla chiudere prima (vedi is_pausa_attiva/get_fase_aperta).
+            pausa_gia_attiva = is_pausa_attiva(dipendente_scelto)
+            pausa_enabled = clocked_in and not pausa_gia_attiva
+            fine_pausa_enabled = pausa_gia_attiva
             
             col_pausa1, col_pausa2 = st.columns(2)
             if col_pausa1.button("▶️ INIZIO PAUSA", use_container_width=True, disabled=not pausa_enabled, help="Inizia la pausa pranzo"):
@@ -6075,7 +6270,7 @@ else:
                 registra_orario(dipendente_scelto, "Fine Pausa", luogo_scelto, dove_trasferta)
 
             st.markdown("---")
-            render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, last_action, key_prefix="utente")
+            render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, key_prefix="utente")
 
             st.markdown("---")
             st.write("Le tue timbrature di oggi:")
@@ -6177,6 +6372,12 @@ else:
 
         elif pagina_utente == "💰 Costi commesse":
             render_gestione_costi(df, key_prefix="user_costi")
+
+        elif pagina_utente == "Grafici e Classifiche":
+            render_grafici_classifiche(df, key_prefix="user_grafici")
+
+        elif pagina_utente == "🌱 Sostenibilità (Smart Working)":
+            render_sostenibilita(df, key_prefix="user_sostenibilita")
 
         elif pagina_utente == "Richiesta ferie/permessi":
             st.subheader("Richiesta ferie / permessi")
