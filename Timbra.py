@@ -181,6 +181,15 @@ DEFAULT_PERMESSO_ORE = 16.0
 DEFAULT_COSTO_ORARIO = 25.0  # €/h di partenza per il costo del personale per livello (da personalizzare)
 ORE_ORDINARIE_GIORNALIERE = 8.0  # Soglia oltre la quale le ore lavorate in un giorno sono straordinario
 
+# Orario di fine giornata "tipo" di fallback, usato per chi non ha ancora impostato il
+# proprio in "Area Personale": se un dipendente dimentica di timbrare l'Uscita (o di
+# chiudere una fase) e la timbratura di chiusura arriva un giorno diverso da quello di
+# apertura (o non arriva affatto), il conteggio delle ore si ferma automaticamente a
+# quest'orario invece di usare l'orario di chiusura reale, molto più tardi/sbagliato
+# (vedi compute_costi_fasi_commessa).
+DEFAULT_ORARIO_FINE_GIORNATA = "18:00"
+DEFAULT_ORARIO_FINE_GIORNATA_TIME = datetime.datetime.strptime(DEFAULT_ORARIO_FINE_GIORNATA, "%H:%M").time()
+
 # Stime di partenza per la sezione "Sostenibilità": quanto risparmia (in costi di
 # gestione ufficio) e quanta CO2 evita l'azienda per ogni ora di smart working invece
 # che in presenza. Sono stime esterne (Osservatorio Smart Working del Politecnico di
@@ -285,16 +294,18 @@ def init_db():
                         data_assunzione TEXT DEFAULT '',
                         codice_fiscale TEXT DEFAULT '',
                         data_nascita TEXT DEFAULT '',
-                        distanza_km REAL DEFAULT 0
+                        distanza_km REAL DEFAULT 0,
+                        orario_fine_giornata TEXT DEFAULT ''
                     )''')
 
         # Migrazione: aggiungi le colonne livello (inquadramento CCNL), data di
         # assunzione e i dati dell'Area Personale (codice fiscale, data di nascita,
-        # distanza casa-lavoro) se il DB esisteva già prima di queste versioni
+        # distanza casa-lavoro, orario di fine giornata) se il DB esisteva già prima
+        # di queste versioni
         for colonna_utente, tipo_colonna in [
             ("livello", "TEXT DEFAULT ''"), ("data_assunzione", "TEXT DEFAULT ''"),
             ("codice_fiscale", "TEXT DEFAULT ''"), ("data_nascita", "TEXT DEFAULT ''"),
-            ("distanza_km", "REAL DEFAULT 0"),
+            ("distanza_km", "REAL DEFAULT 0"), ("orario_fine_giornata", "TEXT DEFAULT ''"),
         ]:
             try:
                 c.execute(f"ALTER TABLE utenti ADD COLUMN {colonna_utente} {tipo_colonna}")
@@ -1250,6 +1261,27 @@ def get_users_distanza_map():
             except (TypeError, ValueError):
                 risultato[nome] = 0.0
         return risultato
+
+def _parse_orario_fine_giornata(valore):
+    """Converte il valore salvato in DB (stringa "HH:MM") in un datetime.time:
+    DEFAULT_ORARIO_FINE_GIORNATA_TIME se non impostato o non valido."""
+    if valore:
+        try:
+            return datetime.datetime.strptime(valore, "%H:%M").time()
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_ORARIO_FINE_GIORNATA_TIME
+
+def get_users_orario_fine_map():
+    """Mappa {nome_dipendente: datetime.time} dell'orario di fine giornata (turno
+    tipo) impostato da ciascun dipendente in 'Area Personale', stesso motivo di
+    get_users_area_map(): usata da compute_costi_fasi_commessa per chiudere
+    automaticamente una fase la cui Fine è stata dimenticata, invece di chiamare
+    get_orario_fine_giornata_utente() dipendente per dipendente."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, orario_fine_giornata FROM utenti")
+        return {nome: _parse_orario_fine_giornata(valore) for nome, valore in c.fetchall()}
 
 @st.cache_data(ttl=30)
 def get_area_names():
@@ -3817,19 +3849,32 @@ def get_distanza_km_utente(nome_dipendente):
     except (TypeError, ValueError):
         return 0.0
 
+def get_orario_fine_giornata_utente(nome_dipendente):
+    """Orario di fine giornata (turno tipo) impostato dal dipendente nella sua Area
+    Personale, come datetime.time. DEFAULT_ORARIO_FINE_GIORNATA_TIME se non ancora
+    impostato: usato per chiudere automaticamente una fase o una giornata la cui
+    Uscita/Fine fase è stata dimenticata (vedi compute_costi_fasi_commessa)."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT orario_fine_giornata FROM utenti WHERE nome=?", (nome_dipendente,))
+        row = c.fetchone()
+    return _parse_orario_fine_giornata(row[0] if row else None)
+
 CODICE_FISCALE_REGEX = re.compile(r'^[A-Z0-9]{16}$')
 
 def get_dati_personali_utente(username):
     """Dati dell'Area Personale di un utente (per username): livello CCNL e data di
     assunzione (informativi, impostati dall'amministratore) più codice fiscale, data di
-    nascita e distanza casa-lavoro (modificabili direttamente dal dipendente)."""
+    nascita, distanza casa-lavoro e orario di fine giornata (modificabili direttamente
+    dal dipendente)."""
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("""SELECT livello, data_assunzione, codice_fiscale, data_nascita, distanza_km
+        c.execute("""SELECT livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata
                      FROM utenti WHERE username=?""", (username,))
         row = c.fetchone()
     if not row:
-        return {"livello": "", "data_assunzione": None, "codice_fiscale": "", "data_nascita": None, "distanza_km": 0.0}
+        return {"livello": "", "data_assunzione": None, "codice_fiscale": "", "data_nascita": None,
+                "distanza_km": 0.0, "orario_fine_giornata": DEFAULT_ORARIO_FINE_GIORNATA_TIME}
 
     def _parse_data(valore):
         try:
@@ -3837,21 +3882,26 @@ def get_dati_personali_utente(username):
         except (ValueError, TypeError):
             return None
 
-    livello, data_assunzione, codice_fiscale, data_nascita, distanza_km = row
+    livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata = row
     return {
         "livello": livello or "",
         "data_assunzione": _parse_data(data_assunzione),
         "codice_fiscale": codice_fiscale or "",
         "data_nascita": _parse_data(data_nascita),
         "distanza_km": float(distanza_km) if distanza_km is not None else 0.0,
+        "orario_fine_giornata": _parse_orario_fine_giornata(orario_fine_giornata),
     }
 
-def aggiorna_dati_personali_utente(username, codice_fiscale, data_nascita, distanza_km):
+def aggiorna_dati_personali_utente(username, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata=None):
     """Aggiorna i dati dell'Area Personale che il dipendente può modificare da solo
-    (codice fiscale, data di nascita, distanza casa-lavoro). Livello CCNL e data di
-    assunzione NON sono toccati qui: restano impostabili solo dall'amministratore,
-    perché incidono sul calcolo di ferie/permessi e sul costo del personale.
-    Restituisce (ok, messaggio_errore)."""
+    (codice fiscale, data di nascita, distanza casa-lavoro, orario di fine giornata).
+    Livello CCNL e data di assunzione NON sono toccati qui: restano impostabili solo
+    dall'amministratore, perché incidono sul calcolo di ferie/permessi e sul costo del
+    personale. orario_fine_giornata è il proprio turno tipo (fine giornata "ideale"):
+    usato per chiudere automaticamente il conteggio delle ore su una commessa se ci si
+    dimentica di timbrare l'Uscita o di chiudere una fase (vedi
+    compute_costi_fasi_commessa), cosi' una singola timbratura dimenticata non genera
+    ore/costi assurdi. Restituisce (ok, messaggio_errore)."""
     codice_fiscale = (codice_fiscale or "").strip().upper()
     if codice_fiscale and not CODICE_FISCALE_REGEX.match(codice_fiscale):
         return False, "Il Codice Fiscale deve essere di 16 caratteri alfanumerici."
@@ -3870,10 +3920,23 @@ def aggiorna_dati_personali_utente(username, codice_fiscale, data_nascita, dista
     else:
         return False, "Data di nascita non valida."
 
+    if orario_fine_giornata is None or orario_fine_giornata == "":
+        orario_fine_giornata_str = ""
+    elif isinstance(orario_fine_giornata, datetime.time):
+        orario_fine_giornata_str = orario_fine_giornata.strftime("%H:%M")
+    elif isinstance(orario_fine_giornata, str):
+        try:
+            datetime.datetime.strptime(orario_fine_giornata, "%H:%M")
+        except ValueError:
+            return False, "L'orario di fine giornata non è valido (usa il formato HH:MM)."
+        orario_fine_giornata_str = orario_fine_giornata
+    else:
+        return False, "L'orario di fine giornata non è valido."
+
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("UPDATE utenti SET codice_fiscale=?, data_nascita=?, distanza_km=? WHERE username=?",
-                  (codice_fiscale, data_nascita_str, distanza_km, username))
+        c.execute("UPDATE utenti SET codice_fiscale=?, data_nascita=?, distanza_km=?, orario_fine_giornata=? WHERE username=?",
+                  (codice_fiscale, data_nascita_str, distanza_km, orario_fine_giornata_str, username))
         conn.commit()
     return True, ""
 
@@ -4039,6 +4102,57 @@ def get_costi_trasferte(df):
     trasferte["Costo_totale"] = (trasferte["Costo_alloggio"] + trasferte["Costo_trasporto"] + trasferte["Costo_personale"]).round(2)
     return trasferte[colonne]
 
+def _chiudi_timestamp_con_fallback(inizio_ts, fine_ts_reale, nome_dipendente, mappa_orario_fine):
+    """Restituisce il timestamp di chiusura da usare per calcolare la durata di una
+    sessione Inizio fase -> Fine fase: quello reale, se la chiusura è arrivata lo
+    stesso giorno dell'apertura; altrimenti (Fine fase dimenticata: arrivata un
+    giorno diverso, o mai arrivata) l'orario di fine giornata "tipo" impostato dal
+    dipendente in Area Personale (vedi get_users_orario_fine_map), nel giorno di
+    apertura. Cosi' un'unica Fine fase dimenticata non genera più ore/costi assurdi
+    abbinandosi a una chiusura molto successiva (vedi compute_costi_fasi_commessa,
+    l'unico punto del codice che confronta gli eventi di un'intera fase su tutta la
+    sua storia invece che giorno per giorno)."""
+    if fine_ts_reale is not None and pd.notna(fine_ts_reale) and fine_ts_reale.date() == inizio_ts.date():
+        return fine_ts_reale
+    orario_fine = mappa_orario_fine.get(nome_dipendente) or DEFAULT_ORARIO_FINE_GIORNATA_TIME
+    return datetime.datetime.combine(inizio_ts.date(), orario_fine)
+
+def _sessioni_fase_con_fallback(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale):
+    """Dato il gruppo (già ordinato per Timestamp) delle righe Inizio fase/Fine fase
+    di un singolo dipendente su una singola fase di una singola commessa, restituisce
+    la lista delle ore di ciascuna sessione realmente lavorata. Una fase resta aperta
+    una alla volta (lo garantisce già validate_timbratura: non si può avviare una
+    nuova fase se una è già aperta): se nella storia arriva comunque una nuova
+    'Inizio fase' prima che la precedente sia stata chiusa, o se l'ultima risulta
+    ancora aperta da più di TIMBRATURA_STALE_HOURS, quella precedente è stata
+    dimenticata e viene chiusa in automatico con _chiudi_timestamp_con_fallback,
+    invece di restare in sospeso ad "avvelenare" l'abbinamento con una Fine fase
+    molto successiva (il bug segnalato da Marco: 'se un utente si dimentica di
+    timbrare l'uscita, i dati si rovinano tutti')."""
+    ore_sessioni = []
+    inizio_pendente = None
+    for _, riga in gruppo_ordinato.iterrows():
+        if pd.isna(riga["Timestamp"]):
+            continue
+        if riga["Azione"] == "Inizio fase":
+            if inizio_pendente is not None:
+                fine_fallback = _chiudi_timestamp_con_fallback(inizio_pendente, None, nome_dipendente, mappa_orario_fine)
+                if fine_fallback > inizio_pendente:
+                    ore_sessioni.append((fine_fallback - inizio_pendente).total_seconds() / 3600)
+            inizio_pendente = riga["Timestamp"]
+        elif riga["Azione"] == "Fine fase" and inizio_pendente is not None:
+            fine_ts = _chiudi_timestamp_con_fallback(inizio_pendente, riga["Timestamp"], nome_dipendente, mappa_orario_fine)
+            if fine_ts > inizio_pendente:
+                ore_sessioni.append((fine_ts - inizio_pendente).total_seconds() / 3600)
+            inizio_pendente = None
+    if inizio_pendente is not None:
+        ore_trascorse = (ora_attuale - inizio_pendente).total_seconds() / 3600
+        if ore_trascorse > TIMBRATURA_STALE_HOURS:
+            fine_fallback = _chiudi_timestamp_con_fallback(inizio_pendente, None, nome_dipendente, mappa_orario_fine)
+            if fine_fallback > inizio_pendente:
+                ore_sessioni.append((fine_fallback - inizio_pendente).total_seconds() / 3600)
+    return ore_sessioni
+
 def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase_filter=None,
                                  macro_fase_filter=None, anno_produzione_filter=None):
     """Costo ipotetico (preventivo) e costo reale di ogni fase configurata, con lo
@@ -4094,19 +4208,14 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase
         # singola timbratura.
         dfn["Area"] = dfn["Dipendente"].map(get_users_area_map()).fillna("Unknown")
         dfn = dfn[dfn["Azione"].isin(["Inizio fase", "Fine fase"])]
+        mappa_orario_fine = get_users_orario_fine_map()
+        ora_attuale = get_current_datetime()
         for (dip, commessa, fase, area), gruppo in dfn.groupby(["Dipendente", "Commessa", "Fase", "Area"]):
             if not commessa or not fase:
                 continue
             gruppo = gruppo.sort_values("Timestamp")
-            coda = []
-            for _, riga in gruppo.iterrows():
-                if riga["Azione"] == "Inizio fase":
-                    coda.append(riga["Timestamp"])
-                elif riga["Azione"] == "Fine fase" and coda:
-                    inizio_ts = coda.pop(0)
-                    if pd.notna(inizio_ts) and pd.notna(riga["Timestamp"]) and riga["Timestamp"] > inizio_ts:
-                        ore = (riga["Timestamp"] - inizio_ts).total_seconds() / 3600
-                        righe_reali.append({"Dipendente": dip, "Commessa": commessa, "Fase": fase, "Area": area, "Ore": ore})
+            for ore in _sessioni_fase_con_fallback(gruppo, dip, mappa_orario_fine, ora_attuale):
+                righe_reali.append({"Dipendente": dip, "Commessa": commessa, "Fase": fase, "Area": area, "Ore": ore})
 
     if righe_reali:
         reale_df = pd.DataFrame(righe_reali)
@@ -5154,7 +5263,7 @@ def render_area_personale(username, key_prefix):
     """Area Personale del dipendente: livello CCNL e data di assunzione (impostati
     dall'amministratore, mostrati come riferimento) più i dati anagrafici che il
     dipendente può inserire o modificare da solo (codice fiscale, data di nascita,
-    distanza casa-lavoro)."""
+    distanza casa-lavoro, orario di fine giornata)."""
     st.subheader("🪪 Area Personale")
     dati = get_dati_personali_utente(username)
 
@@ -5172,8 +5281,12 @@ def render_area_personale(username, key_prefix):
                                             min_value=datetime.date(1930, 1, 1), max_value=datetime.date.today(), key=f"{key_prefix}_ap_dob")
         distanza_km_input = st.number_input("Distanza casa-lavoro (km, sola andata)", min_value=0.0, step=0.5,
                                              value=dati["distanza_km"], key=f"{key_prefix}_ap_dist")
+        st.caption("L'orario di fine giornata è il tuo turno tipo (a che ora finisci di solito): se un giorno ti dimentichi di timbrare l'Uscita (o di chiudere una fase), il conteggio delle ore su quel giorno si ferma automaticamente a quest'orario invece di restare bloccato o di calcolare ore sbagliate fino alla timbratura successiva.")
+        orario_fine_giornata_input = st.time_input("Orario di fine giornata (turno tipo)",
+                                                     value=dati["orario_fine_giornata"], key=f"{key_prefix}_ap_orario_fine")
         if st.form_submit_button("💾 Salva dati personali"):
-            ok, errore = aggiorna_dati_personali_utente(username, codice_fiscale_input, data_nascita_input, distanza_km_input)
+            ok, errore = aggiorna_dati_personali_utente(username, codice_fiscale_input, data_nascita_input,
+                                                          distanza_km_input, orario_fine_giornata_input)
             if ok:
                 st.success("Dati personali aggiornati.")
                 st.rerun()
