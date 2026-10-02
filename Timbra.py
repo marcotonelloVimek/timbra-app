@@ -133,11 +133,68 @@ def get_turso_config():
             pass
     return (url, token) if url else (None, None)
 
+class _ConnessioneSqliteConChiusuraAutomatica(sqlite3.Connection):
+    """Sottoclasse di sqlite3.Connection usata come 'factory' in db_connect():
+    quando la connessione viene usata come context manager ("with db_connect()
+    as conn:"), dopo il commit/rollback automatico già offerto da
+    sqlite3.Connection.__exit__ chiude anche la connessione stessa (.close()),
+    invece di lasciarla aperta in memoria fino al passaggio del garbage
+    collector. Usata nelle centinaia di punti del codice che aprono il
+    database con "with db_connect() as conn:" e non chiamano .close()
+    esplicitamente, per evitare un accumulo di connessioni/file descriptor
+    aperti nel tempo. Chi invece chiama db_connect() direttamente (senza
+    "with", es. in alcuni test) continua a dover chiudere la connessione da
+    sé, come prima: il comportamento cambia solo per l'uso come context
+    manager."""
+    def __exit__(self, tipo_exc, valore_exc, traceback_exc):
+        try:
+            return super().__exit__(tipo_exc, valore_exc, traceback_exc)
+        finally:
+            self.close()
+
+class _ConnessioneTursoConChiusuraAutomatica:
+    """Avvolge la connessione del client Turso ('libsql') per garantire che,
+    quando viene usata come context manager ("with db_connect() as conn:"),
+    venga chiusa (.close()) dopo il commit/rollback - esattamente come fa
+    _ConnessioneSqliteConChiusuraAutomatica per il file locale, risolvendo lo
+    stesso problema di connessioni che restavano aperte in memoria. Ogni
+    attributo o metodo non gestito qui viene delegato alla connessione reale,
+    quindi per il resto si comporta in modo identico alla connessione Turso
+    originale (stesso oggetto cursore, stesse query, ecc.)."""
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, nome):
+        return getattr(self._conn, nome)
+
+    def __enter__(self):
+        if hasattr(self._conn, "__enter__"):
+            self._conn.__enter__()
+        return self
+
+    def __exit__(self, tipo_exc, valore_exc, traceback_exc):
+        try:
+            if hasattr(self._conn, "__exit__"):
+                return self._conn.__exit__(tipo_exc, valore_exc, traceback_exc)
+            if tipo_exc is None and hasattr(self._conn, "commit"):
+                self._conn.commit()
+            elif hasattr(self._conn, "rollback"):
+                self._conn.rollback()
+        finally:
+            if hasattr(self._conn, "close"):
+                self._conn.close()
+
 def db_connect():
     """Apre una connessione al database, da usare al posto di sqlite3.connect(...) in
     tutto il codice: se è configurato un database Turso esterno la usa (persistente
     anche su hosting senza disco persistente), altrimenti apre il file SQLite locale
-    DB_FILE come sempre."""
+    DB_FILE come sempre. La connessione restituita, se usata come context manager
+    ("with db_connect() as conn:"), si chiude automaticamente (.close()) all'uscita
+    del blocco "with", per non accumulare connessioni/file descriptor aperti ad ogni
+    chiamata (vedi _ConnessioneSqliteConChiusuraAutomatica e
+    _ConnessioneTursoConChiusuraAutomatica)."""
     url, token = get_turso_config()
     if url:
         turso = _load_turso_client()
@@ -148,8 +205,8 @@ def db_connect():
                 "('pip install libsql') o correggi _load_turso_client() se il "
                 "nome del pacchetto risultasse cambiato (vedi il commento sopra)."
             )
-        return turso.connect(url, auth_token=token)
-    return sqlite3.connect(DB_FILE, timeout=DB_TIMEOUT)
+        return _ConnessioneTursoConChiusuraAutomatica(turso.connect(url, auth_token=token))
+    return sqlite3.connect(DB_FILE, timeout=DB_TIMEOUT, factory=_ConnessioneSqliteConChiusuraAutomatica)
 
 def db_error_classes(nome_eccezione):
     """Classi di eccezione da usare in 'except' per gli errori del database (es.
@@ -637,13 +694,41 @@ def get_current_datetime():
 
 TIMBRATURA_STALE_HOURS = 20  # oltre questa soglia una timbratura "aperta" è considerata dimenticata
 
+def _parse_timbratura_timestamp(data_str, ora_str):
+    """Converte (Data, Ora) di una riga della tabella timbrature in un datetime,
+    tollerando formati leggermente diversi da quello standard "YYYY-MM-DD
+    HH:MM:SS" (es. un'ora senza i secondi, o con microsecondi residui da un
+    datetime.time.isoformat() quando microsecond != 0): un dato storico o
+    anomalo non deve impedire di calcolare da quanto tempo è stata fatta.
+    Restituisce None se il timestamp non è comunque interpretabile in nessun
+    formato noto."""
+    if not data_str or not ora_str:
+        return None
+    ora_str = str(ora_str).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(f"{data_str} {ora_str}", fmt)
+        except (ValueError, TypeError):
+            continue
+    try:
+        timestamp = pd.to_datetime(f"{data_str} {ora_str}", errors="coerce")
+    except (ValueError, TypeError):
+        return None
+    if timestamp is None or pd.isna(timestamp):
+        return None
+    return timestamp.to_pydatetime() if hasattr(timestamp, "to_pydatetime") else timestamp
+
 def get_last_timbratura(nome_dipendente):
     """Recupera l'ultima timbratura registrata per un dipendente, a prescindere dal
     giorno in cui è stata fatta (così un turno che attraversa la mezzanotte non
     impedisce di registrare l'uscita). Se però l'ultima timbratura risale a più di
     TIMBRATURA_STALE_HOURS ore fa, viene considerata dimenticata/anomala e ignorata,
     per evitare che un dipendente rimanga bloccato a causa di una timbratura mancata
-    nei giorni precedenti."""
+    nei giorni precedenti. Se il timestamp della riga non è interpretabile (dato
+    malformato), viene trattato allo stesso modo di una timbratura troppo vecchia
+    (ignorata, non bloccante), invece di essere considerato valido per sempre: un
+    dato anomalo non deve poter eludere il controllo di anzianità e restare aperto
+    all'infinito."""
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""SELECT Azione, Data, Ora FROM timbrature
@@ -654,10 +739,9 @@ def get_last_timbratura(nome_dipendente):
     if not row:
         return None
     azione, data_str, ora_str = row
-    try:
-        ultimo_timestamp = datetime.datetime.strptime(f"{data_str} {ora_str}", "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        return azione
+    ultimo_timestamp = _parse_timbratura_timestamp(data_str, ora_str)
+    if ultimo_timestamp is None:
+        return None
     ore_trascorse = (get_current_datetime() - ultimo_timestamp).total_seconds() / 3600
     if ore_trascorse > TIMBRATURA_STALE_HOURS:
         return None
