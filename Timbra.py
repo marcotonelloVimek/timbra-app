@@ -2917,6 +2917,14 @@ def is_area_costi(area):
     semplici) con questa area, quando saranno pronti."""
     return str(area or "").strip().lower() == "costi"
 
+def is_area_amministrazione(area):
+    """Vero se l'area indicata è l'area Amministrazione (senza distinguere maiuscole/
+    minuscole o spazi), sullo stesso modello di is_area_service/is_area_costi:
+    sblocca la pagina 'Cartellini dipendenti' (i cartellini mensili di tutti i
+    dipendenti, da mandare allo studio esterno che prepara le buste paga) a
+    chiunque ne faccia parte, oltre che all'admin."""
+    return str(area or "").strip().lower() == "amministrazione"
+
 MEZZI_TRASPORTO_DISPONIBILI = ["Auto", "Treno", "Aereo", "Auto a noleggio"]
 
 def get_cliente_commessa(commessa):
@@ -5473,19 +5481,24 @@ def evidenzia_stato_e_priorita_commesse(df):
         styler = styler.apply(_colora_con_mappa(COLORI_PRIORITA_COMMESSA), subset=["Priorità"])
     return styler
 
-def render_report_mensile(nome_dipendente, df, key_prefix):
+def render_report_mensile(nome_dipendente, df, key_prefix, mese=None, anno=None):
     """Report/cartellino mensile personale: giorno per giorno orari, fasi lavorate e
     luogo di lavoro, ore ordinarie/straordinarie, più il saldo di ferie e permessi
     maturato fino al mese selezionato in base al livello CCNL dell'utente."""
-    st.subheader("🗓️ Report mensile")
     oggi = datetime.date.today()
-    col_mese, col_anno = st.columns(2)
-    with col_mese:
-        mese_sel = st.selectbox("Mese", options=list(range(1, 13)),
-                                 format_func=lambda m: calendar.month_name[m].capitalize(),
-                                 index=oggi.month - 1, key=f"{key_prefix}_report_mese")
-    with col_anno:
-        anno_sel = st.number_input("Anno", min_value=2020, max_value=oggi.year + 1, value=oggi.year, key=f"{key_prefix}_report_anno")
+    if mese is not None and anno is not None:
+        # Mese/anno già scelti dalla pagina chiamante (es. Cartellini dipendenti
+        # delle Risorse Umane): niente titolo e niente selettori duplicati.
+        mese_sel, anno_sel = int(mese), int(anno)
+    else:
+        st.subheader("🗓️ Report mensile")
+        col_mese, col_anno = st.columns(2)
+        with col_mese:
+            mese_sel = st.selectbox("Mese", options=list(range(1, 13)),
+                                     format_func=lambda m: calendar.month_name[m].capitalize(),
+                                     index=oggi.month - 1, key=f"{key_prefix}_report_mese")
+        with col_anno:
+            anno_sel = st.number_input("Anno", min_value=2020, max_value=oggi.year + 1, value=oggi.year, key=f"{key_prefix}_report_anno")
 
     richieste_dipendente = carica_richieste()
 
@@ -5531,6 +5544,171 @@ def render_report_mensile(nome_dipendente, df, key_prefix):
                                     mime="application/pdf", key=f"{key_prefix}_download_cartellino_pdf")
         else:
             st.warning("⚠️ PDF non disponibile. Installa ReportLab: pip install reportlab")
+
+def _giorni_con_timbrature_anomale(df, nome_dipendente, anno, mese):
+    """Giorni del mese (esclusa la data di oggi, in cui il turno può essere ancora
+    in corso) in cui il numero di Ingressi e di Uscite non coincide: tipicamente
+    un'uscita dimenticata, che nel cartellino lascia quella giornata con 0 ore.
+    Servono a chi prepara i dati per le buste paga per sapere cosa verificare
+    (o far rettificare) prima di mandare i cartellini allo studio."""
+    dfn = normalize_datetime(df) if df is not None else pd.DataFrame()
+    if dfn.empty:
+        return []
+    dfn = dfn[(dfn["Dipendente"] == nome_dipendente) & dfn["Azione"].isin(["Ingresso", "Uscita"])]
+    oggi = datetime.date.today()
+    giorni = []
+    for data, gruppo in dfn.groupby("Data"):
+        if pd.isna(data) or data.year != anno or data.month != mese or data == oggi:
+            continue
+        if (gruppo["Azione"] == "Ingresso").sum() != (gruppo["Azione"] == "Uscita").sum():
+            giorni.append(data)
+    return sorted(giorni)
+
+def compute_riepilogo_hr_mensile(df, anno, mese, dipendenti, df_requests=None, df_rettifiche=None):
+    """Riepilogo del mese di ogni dipendente indicato, una riga ciascuno, con i dati
+    che servono per le buste paga: giorni lavorati, ore ordinarie e straordinarie
+    (le stesse del cartellino mensile), giorni di ferie e ore di permesso approvati
+    nel mese (le ferie contano i giorni di calendario, come nel resto dell'app).
+    Più due colonne di controllo: 'Giorni da verificare' (giorni con ingressi e
+    uscite non corrispondenti, vedi _giorni_con_timbrature_anomale) e 'In sospeso'
+    (rettifiche e richieste ferie/permessi del mese ancora 'In attesa': finché
+    non sono approvate/rifiutate il cartellino potrebbe cambiare)."""
+    colonne = ["Dipendente", "Area", "Giorni lavorati", "Ore ordinarie", "Ore straordinarie",
+               "Giorni ferie", "Ore permesso", "Giorni da verificare", "In sospeso"]
+    mappa_area = get_users_area_map()
+    inizio_mese = datetime.date(anno, mese, 1)
+    fine_mese = datetime.date(anno, mese, calendar.monthrange(anno, mese)[1])
+
+    richieste = df_requests.copy() if df_requests is not None else pd.DataFrame()
+    richieste_ok = (not richieste.empty and all(c in richieste.columns for c in
+                    ["Dipendente", "Stato", "Tipo", "Data_inizio", "Data_fine", "Ore_permesso"]))
+    if richieste_ok:
+        richieste["Data_inizio"] = pd.to_datetime(richieste["Data_inizio"], errors="coerce").dt.date
+        richieste["Data_fine"] = pd.to_datetime(richieste["Data_fine"], errors="coerce").dt.date
+    rettifiche = df_rettifiche.copy() if df_rettifiche is not None else pd.DataFrame()
+    rettifiche_ok = (not rettifiche.empty and all(c in rettifiche.columns for c in
+                     ["Dipendente", "Stato", "Data_prevista"]))
+    if rettifiche_ok:
+        rettifiche["Data_prevista"] = pd.to_datetime(rettifiche["Data_prevista"], errors="coerce").dt.date
+
+    righe = []
+    for nome in dipendenti:
+        cartellino = compute_cartellino_mensile(df, nome, anno, mese, df_requests=df_requests)
+        totali = compute_totali_cartellino(cartellino, df, nome, anno, mese)
+        giorni_ferie, ore_permesso, in_sospeso = 0, 0.0, 0
+        if richieste_ok:
+            mie = richieste[(richieste["Dipendente"] == nome) & richieste["Data_inizio"].notna() & richieste["Data_fine"].notna()]
+            sovrapposte = mie[(mie["Data_inizio"] <= fine_mese) & (mie["Data_fine"] >= inizio_mese)]
+            for _, r in sovrapposte.iterrows():
+                if r["Stato"] == "In attesa":
+                    in_sospeso += 1
+                elif r["Stato"] == "Approvato" and r["Tipo"] == "Ferie":
+                    giorni_ferie += calculate_ferie_days(max(r["Data_inizio"], inizio_mese), min(r["Data_fine"], fine_mese))
+                elif r["Stato"] == "Approvato" and r["Tipo"] == "Permesso" and inizio_mese <= r["Data_inizio"] <= fine_mese:
+                    try:
+                        ore_permesso += float(r["Ore_permesso"]) if r["Ore_permesso"] else 0.0
+                    except (TypeError, ValueError):
+                        pass
+        if rettifiche_ok:
+            mie_r = rettifiche[(rettifiche["Dipendente"] == nome) & (rettifiche["Stato"] == "In attesa")
+                               & rettifiche["Data_prevista"].notna()]
+            in_sospeso += int(((mie_r["Data_prevista"] >= inizio_mese) & (mie_r["Data_prevista"] <= fine_mese)).sum())
+        righe.append({
+            "Dipendente": nome, "Area": mappa_area.get(nome, ""),
+            "Giorni lavorati": totali["giorni_lavorati"],
+            "Ore ordinarie": totali["ore_ordinarie"], "Ore straordinarie": totali["ore_straordinarie"],
+            "Giorni ferie": giorni_ferie, "Ore permesso": round(ore_permesso, 2),
+            "Giorni da verificare": len(_giorni_con_timbrature_anomale(df, nome, anno, mese)),
+            "In sospeso": in_sospeso,
+        })
+    if not righe:
+        return pd.DataFrame(columns=colonne)
+    return pd.DataFrame(righe)[colonne]
+
+def build_zip_cartellini(df, anno, mese, dipendenti, df_requests=None):
+    """ZIP con il cartellino mensile in PDF di ciascun dipendente indicato
+    (cartellino_<Nome>_<anno>_<mese>.pdf), da inviare in un colpo solo allo studio
+    esterno delle buste paga. Restituisce (bytes_zip, nomi_falliti): se la
+    generazione del PDF di un dipendente fallisce, gli altri vengono comunque
+    inclusi e il suo nome finisce nell'elenco dei falliti."""
+    import zipfile
+    buffer = BytesIO()
+    falliti = []
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archivio:
+        for nome in dipendenti:
+            cartellino = compute_cartellino_mensile(df, nome, anno, mese, df_requests=df_requests)
+            totali = compute_totali_cartellino(cartellino, df, nome, anno, mese)
+            saldo = compute_saldo_ferie_permessi_mensile(df_requests, nome, anno, mese)
+            pdf = generate_pdf_cartellino_mensile(nome, anno, mese, cartellino, totali, saldo)
+            if not pdf:
+                falliti.append(nome)
+                continue
+            nome_file = re.sub(r"[^\w\-]+", "_", nome.strip()).strip("_") or "dipendente"
+            archivio.writestr(f"cartellino_{nome_file}_{anno}_{mese:02d}.pdf", pdf.getvalue())
+    return buffer.getvalue(), falliti
+
+def render_risorse_umane(df, key_prefix):
+    """Pagina 'Cartellini dipendenti' dell'area Amministrazione (e dell'admin): i
+    cartellini mensili di TUTTI i dipendenti, per preparare i dati da mandare allo
+    studio esterno che redige le buste paga. Dall'alto: riepilogo del mese con una
+    riga per dipendente (ore ordinarie/straordinarie, ferie, permessi, più i
+    controlli da fare prima dell'invio: giorni con timbrature incomplete e
+    rettifiche/richieste ancora in sospeso), CSV del riepilogo, cartellino
+    dettagliato di un singolo dipendente (lo stesso del 'Report mensile', con
+    download PDF/CSV) e ZIP con tutti i cartellini in PDF."""
+    st.subheader("👥 Cartellini dipendenti")
+    st.caption("Cartellini mensili di tutti i dipendenti, da inviare allo studio esterno per le buste paga. Prima di inviarli controlla le colonne 'Giorni da verificare' e 'In sospeso'.")
+    oggi = datetime.date.today()
+    col_mese, col_anno, col_area = st.columns(3)
+    with col_mese:
+        mese_sel = st.selectbox("Mese", options=list(range(1, 13)), format_func=lambda m: calendar.month_name[m].capitalize(),
+                                 index=oggi.month - 1, key=f"{key_prefix}_hr_mese")
+    with col_anno:
+        anno_sel = st.number_input("Anno", min_value=2020, max_value=oggi.year + 1, value=oggi.year, key=f"{key_prefix}_hr_anno")
+    with col_area:
+        area_sel = st.selectbox("Area", options=get_area_names(), key=f"{key_prefix}_hr_area")
+    mese_sel = int(mese_sel or oggi.month)
+    anno_sel = int(anno_sel or oggi.year)
+    dipendenti = get_users_in_area(area_sel or "Tutte le aree")
+    if not dipendenti:
+        st.info("Nessun dipendente trovato per l'area selezionata.")
+        return
+
+    richieste = carica_richieste()
+    rettifiche = carica_rettifiche()
+    riepilogo = compute_riepilogo_hr_mensile(df, anno_sel, mese_sel, dipendenti, richieste, rettifiche)
+    st.markdown(f"### Riepilogo di {calendar.month_name[mese_sel].capitalize()} {anno_sel}")
+    da_controllare = riepilogo[(riepilogo["Giorni da verificare"] > 0) | (riepilogo["In sospeso"] > 0)]
+    if not da_controllare.empty:
+        st.warning(f"⚠️ {len(da_controllare)} dipendenti hanno giorni da verificare o richieste in sospeso: "
+                   + ", ".join(da_controllare["Dipendente"].tolist()))
+    st.dataframe(riepilogo, use_container_width=True)
+    st.download_button("📥 Scarica riepilogo (CSV)", data=riepilogo.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                        file_name=f"riepilogo_presenze_{anno_sel}_{mese_sel:02d}.csv", mime="text/csv",
+                        key=f"{key_prefix}_hr_download_riepilogo")
+
+    st.markdown("---")
+    st.markdown("### 📦 Tutti i cartellini in PDF")
+    if not PDF_AVAILABLE:
+        st.warning("⚠️ PDF non disponibile. Installa ReportLab: pip install reportlab")
+    else:
+        chiave_zip = f"{key_prefix}_hr_zip_{anno_sel}_{mese_sel}_{area_sel}"
+        if st.button("📦 Prepara ZIP con tutti i cartellini", key=f"{key_prefix}_hr_prepara_zip"):
+            dati_zip, falliti = build_zip_cartellini(df, anno_sel, mese_sel, dipendenti, richieste)
+            st.session_state[chiave_zip] = (dati_zip, falliti)
+        if chiave_zip in st.session_state:
+            dati_zip, falliti = st.session_state[chiave_zip]
+            if falliti:
+                st.error("Cartellino non generato per: " + ", ".join(falliti))
+            st.download_button("⬇️ Scarica ZIP dei cartellini", data=dati_zip,
+                                file_name=f"cartellini_{anno_sel}_{mese_sel:02d}.zip", mime="application/zip",
+                                key=f"{key_prefix}_hr_download_zip")
+
+    st.markdown("---")
+    st.markdown("### 🔎 Cartellino di un singolo dipendente")
+    dipendente_sel = st.selectbox("Dipendente", options=dipendenti, key=f"{key_prefix}_hr_dipendente")
+    if dipendente_sel:
+        render_report_mensile(dipendente_sel, df, key_prefix=f"{key_prefix}_hr_dip", mese=mese_sel, anno=anno_sel)
 
 def render_area_personale(username, key_prefix):
     """Area Personale del dipendente: livello CCNL e data di assunzione (impostati
@@ -5846,6 +6024,7 @@ PAGINE_SENZA_AUTOREFRESH_AUTOMATICO = {
     "Programmazione nuova Trasferta", "Trasferte programmate", "🧳 Trasferte Service",
     "Richiesta ferie/permessi", "Richiesta rettifica",
     "💰 Costi commesse", "💰 Gestione Costi", "📅 Pianificazione",
+    "Cartellini dipendenti",
 }
 
 def pagina_abilitata_per_autorefresh(pagina):
@@ -5901,6 +6080,7 @@ else:
             ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione"]),
             ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🛠️ Statistiche Assistenza", "🌱 Sostenibilità (Smart Working)"]),
+            ("👥 Risorse Umane", ["Cartellini dipendenti"]),
             ("🧳 Trasferte e Team", ["Programmazione nuova Trasferta", "Trasferte programmate", "Report interventi ricevuti", "📅 Disponibilità Team"]),
             ("💰 Costi", ["💰 Costi commesse"]),
             ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
@@ -6090,6 +6270,9 @@ else:
         elif admin_page == "🛠️ Statistiche Assistenza":
             render_statistiche_assistenza(df, key_prefix="admin_assistenza")
 
+        elif admin_page == "Cartellini dipendenti":
+            render_risorse_umane(df, key_prefix="admin_hr")
+
         elif admin_page == "🌱 Sostenibilità (Smart Working)":
             render_sostenibilita(df, key_prefix="admin_sostenibilita")
 
@@ -6259,6 +6442,8 @@ else:
             opzioni_modalita.append("🧳 Trasferte Service")
         if is_area_costi(user_info["area"]):
             opzioni_modalita.append("💰 Gestione Costi")
+        if is_area_amministrazione(user_info["area"]):
+            opzioni_modalita.append("👥 Risorse Umane")
         modalita = st.sidebar.radio("📌 Modalità", opzioni_modalita)
 
         if modalita == "Mie funzioni personali":
@@ -6573,6 +6758,10 @@ else:
             st.markdown("---")
             render_statistiche_assistenza(df, key_prefix="resp_assistenza")
 
+        elif modalita == "👥 Risorse Umane":
+            st.session_state["_ultima_pagina_vista"] = "Cartellini dipendenti"
+            render_risorse_umane(df, key_prefix="resp_hr")
+
         elif modalita == "💰 Gestione Costi":
             costi_page = render_menu_a_categorie([
                 ("💰 Costi", ["💰 Costi commesse"]),
@@ -6605,6 +6794,8 @@ else:
         ]
         # La categoria Costi compare solo per chi fa parte dell'area Costi, come il
         # Service: per tutti gli altri utenti non c'è alcuna voce sui costi.
+        if is_area_amministrazione(user_info["area"]):
+            categorie_utente.append(("👥 Risorse Umane", ["Cartellini dipendenti"]))
         if is_area_costi(user_info["area"]):
             categorie_utente.append(("💰 Costi", ["💰 Costi commesse"]))
             categorie_utente.append(("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]))
@@ -6772,6 +6963,9 @@ else:
 
         elif pagina_utente == "🛠️ Statistiche Assistenza":
             render_statistiche_assistenza(df, key_prefix="user_assistenza")
+
+        elif pagina_utente == "Cartellini dipendenti":
+            render_risorse_umane(df, key_prefix="user_hr")
 
         elif pagina_utente == "💰 Costi commesse":
             render_gestione_costi(df, key_prefix="user_costi")
