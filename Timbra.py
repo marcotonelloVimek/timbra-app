@@ -6562,6 +6562,8 @@ else:
                 st.info("Nessun report intervento inviato finora.")
             else:
                 st.dataframe(report_area_service, use_container_width=True)
+            st.markdown("---")
+            render_statistiche_assistenza(df, key_prefix="resp_assistenza")
 
         elif modalita == "💰 Gestione Costi":
             costi_page = render_menu_a_categorie([
@@ -6585,6 +6587,7 @@ else:
         pagine_service_utente = ["📷 Report Intervento"]
         if is_area_service(user_info["area"]):
             pagine_service_utente.append("🧳 Trasferte Service")
+            pagine_service_utente.append("🛠️ Statistiche Assistenza")
         categorie_utente = [
             ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
             ("👤 Profilo", ["Profilo"]),
@@ -6758,6 +6761,9 @@ else:
                 st.info("Nessun report intervento inviato finora.")
             else:
                 st.dataframe(report_utente_service, use_container_width=True)
+
+        elif pagina_utente == "🛠️ Statistiche Assistenza":
+            render_statistiche_assistenza(df, key_prefix="user_assistenza")
 
         elif pagina_utente == "💰 Costi commesse":
             render_gestione_costi(df, key_prefix="user_costi")
