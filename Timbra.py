@@ -320,6 +320,16 @@ MACRO_FASI_DISPONIBILI = [
 # quelli si basano sulle timbrature reali, non sull'anagrafica delle commesse.
 ATTIVITA_VARIE = "Varie"
 
+# Fase "Assistenza", richiesta da Marco: "se devo fare un'assistenza non posso
+# timbrare come assistenza nelle commesse. Vorrei poter timbrare la fase
+# assistenza per ogni commessa". A differenza di 'Varie' è legata a una commessa
+# vera, ma non è una fase pianificata dall'admin (nessuna riga in fasi_commessa,
+# nessuna ora stimata): è una fase "virtuale" sempre disponibile su OGNI
+# commessa, anche già Completata o In pausa (l'assistenza si fa tipicamente a
+# impianto consegnato). Le sue ore compaiono comunque nella pagina Costi, come
+# riga extra della commessa (vedi compute_costi_fasi_commessa).
+FASE_ASSISTENZA = "Assistenza"
+
 @st.cache_resource
 def init_db():
     """Inizializza il database e crea le tabelle se non esistono. Il decoratore
@@ -2973,10 +2983,25 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
         st.info(f"Fase attualmente aperta: **{fase_aperta[0]} → {fase_aperta[1]}**")
 
     e_varie = st.checkbox("🔧 Varie (attività non legata a una commessa specifica)", key=f"{key_prefix}_varie_timbra")
+    e_assistenza = st.checkbox("🛠️ Assistenza (su una qualsiasi commessa, anche già completata)",
+                               key=f"{key_prefix}_assistenza_timbra", disabled=e_varie)
+    e_assistenza = e_assistenza and not e_varie
     dettaglio_fase = ""
     if e_varie:
         commessa_scelta, fase_scelta = ATTIVITA_VARIE, ATTIVITA_VARIE
         dettaglio_fase = st.text_input("Cosa stai facendo? (facoltativo)", key=f"{key_prefix}_varie_dettaglio_timbra")
+    elif e_assistenza:
+        # Qualsiasi commessa esistente, a prescindere da stato, reparto e
+        # assegnazione delle sue fasi: la fase è sempre FASE_ASSISTENZA.
+        commesse_assistenza = get_commesse_names()
+        if not commesse_assistenza:
+            st.warning("Nessuna commessa esistente su cui timbrare l'assistenza.")
+            commessa_scelta, fase_scelta = None, None
+        else:
+            commessa_scelta = st.selectbox("🏗️ Commessa su cui fai assistenza", commesse_assistenza, key=f"{key_prefix}_commessa_assistenza_timbra")
+            mostra_info_commessa(commessa_scelta)
+            fase_scelta = FASE_ASSISTENZA
+            dettaglio_fase = st.text_input("Cosa stai facendo? (facoltativo)", key=f"{key_prefix}_assistenza_dettaglio_timbra")
     else:
         # Solo le commesse 'Da iniziare'/'In corso' che hanno, nel suo reparto,
         # almeno una fase assegnata a lui o non ancora assegnata a nessuno:
@@ -4201,6 +4226,41 @@ def _chiudi_timestamp_con_fallback(inizio_ts, fine_ts_reale, nome_dipendente, ma
     orario_fine = mappa_orario_fine.get(nome_dipendente) or DEFAULT_ORARIO_FINE_GIORNATA_TIME
     return datetime.datetime.combine(inizio_ts.date(), orario_fine)
 
+def _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale):
+    """Come _sessioni_fase_con_fallback (stessa logica, vedi sotto), ma per ogni
+    sessione restituisce la tupla (inizio, ore, dettaglio_fase) invece delle sole
+    ore: serve alle statistiche che devono sapere QUANDO è iniziata ogni sessione
+    (es. Statistiche Assistenza, per periodo/mese) e la nota scritta al momento
+    dell'avvio."""
+    sessioni = []
+    inizio_pendente = None
+    dettaglio_pendente = ""
+
+    def _chiudi_con_fallback():
+        fine_fallback = _chiudi_timestamp_con_fallback(inizio_pendente, None, nome_dipendente, mappa_orario_fine)
+        if fine_fallback > inizio_pendente:
+            sessioni.append((inizio_pendente, (fine_fallback - inizio_pendente).total_seconds() / 3600, dettaglio_pendente))
+
+    for _, riga in gruppo_ordinato.iterrows():
+        if pd.isna(riga["Timestamp"]):
+            continue
+        if riga["Azione"] == "Inizio fase":
+            if inizio_pendente is not None:
+                _chiudi_con_fallback()
+            inizio_pendente = riga["Timestamp"]
+            dettaglio_valore = riga.get("Dettaglio Fase", "") if hasattr(riga, "get") else ""
+            dettaglio_pendente = "" if pd.isna(dettaglio_valore) else str(dettaglio_valore)
+        elif riga["Azione"] == "Fine fase" and inizio_pendente is not None:
+            fine_ts = _chiudi_timestamp_con_fallback(inizio_pendente, riga["Timestamp"], nome_dipendente, mappa_orario_fine)
+            if fine_ts > inizio_pendente:
+                sessioni.append((inizio_pendente, (fine_ts - inizio_pendente).total_seconds() / 3600, dettaglio_pendente))
+            inizio_pendente = None
+    if inizio_pendente is not None:
+        ore_trascorse = (ora_attuale - inizio_pendente).total_seconds() / 3600
+        if ore_trascorse > TIMBRATURA_STALE_HOURS:
+            _chiudi_con_fallback()
+    return sessioni
+
 def _sessioni_fase_con_fallback(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale):
     """Dato il gruppo (già ordinato per Timestamp) delle righe Inizio fase/Fine fase
     di un singolo dipendente su una singola fase di una singola commessa, restituisce
@@ -4213,29 +4273,8 @@ def _sessioni_fase_con_fallback(gruppo_ordinato, nome_dipendente, mappa_orario_f
     invece di restare in sospeso ad "avvelenare" l'abbinamento con una Fine fase
     molto successiva (il bug segnalato da Marco: 'se un utente si dimentica di
     timbrare l'uscita, i dati si rovinano tutti')."""
-    ore_sessioni = []
-    inizio_pendente = None
-    for _, riga in gruppo_ordinato.iterrows():
-        if pd.isna(riga["Timestamp"]):
-            continue
-        if riga["Azione"] == "Inizio fase":
-            if inizio_pendente is not None:
-                fine_fallback = _chiudi_timestamp_con_fallback(inizio_pendente, None, nome_dipendente, mappa_orario_fine)
-                if fine_fallback > inizio_pendente:
-                    ore_sessioni.append((fine_fallback - inizio_pendente).total_seconds() / 3600)
-            inizio_pendente = riga["Timestamp"]
-        elif riga["Azione"] == "Fine fase" and inizio_pendente is not None:
-            fine_ts = _chiudi_timestamp_con_fallback(inizio_pendente, riga["Timestamp"], nome_dipendente, mappa_orario_fine)
-            if fine_ts > inizio_pendente:
-                ore_sessioni.append((fine_ts - inizio_pendente).total_seconds() / 3600)
-            inizio_pendente = None
-    if inizio_pendente is not None:
-        ore_trascorse = (ora_attuale - inizio_pendente).total_seconds() / 3600
-        if ore_trascorse > TIMBRATURA_STALE_HOURS:
-            fine_fallback = _chiudi_timestamp_con_fallback(inizio_pendente, None, nome_dipendente, mappa_orario_fine)
-            if fine_fallback > inizio_pendente:
-                ore_sessioni.append((fine_fallback - inizio_pendente).total_seconds() / 3600)
-    return ore_sessioni
+    return [ore for _inizio, ore, _dettaglio in
+            _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale)]
 
 def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase_filter=None,
                                  macro_fase_filter=None, anno_produzione_filter=None):
@@ -4261,27 +4300,34 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase
                                FROM fasi_commessa f LEFT JOIN commesse co ON co.nome = f.commessa""", conn)
     colonne = ["Commessa", "Anno_produzione", "Fase", "Area", "Macro-fase", "Stato", "Ore_stimate",
                "Costo_ipotetico", "Ore_effettive", "Costo_reale"]
-    if fasi.empty:
-        return pd.DataFrame(columns=colonne)
-    if commessa_filter and commessa_filter != "Tutte le commesse":
-        fasi = fasi[fasi["Commessa"] == commessa_filter]
-    if area_filter and area_filter != "Tutte le aree":
-        fasi = fasi[fasi["Area"] == area_filter]
-    if fase_filter and fase_filter != "Tutte le fasi":
-        fasi = fasi[fasi["Fase"] == fase_filter]
-    if macro_fase_filter and macro_fase_filter != "Tutte le macro-fasi":
-        fasi = fasi[fasi["Macro-fase"] == macro_fase_filter]
-    if anno_produzione_filter and anno_produzione_filter != "Tutti gli anni":
-        fasi = fasi[fasi["Anno_produzione"] == anno_produzione_filter]
-    if fasi.empty:
-        return pd.DataFrame(columns=colonne)
-    fasi = fasi.copy()
+    # Chiavi (Commessa, Fase, Area) delle fasi realmente pianificate, PRIMA di
+    # applicare i filtri: servono a riconoscere le ore di 'Assistenza' che non
+    # appartengono a nessuna fase pianificata (vedi FASE_ASSISTENZA, sotto).
+    chiavi_fasi_pianificate = set(zip(fasi["Commessa"], fasi["Fase"], fasi["Area"]))
+
+    def _applica_filtri(tabella):
+        if commessa_filter and commessa_filter != "Tutte le commesse":
+            tabella = tabella[tabella["Commessa"] == commessa_filter]
+        if area_filter and area_filter != "Tutte le aree":
+            tabella = tabella[tabella["Area"] == area_filter]
+        if fase_filter and fase_filter != "Tutte le fasi":
+            tabella = tabella[tabella["Fase"] == fase_filter]
+        if macro_fase_filter and macro_fase_filter != "Tutte le macro-fasi":
+            tabella = tabella[tabella["Macro-fase"] == macro_fase_filter]
+        if anno_produzione_filter and anno_produzione_filter != "Tutti gli anni":
+            tabella = tabella[tabella["Anno_produzione"] == anno_produzione_filter]
+        return tabella
+
+    fasi = _applica_filtri(fasi).copy()
 
     mappa_livelli = get_users_livello_map()
     mappa_costi_livello = get_livelli_costo_orario_map()
-    fasi["Costo_ipotetico"] = fasi.apply(
-        lambda r: round(float(r["Ore_stimate"] or 0) * _costo_orario_dipendente(r["Operatore"], mappa_livelli, mappa_costi_livello), 2),
-        axis=1)
+    if fasi.empty:
+        fasi["Costo_ipotetico"] = pd.Series(dtype=float)
+    else:
+        fasi["Costo_ipotetico"] = fasi.apply(
+            lambda r: round(float(r["Ore_stimate"] or 0) * _costo_orario_dipendente(r["Operatore"], mappa_livelli, mappa_costi_livello), 2),
+            axis=1)
 
     dfn = normalize_datetime(df)
     righe_reali = []
@@ -4311,6 +4357,32 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase
         aggregato = pd.DataFrame(columns=["Commessa", "Fase", "Area", "Ore_effettive", "Costo_reale"])
 
     risultato = fasi.merge(aggregato, on=["Commessa", "Fase", "Area"], how="left")
+
+    # Ore di 'Assistenza' (FASE_ASSISTENZA) su una commessa, svolte da un reparto
+    # per cui non esiste una fase pianificata con quel nome: non hanno una riga in
+    # fasi_commessa, quindi senza questo passaggio non comparirebbero mai nei
+    # costi. Diventano una riga extra (nessuna ora stimata, quindi costo
+    # ipotetico 0) per ogni (commessa, reparto). Se invece l'admin ha creato una
+    # vera fase chiamata "Assistenza" per quel reparto, le ore vanno su quella.
+    if not aggregato.empty:
+        assistenza = aggregato[aggregato["Fase"] == FASE_ASSISTENZA]
+        assistenza = assistenza[[(c, f, a) not in chiavi_fasi_pianificate
+                                  for c, f, a in zip(assistenza["Commessa"], assistenza["Fase"], assistenza["Area"])]]
+        if not assistenza.empty:
+            with db_connect() as conn:
+                anni = dict(conn.execute("SELECT nome, anno_produzione FROM commesse").fetchall())
+            extra = assistenza.copy()
+            extra["Anno_produzione"] = extra["Commessa"].map(anni)
+            extra["Macro-fase"] = FASE_ASSISTENZA
+            extra["Stato"] = "-"
+            extra["Ore_stimate"] = 0.0
+            extra["Costo_ipotetico"] = 0.0
+            extra = _applica_filtri(extra)
+            if not extra.empty:
+                risultato = pd.concat([risultato, extra[risultato.columns.intersection(extra.columns).tolist()]], ignore_index=True)
+
+    if risultato.empty:
+        return pd.DataFrame(columns=colonne)
     risultato["Ore_effettive"] = risultato["Ore_effettive"].fillna(0.0).round(2)
     risultato["Costo_reale"] = risultato["Costo_reale"].fillna(0.0).round(2)
     return risultato[colonne]
@@ -4377,9 +4449,9 @@ def render_gestione_costi(df, key_prefix):
     with col_area_fasi:
         area_filtro_fasi = st.selectbox("Area", options=get_area_names(), key=f"{key_prefix}_costi_fasi_area_filtro")
     with col_macro_fasi:
-        macro_fase_filtro_fasi = st.selectbox("Macro-fase", options=["Tutte le macro-fasi"] + MACRO_FASI_DISPONIBILI, key=f"{key_prefix}_costi_fasi_macro_filtro")
+        macro_fase_filtro_fasi = st.selectbox("Macro-fase", options=["Tutte le macro-fasi"] + MACRO_FASI_DISPONIBILI + [FASE_ASSISTENZA], key=f"{key_prefix}_costi_fasi_macro_filtro")
     with col_fase_fasi:
-        fase_filtro_fasi = st.selectbox("Fase", options=["Tutte le fasi"] + get_fase_names_disponibili(), key=f"{key_prefix}_costi_fasi_fase_filtro")
+        fase_filtro_fasi = st.selectbox("Fase", options=["Tutte le fasi"] + sorted(set(get_fase_names_disponibili()) | {FASE_ASSISTENZA}), key=f"{key_prefix}_costi_fasi_fase_filtro")
     with col_anno_fasi:
         anno_filtro_fasi = st.selectbox("Anno di produzione", options=["Tutti gli anni"] + get_anni_produzione_disponibili(), key=f"{key_prefix}_costi_fasi_anno_filtro")
     fasi_costi = compute_costi_fasi_commessa(
@@ -4437,6 +4509,123 @@ def render_gestione_costi(df, key_prefix):
             else:
                 st.error(errore)
         st.caption("Il costo del personale in trasferta è calcolato in automatico dalle ore effettivamente lavorate nel periodo della trasferta × il costo orario CCNL del dipendente (lo stesso usato in 'Grafici e Classifiche').")
+
+def compute_ore_assistenza(df, start_date=None, end_date=None, commessa_filter=None,
+                            area_filter=None, dipendente_filter=None):
+    """Una riga per ogni sessione di 'Assistenza' (FASE_ASSISTENZA) timbrata su una
+    commessa: [Data, Dipendente, Area, Commessa, Cliente, Anno_produzione, Ore,
+    Costo, Dettaglio]. Si basa sulle timbrature (Inizio fase -> Fine fase, con la
+    stessa chiusura automatica di una Fine fase dimenticata usata nei costi), e il
+    periodo filtra per giorno di INIZIO della sessione. Il costo è Ore x costo
+    orario CCNL del dipendente."""
+    colonne = ["Data", "Dipendente", "Area", "Commessa", "Cliente", "Anno_produzione", "Ore", "Costo", "Dettaglio"]
+    dfn = normalize_datetime(df)
+    if dfn.empty:
+        return pd.DataFrame(columns=colonne)
+    dfn = dfn[dfn["Azione"].isin(["Inizio fase", "Fine fase"]) & (dfn["Fase"] == FASE_ASSISTENZA)
+              & dfn["Commessa"].fillna("").astype(bool)]
+    if dfn.empty:
+        return pd.DataFrame(columns=colonne)
+    mappa_area = get_users_area_map()
+    mappa_orario_fine = get_users_orario_fine_map()
+    mappa_livelli = get_users_livello_map()
+    mappa_costi_livello = get_livelli_costo_orario_map()
+    with db_connect() as conn:
+        info_commesse = {nome: (cliente or "", anno) for nome, cliente, anno in
+                         conn.execute("SELECT nome, cliente, anno_produzione FROM commesse").fetchall()}
+    ora_attuale = get_current_datetime()
+    righe = []
+    for (dip, commessa), gruppo in dfn.groupby(["Dipendente", "Commessa"]):
+        area = mappa_area.get(dip, "Unknown")
+        cliente, anno = info_commesse.get(commessa, ("", None))
+        costo_orario = _costo_orario_dipendente(dip, mappa_livelli, mappa_costi_livello)
+        for inizio, ore, dettaglio in _sessioni_fase_con_fallback_dettaglio(
+                gruppo.sort_values("Timestamp"), dip, mappa_orario_fine, ora_attuale):
+            righe.append({"Data": inizio.date(), "Dipendente": dip, "Area": area, "Commessa": commessa,
+                          "Cliente": cliente, "Anno_produzione": anno, "Ore": round(ore, 2),
+                          "Costo": round(ore * costo_orario, 2), "Dettaglio": dettaglio})
+    if not righe:
+        return pd.DataFrame(columns=colonne)
+    risultato = pd.DataFrame(righe)
+    if start_date is not None:
+        risultato = risultato[risultato["Data"] >= start_date]
+    if end_date is not None:
+        risultato = risultato[risultato["Data"] <= end_date]
+    if commessa_filter and commessa_filter != "Tutte le commesse":
+        risultato = risultato[risultato["Commessa"] == commessa_filter]
+    if area_filter and area_filter != "Tutte le aree":
+        risultato = risultato[risultato["Area"] == area_filter]
+    if dipendente_filter and dipendente_filter != "Tutti i dipendenti":
+        risultato = risultato[risultato["Dipendente"] == dipendente_filter]
+    return risultato.sort_values(["Data", "Dipendente"], ascending=[False, True]).reset_index(drop=True)[colonne]
+
+def riepiloga_ore_assistenza(sessioni):
+    """Riepiloghi della tabella di compute_ore_assistenza: dict con 'per_commessa'
+    (Commessa, Cliente, Sessioni, Dipendenti, Ore, Costo), 'per_dipendente'
+    (Dipendente, Area, Sessioni, Commesse, Ore, Costo) e 'per_mese' (Mese, Ore),
+    tutti ordinati per ore decrescenti (per_mese cronologico)."""
+    if sessioni.empty:
+        vuoto = pd.DataFrame
+        return {"per_commessa": vuoto(columns=["Commessa", "Cliente", "Sessioni", "Dipendenti", "Ore", "Costo"]),
+                "per_dipendente": vuoto(columns=["Dipendente", "Area", "Sessioni", "Commesse", "Ore", "Costo"]),
+                "per_mese": vuoto(columns=["Mese", "Ore"])}
+    per_commessa = sessioni.groupby(["Commessa", "Cliente"], as_index=False).agg(
+        Sessioni=("Ore", "size"), Dipendenti=("Dipendente", "nunique"), Ore=("Ore", "sum"), Costo=("Costo", "sum"))
+    per_dipendente = sessioni.groupby(["Dipendente", "Area"], as_index=False).agg(
+        Sessioni=("Ore", "size"), Commesse=("Commessa", "nunique"), Ore=("Ore", "sum"), Costo=("Costo", "sum"))
+    mesi = sessioni.assign(Mese=sessioni["Data"].map(lambda d: d.strftime("%Y-%m")))
+    per_mese = mesi.groupby("Mese", as_index=False).agg(Ore=("Ore", "sum")).sort_values("Mese")
+    for tabella in (per_commessa, per_dipendente, per_mese):
+        tabella["Ore"] = tabella["Ore"].round(2)
+    for tabella in (per_commessa, per_dipendente):
+        tabella["Costo"] = tabella["Costo"].round(2)
+    return {"per_commessa": per_commessa.sort_values("Ore", ascending=False).reset_index(drop=True),
+            "per_dipendente": per_dipendente.sort_values("Ore", ascending=False).reset_index(drop=True),
+            "per_mese": per_mese.reset_index(drop=True)}
+
+def render_statistiche_assistenza(df, key_prefix):
+    """Pagina 'Statistiche Assistenza' (admin): ore, sessioni e costo delle
+    timbrature in fase 'Assistenza', sempre legate alla commessa su cui sono
+    state fatte. Filtri per periodo, commessa, area e dipendente; riepilogo per
+    commessa, per dipendente e per mese, più l'elenco di ogni singola sessione."""
+    st.subheader("🛠️ Statistiche Assistenza")
+    st.caption("Ore timbrate in fase 'Assistenza' sulle commesse (costo = ore × costo orario CCNL del dipendente). Il periodo filtra per giorno di inizio dell'intervento.")
+    oggi = datetime.date.today()
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        periodo = st.date_input("Periodo", value=(oggi.replace(month=1, day=1), oggi), key=f"{key_prefix}_ass_periodo")
+    with col2:
+        commessa_f = st.selectbox("Commessa", ["Tutte le commesse"] + get_commesse_names(), key=f"{key_prefix}_ass_commessa")
+    with col3:
+        area_f = st.selectbox("Area", get_area_names(), key=f"{key_prefix}_ass_area")
+    with col4:
+        dip_f = st.selectbox("Dipendente", ["Tutti i dipendenti"] + get_user_names(), key=f"{key_prefix}_ass_dip")
+    if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
+        inizio, fine = periodo
+    elif isinstance(periodo, (tuple, list)):
+        inizio = fine = periodo[0] if periodo else oggi
+    else:
+        inizio = fine = periodo if periodo else oggi
+
+    sessioni = compute_ore_assistenza(df, inizio, fine, commessa_f, area_f, dip_f)
+    if sessioni.empty:
+        st.info("Nessuna ora di assistenza timbrata nel periodo e con i filtri selezionati.")
+        return
+    riepilogo = riepiloga_ore_assistenza(sessioni)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Ore di assistenza", f"{sessioni['Ore'].sum():.2f} h")
+    m2.metric("Interventi", f"{len(sessioni)}")
+    m3.metric("Commesse coinvolte", f"{sessioni['Commessa'].nunique()}")
+    m4.metric("Costo del personale", f"{sessioni['Costo'].sum():.2f} €")
+
+    st.markdown("**Per commessa**")
+    st.dataframe(riepilogo["per_commessa"], use_container_width=True)
+    st.markdown("**Per dipendente**")
+    st.dataframe(riepilogo["per_dipendente"], use_container_width=True)
+    st.markdown("**Andamento mensile (ore)**")
+    st.bar_chart(riepilogo["per_mese"].set_index("Mese")["Ore"])
+    st.markdown("**Dettaglio interventi**")
+    st.dataframe(sessioni, use_container_width=True)
 
 def render_pianificazione_commessa(df, key_prefix, puo_modificare=False):
     """Pagina 'Pianificazione' (Gantt): visibile a TUTTI (admin, responsabile, utente
@@ -5711,7 +5900,7 @@ else:
         admin_page = render_menu_a_categorie([
             ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione"]),
-            ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
+            ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🛠️ Statistiche Assistenza", "🌱 Sostenibilità (Smart Working)"]),
             ("🧳 Trasferte e Team", ["Programmazione nuova Trasferta", "Trasferte programmate", "Report interventi ricevuti", "📅 Disponibilità Team"]),
             ("💰 Costi", ["💰 Costi commesse"]),
             ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
@@ -5897,6 +6086,9 @@ else:
 
         elif admin_page == "Grafici e Classifiche":
             render_grafici_classifiche(df, key_prefix="admin_grafici")
+
+        elif admin_page == "🛠️ Statistiche Assistenza":
+            render_statistiche_assistenza(df, key_prefix="admin_assistenza")
 
         elif admin_page == "🌱 Sostenibilità (Smart Working)":
             render_sostenibilita(df, key_prefix="admin_sostenibilita")
