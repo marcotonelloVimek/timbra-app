@@ -6264,11 +6264,16 @@ else:
         if modalita == "Mie funzioni personali":
             # *** REPLICA DELLA SEZIONE UTENTE PER IL RESPONSABILE ***
             dipendente_scelto = user_info["name"]
+            # Chi è nell'area Service trova qui, nella categoria "Service", anche
+            # le Statistiche Assistenza (oltre che in fondo a "Trasferte Service").
+            pagine_service_resp = ["📷 Report Intervento"]
+            if is_area_service(user_info["area"]):
+                pagine_service_resp.append("🛠️ Statistiche Assistenza")
             pagina_utente = render_menu_a_categorie([
                 ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
                 ("👤 Profilo", ["Profilo"]),
                 ("🏭 Le mie Commesse", ["Le mie Commesse"]),
-                ("🧳 Service", ["📷 Report Intervento"]),
+                ("🧳 Service", pagine_service_resp),
                 ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
             ], key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
             st.session_state["_ultima_pagina_vista"] = pagina_utente
@@ -6375,6 +6380,9 @@ else:
 
             elif pagina_utente == "📷 Report Intervento":
                 render_report_intervento(dipendente_scelto, df, key_prefix="resp")
+
+            elif pagina_utente == "🛠️ Statistiche Assistenza":
+                render_statistiche_assistenza(df, key_prefix="resp_personale_assistenza")
 
             elif pagina_utente == "Richiesta ferie/permessi":
                 st.subheader("Richiesta ferie / permessi")
