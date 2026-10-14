@@ -2976,6 +2976,55 @@ def mostra_info_commessa(commessa):
         dettagli = " · ".join(filter(None, [f"Cliente: {cliente}" if cliente else "", f"Impianto: {tipologia}" if tipologia else ""]))
         st.caption(f"ℹ️ {dettagli}")
 
+OPZIONE_TUTTI_I_CLIENTI = "Tutti i clienti"
+OPZIONE_SENZA_CLIENTE = "(senza cliente)"
+
+def get_mappa_cliente_commesse():
+    """Mappa {nome_commessa: cliente} di tutte le commesse (stringa vuota se il
+    cliente non è stato inserito in 'Gestione Commesse')."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, cliente FROM commesse")
+        return {nome: (cliente or "").strip() for nome, cliente in c.fetchall()}
+
+def clienti_delle_commesse(commesse, mappa_cliente):
+    """Clienti distinti (in ordine alfabetico, senza distinguere maiuscole) delle
+    commesse indicate, più OPZIONE_SENZA_CLIENTE in fondo se qualcuna non ha un
+    cliente."""
+    clienti = sorted({mappa_cliente.get(c, "") for c in commesse} - {""}, key=str.lower)
+    if any(not mappa_cliente.get(c, "") for c in commesse):
+        clienti.append(OPZIONE_SENZA_CLIENTE)
+    return clienti
+
+def filtra_commesse_per_cliente(commesse, cliente, mappa_cliente):
+    """Le sole commesse del cliente scelto (stesso ordine di partenza); con
+    OPZIONE_TUTTI_I_CLIENTI (o nessuna scelta) restituisce tutte le commesse,
+    con OPZIONE_SENZA_CLIENTE quelle che non hanno un cliente."""
+    if not cliente or cliente == OPZIONE_TUTTI_I_CLIENTI:
+        return list(commesse)
+    if cliente == OPZIONE_SENZA_CLIENTE:
+        return [c for c in commesse if not mappa_cliente.get(c, "")]
+    return [c for c in commesse if mappa_cliente.get(c, "") == cliente]
+
+def selettore_commessa_con_filtro_cliente(commesse, etichetta_commessa, key_prefix_widget):
+    """Tendina Commessa con, sopra, un filtro per Cliente (quando almeno una delle
+    commesse ha un cliente), per non perdersi in un lungo elenco di commesse. Nelle
+    voci della tendina il cliente è mostrato accanto al nome. Restituisce la
+    commessa scelta (None se il filtro non lascia nessuna commessa)."""
+    mappa_cliente = get_mappa_cliente_commesse()
+    clienti = clienti_delle_commesse(commesse, mappa_cliente)
+    cliente_scelto = OPZIONE_TUTTI_I_CLIENTI
+    if any(c != OPZIONE_SENZA_CLIENTE for c in clienti):
+        cliente_scelto = st.selectbox("🏢 Cliente", [OPZIONE_TUTTI_I_CLIENTI] + clienti,
+                                      key=f"{key_prefix_widget}_cliente")
+    commesse_filtrate = filtra_commesse_per_cliente(commesse, cliente_scelto, mappa_cliente)
+    if not commesse_filtrate:
+        st.warning("Nessuna commessa per il cliente selezionato.")
+        return None
+    return st.selectbox(etichetta_commessa, commesse_filtrate,
+                        format_func=lambda c: f"{c} — {mappa_cliente[c]}" if mappa_cliente.get(c) else c,
+                        key=f"{key_prefix_widget}_commessa")
+
 def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, key_prefix):
     """Blocco '🧩 Fase Lavorativa' della pagina Timbrature, condiviso tra la vista
     del responsabile (quando timbra per sé stesso) e quella dell'utente
@@ -3006,9 +3055,10 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
             st.warning("Nessuna commessa esistente su cui timbrare l'assistenza.")
             commessa_scelta, fase_scelta = None, None
         else:
-            commessa_scelta = st.selectbox("🏗️ Commessa su cui fai assistenza", commesse_assistenza, key=f"{key_prefix}_commessa_assistenza_timbra")
+            commessa_scelta = selettore_commessa_con_filtro_cliente(
+                commesse_assistenza, "🏗️ Commessa su cui fai assistenza", f"{key_prefix}_assistenza_timbra")
             mostra_info_commessa(commessa_scelta)
-            fase_scelta = FASE_ASSISTENZA
+            fase_scelta = FASE_ASSISTENZA if commessa_scelta else None
             dettaglio_fase = st.text_input("Cosa stai facendo? (facoltativo)", key=f"{key_prefix}_assistenza_dettaglio_timbra")
     else:
         # Solo le commesse 'Da iniziare'/'In corso' che hanno, nel suo reparto,
@@ -3019,10 +3069,13 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
             st.warning("Nessuna commessa disponibile per il tuo reparto al momento. Chiedi all'admin di crearne una o di assegnartela.")
             commessa_scelta, fase_scelta = None, None
         else:
-            commessa_scelta = st.selectbox("🏗️ Commessa", commesse_disponibili, key=f"{key_prefix}_commessa_timbra")
+            commessa_scelta = selettore_commessa_con_filtro_cliente(
+                commesse_disponibili, "🏗️ Commessa", f"{key_prefix}_timbra")
             mostra_info_commessa(commessa_scelta)
-            fasi_disponibili = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto)
-            if not fasi_disponibili:
+            fasi_disponibili = get_fasi_assegnate_a_operatore(commessa_scelta, user_info["area"], dipendente_scelto) if commessa_scelta else []
+            if not commessa_scelta:
+                fase_scelta = None
+            elif not fasi_disponibili:
                 st.warning(f"Nessuna fase disponibile per te su '{commessa_scelta}' nel tuo reparto. Chiedi al tuo responsabile di aggiungerla.")
                 fase_scelta = None
             else:
