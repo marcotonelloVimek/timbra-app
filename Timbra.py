@@ -247,6 +247,15 @@ ORE_ORDINARIE_GIORNALIERE = 8.0  # Soglia oltre la quale le ore lavorate in un g
 DEFAULT_ORARIO_FINE_GIORNATA = "18:00"
 DEFAULT_ORARIO_FINE_GIORNATA_TIME = datetime.datetime.strptime(DEFAULT_ORARIO_FINE_GIORNATA, "%H:%M").time()
 
+# Pausa pranzo "abituale": se in un giorno lavorato un dipendente non ha timbrato la
+# pausa pranzo (Inizio Pausa + Fine Pausa), le ore di quel giorno vengono ridotte
+# della parte di pausa abituale che cade dentro il suo orario di lavoro (richiesta
+# di Marco: "se non vedo timbratura della pausa pranzo la calcoli di default").
+# Ogni dipendente (tranne l'admin) imposta la propria in Area Personale; fino ad
+# allora vale questa fascia di default.
+DEFAULT_PAUSA_PRANZO_INIZIO = "12:00"
+DEFAULT_PAUSA_PRANZO_FINE = "13:00"
+
 # Stime di partenza per la sezione "Sostenibilità": quanto risparmia (in costi di
 # gestione ufficio) e quanta CO2 evita l'azienda per ogni ora di smart working invece
 # che in presenza. Sono stime esterne (Osservatorio Smart Working del Politecnico di
@@ -362,7 +371,9 @@ def init_db():
                         codice_fiscale TEXT DEFAULT '',
                         data_nascita TEXT DEFAULT '',
                         distanza_km REAL DEFAULT 0,
-                        orario_fine_giornata TEXT DEFAULT ''
+                        orario_fine_giornata TEXT DEFAULT '',
+                        pausa_pranzo_inizio TEXT DEFAULT '',
+                        pausa_pranzo_fine TEXT DEFAULT ''
                     )''')
 
         # Migrazione: aggiungi le colonne livello (inquadramento CCNL), data di
@@ -373,6 +384,7 @@ def init_db():
             ("livello", "TEXT DEFAULT ''"), ("data_assunzione", "TEXT DEFAULT ''"),
             ("codice_fiscale", "TEXT DEFAULT ''"), ("data_nascita", "TEXT DEFAULT ''"),
             ("distanza_km", "REAL DEFAULT 0"), ("orario_fine_giornata", "TEXT DEFAULT ''"),
+            ("pausa_pranzo_inizio", "TEXT DEFAULT ''"), ("pausa_pranzo_fine", "TEXT DEFAULT ''"),
         ]:
             try:
                 c.execute(f"ALTER TABLE utenti ADD COLUMN {colonna_utente} {tipo_colonna}")
@@ -1091,6 +1103,9 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
             story.append(table)
             story.append(Spacer(1, 0.25*inch))
 
+        if not cartellino_df.empty and cartellino_df["Inizio Pausa"].astype(str).str.contains("(auto)", regex=False).any():
+            story.append(Paragraph("(auto) = pausa pranzo non timbrata: dedotta in automatico secondo l'orario di pausa abituale del dipendente.", info_style))
+            story.append(Spacer(1, 0.1*inch))
         story.append(Paragraph("<b>Totali del mese</b>", styles['Heading2']))
         story.append(Paragraph(
             f"Giorni lavorati: {totali['giorni_lavorati']} &nbsp;|&nbsp; "
@@ -2128,6 +2143,7 @@ def get_storico_attivita_commessa(commessa, df):
     if not commessa or df is None or df.empty:
         return pd.DataFrame(columns=colonne)
     dfn = normalize_datetime(df)
+    indice_pause = IndicePauseFasi(dfn)  # prima di restringere alle sole righe fase
     dfn = dfn[(dfn["Commessa"] == commessa) & (dfn["Azione"].isin(["Inizio fase", "Fine fase"]))]
     if dfn.empty:
         return pd.DataFrame(columns=colonne)
@@ -2143,7 +2159,7 @@ def get_storico_attivita_commessa(commessa, df):
                 inizio_ts = coda_inizio.pop(0) if coda_inizio else None
                 ore = None
                 if inizio_ts is not None and pd.notna(inizio_ts) and pd.notna(riga["Timestamp"]) and riga["Timestamp"] > inizio_ts:
-                    ore = round((riga["Timestamp"] - inizio_ts).total_seconds() / 3600, 2)
+                    ore = round(indice_pause.ore_nette(dip, inizio_ts, riga["Timestamp"]), 2)
                 righe.append({
                     "Dipendente": dip, "Area": mappa_aree.get(dip, "Unknown"), "Fase": fase, "Data": data_lavoro,
                     "Inizio": inizio_ts.strftime("%H:%M") if inizio_ts is not None and pd.notna(inizio_ts) else "-",
@@ -4039,12 +4055,15 @@ def get_dati_personali_utente(username):
     dal dipendente)."""
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("""SELECT livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata
+        c.execute("""SELECT livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata,
+                            pausa_pranzo_inizio, pausa_pranzo_fine, role
                      FROM utenti WHERE username=?""", (username,))
         row = c.fetchone()
     if not row:
         return {"livello": "", "data_assunzione": None, "codice_fiscale": "", "data_nascita": None,
-                "distanza_km": 0.0, "orario_fine_giornata": DEFAULT_ORARIO_FINE_GIORNATA_TIME}
+                "distanza_km": 0.0, "orario_fine_giornata": DEFAULT_ORARIO_FINE_GIORNATA_TIME,
+                "pausa_pranzo_inizio": _parse_pausa_pranzo("", "")[0], "pausa_pranzo_fine": _parse_pausa_pranzo("", "")[1],
+                "ha_pausa_pranzo": True}
 
     def _parse_data(valore):
         try:
@@ -4052,7 +4071,8 @@ def get_dati_personali_utente(username):
         except (ValueError, TypeError):
             return None
 
-    livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata = row
+    livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata, pausa_inizio, pausa_fine, ruolo = row
+    pausa_pranzo = _parse_pausa_pranzo(pausa_inizio, pausa_fine)
     return {
         "livello": livello or "",
         "data_assunzione": _parse_data(data_assunzione),
@@ -4060,9 +4080,16 @@ def get_dati_personali_utente(username):
         "data_nascita": _parse_data(data_nascita),
         "distanza_km": float(distanza_km) if distanza_km is not None else 0.0,
         "orario_fine_giornata": _parse_orario_fine_giornata(orario_fine_giornata),
+        "pausa_pranzo_inizio": pausa_pranzo[0],
+        "pausa_pranzo_fine": pausa_pranzo[1],
+        # L'admin non ha una pausa pranzo abituale da dedurre.
+        "ha_pausa_pranzo": str(ruolo or "").strip().lower() != "admin",
     }
 
-def aggiorna_dati_personali_utente(username, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata=None):
+_NON_MODIFICARE = object()
+
+def aggiorna_dati_personali_utente(username, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata=None,
+                                    pausa_pranzo_inizio=_NON_MODIFICARE, pausa_pranzo_fine=_NON_MODIFICARE):
     """Aggiorna i dati dell'Area Personale che il dipendente può modificare da solo
     (codice fiscale, data di nascita, distanza casa-lavoro, orario di fine giornata).
     Livello CCNL e data di assunzione NON sono toccati qui: restano impostabili solo
@@ -4071,7 +4098,12 @@ def aggiorna_dati_personali_utente(username, codice_fiscale, data_nascita, dista
     usato per chiudere automaticamente il conteggio delle ore su una commessa se ci si
     dimentica di timbrare l'Uscita o di chiudere una fase (vedi
     compute_costi_fasi_commessa), cosi' una singola timbratura dimenticata non genera
-    ore/costi assurdi. Restituisce (ok, messaggio_errore)."""
+    ore/costi assurdi. pausa_pranzo_inizio/pausa_pranzo_fine sono la propria pausa
+    pranzo abituale: se in un giorno non timbra la pausa, le ore di quel giorno
+    vengono ridotte di questa fascia (vedi calcola_pausa_giornaliera); vanno passati
+    insieme (entrambi vuoti = fascia di default) e la fine deve essere dopo
+    l'inizio; se non passati, restano quelli già salvati.
+    Restituisce (ok, messaggio_errore)."""
     codice_fiscale = (codice_fiscale or "").strip().upper()
     if codice_fiscale and not CODICE_FISCALE_REGEX.match(codice_fiscale):
         return False, "Il Codice Fiscale deve essere di 16 caratteri alfanumerici."
@@ -4103,10 +4135,32 @@ def aggiorna_dati_personali_utente(username, codice_fiscale, data_nascita, dista
     else:
         return False, "L'orario di fine giornata non è valido."
 
+    aggiorna_pausa = not (pausa_pranzo_inizio is _NON_MODIFICARE and pausa_pranzo_fine is _NON_MODIFICARE)
+    pausa_inizio_str = pausa_fine_str = ""
+    if aggiorna_pausa:
+        def _a_stringa(valore):
+            if valore is None or valore is _NON_MODIFICARE or valore == "":
+                return ""
+            if isinstance(valore, datetime.time):
+                return valore.strftime("%H:%M")
+            datetime.datetime.strptime(valore, "%H:%M")  # solleva ValueError se non valido
+            return valore
+        try:
+            pausa_inizio_str, pausa_fine_str = _a_stringa(pausa_pranzo_inizio), _a_stringa(pausa_pranzo_fine)
+        except (TypeError, ValueError):
+            return False, "L'orario della pausa pranzo non è valido (usa il formato HH:MM)."
+        if bool(pausa_inizio_str) != bool(pausa_fine_str):
+            return False, "Per la pausa pranzo indica sia l'orario di inizio che quello di fine."
+        if pausa_inizio_str and pausa_fine_str <= pausa_inizio_str:
+            return False, "La fine della pausa pranzo deve essere dopo l'inizio."
+
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("UPDATE utenti SET codice_fiscale=?, data_nascita=?, distanza_km=?, orario_fine_giornata=? WHERE username=?",
                   (codice_fiscale, data_nascita_str, distanza_km, orario_fine_giornata_str, username))
+        if aggiorna_pausa:
+            c.execute("UPDATE utenti SET pausa_pranzo_inizio=?, pausa_pranzo_fine=? WHERE username=?",
+                      (pausa_inizio_str, pausa_fine_str, username))
         conn.commit()
     return True, ""
 
@@ -4287,12 +4341,14 @@ def _chiudi_timestamp_con_fallback(inizio_ts, fine_ts_reale, nome_dipendente, ma
     orario_fine = mappa_orario_fine.get(nome_dipendente) or DEFAULT_ORARIO_FINE_GIORNATA_TIME
     return datetime.datetime.combine(inizio_ts.date(), orario_fine)
 
-def _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale):
+def _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale,
+                                           indice_pause=None):
     """Come _sessioni_fase_con_fallback (stessa logica, vedi sotto), ma per ogni
     sessione restituisce la tupla (inizio, ore, dettaglio_fase) invece delle sole
     ore: serve alle statistiche che devono sapere QUANDO è iniziata ogni sessione
     (es. Statistiche Assistenza, per periodo/mese) e la nota scritta al momento
-    dell'avvio."""
+    dell'avvio. Con indice_pause (vedi IndicePauseFasi) le ore sono nette della
+    pausa pranzo, timbrata o automatica; senza, sono lorde."""
     sessioni = []
     inizio_pendente = None
     dettaglio_pendente = ""
@@ -4300,7 +4356,9 @@ def _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mapp
     def _chiudi_con_fallback():
         fine_fallback = _chiudi_timestamp_con_fallback(inizio_pendente, None, nome_dipendente, mappa_orario_fine)
         if fine_fallback > inizio_pendente:
-            sessioni.append((inizio_pendente, (fine_fallback - inizio_pendente).total_seconds() / 3600, dettaglio_pendente))
+            ore = _ore_fra(indice_pause, nome_dipendente, inizio_pendente, fine_fallback)
+            if ore > 0:
+                sessioni.append((inizio_pendente, ore, dettaglio_pendente))
 
     for _, riga in gruppo_ordinato.iterrows():
         if pd.isna(riga["Timestamp"]):
@@ -4314,7 +4372,9 @@ def _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mapp
         elif riga["Azione"] == "Fine fase" and inizio_pendente is not None:
             fine_ts = _chiudi_timestamp_con_fallback(inizio_pendente, riga["Timestamp"], nome_dipendente, mappa_orario_fine)
             if fine_ts > inizio_pendente:
-                sessioni.append((inizio_pendente, (fine_ts - inizio_pendente).total_seconds() / 3600, dettaglio_pendente))
+                ore = _ore_fra(indice_pause, nome_dipendente, inizio_pendente, fine_ts)
+                if ore > 0:
+                    sessioni.append((inizio_pendente, ore, dettaglio_pendente))
             inizio_pendente = None
     if inizio_pendente is not None:
         ore_trascorse = (ora_attuale - inizio_pendente).total_seconds() / 3600
@@ -4322,7 +4382,7 @@ def _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mapp
             _chiudi_con_fallback()
     return sessioni
 
-def _sessioni_fase_con_fallback(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale):
+def _sessioni_fase_con_fallback(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale, indice_pause=None):
     """Dato il gruppo (già ordinato per Timestamp) delle righe Inizio fase/Fine fase
     di un singolo dipendente su una singola fase di una singola commessa, restituisce
     la lista delle ore di ciascuna sessione realmente lavorata. Una fase resta aperta
@@ -4335,7 +4395,8 @@ def _sessioni_fase_con_fallback(gruppo_ordinato, nome_dipendente, mappa_orario_f
     molto successiva (il bug segnalato da Marco: 'se un utente si dimentica di
     timbrare l'uscita, i dati si rovinano tutti')."""
     return [ore for _inizio, ore, _dettaglio in
-            _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale)]
+            _sessioni_fase_con_fallback_dettaglio(gruppo_ordinato, nome_dipendente, mappa_orario_fine, ora_attuale,
+                                                  indice_pause)]
 
 def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase_filter=None,
                                  macro_fase_filter=None, anno_produzione_filter=None):
@@ -4398,6 +4459,7 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase
         # ricava dal reparto del dipendente che l'ha eseguita, non salvata sulla
         # singola timbratura.
         dfn["Area"] = dfn["Dipendente"].map(get_users_area_map()).fillna("Unknown")
+        indice_pause = IndicePauseFasi(dfn)  # prima di restringere alle sole righe fase
         dfn = dfn[dfn["Azione"].isin(["Inizio fase", "Fine fase"])]
         mappa_orario_fine = get_users_orario_fine_map()
         ora_attuale = get_current_datetime()
@@ -4405,7 +4467,7 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase
             if not commessa or not fase:
                 continue
             gruppo = gruppo.sort_values("Timestamp")
-            for ore in _sessioni_fase_con_fallback(gruppo, dip, mappa_orario_fine, ora_attuale):
+            for ore in _sessioni_fase_con_fallback(gruppo, dip, mappa_orario_fine, ora_attuale, indice_pause):
                 righe_reali.append({"Dipendente": dip, "Commessa": commessa, "Fase": fase, "Area": area, "Ore": ore})
 
     if righe_reali:
@@ -4583,6 +4645,7 @@ def compute_ore_assistenza(df, start_date=None, end_date=None, commessa_filter=N
     dfn = normalize_datetime(df)
     if dfn.empty:
         return pd.DataFrame(columns=colonne)
+    indice_pause = IndicePauseFasi(dfn)  # prima di restringere alle sole righe fase
     dfn = dfn[dfn["Azione"].isin(["Inizio fase", "Fine fase"]) & (dfn["Fase"] == FASE_ASSISTENZA)
               & dfn["Commessa"].fillna("").astype(bool)]
     if dfn.empty:
@@ -4601,7 +4664,7 @@ def compute_ore_assistenza(df, start_date=None, end_date=None, commessa_filter=N
         cliente, anno = info_commesse.get(commessa, ("", None))
         costo_orario = _costo_orario_dipendente(dip, mappa_livelli, mappa_costi_livello)
         for inizio, ore, dettaglio in _sessioni_fase_con_fallback_dettaglio(
-                gruppo.sort_values("Timestamp"), dip, mappa_orario_fine, ora_attuale):
+                gruppo.sort_values("Timestamp"), dip, mappa_orario_fine, ora_attuale, indice_pause):
             righe.append({"Data": inizio.date(), "Dipendente": dip, "Area": area, "Commessa": commessa,
                           "Cliente": cliente, "Anno_produzione": anno, "Ore": round(ore, 2),
                           "Costo": round(ore * costo_orario, 2), "Dettaglio": dettaglio})
@@ -4993,6 +5056,149 @@ def compute_co2_risparmiata_pendolarismo(df, start_date, end_date, area_filter=N
     totale_kg = round(float(giorni_smart["CO2_evitata_kg"].sum()), 2)
     return giorni_smart[colonne].sort_values("CO2_evitata_kg", ascending=False).reset_index(drop=True), totale_kg
 
+def _parse_pausa_pranzo(inizio_str, fine_str):
+    """Converte i due valori salvati in DB ("HH:MM") nella fascia (inizio, fine) come
+    datetime.time. Se uno dei due manca o non è valido, o la fine non è dopo
+    l'inizio, restituisce la fascia di default (DEFAULT_PAUSA_PRANZO_*)."""
+    try:
+        inizio = datetime.datetime.strptime(inizio_str, "%H:%M").time()
+        fine = datetime.datetime.strptime(fine_str, "%H:%M").time()
+        if fine > inizio:
+            return inizio, fine
+    except (TypeError, ValueError):
+        pass
+    return (datetime.datetime.strptime(DEFAULT_PAUSA_PRANZO_INIZIO, "%H:%M").time(),
+            datetime.datetime.strptime(DEFAULT_PAUSA_PRANZO_FINE, "%H:%M").time())
+
+def get_users_pausa_pranzo_map():
+    """Mappa {nome_dipendente: (inizio, fine)} della pausa pranzo abituale impostata
+    in Area Personale (fascia di default se non impostata). Per l'admin il valore è
+    None: l'admin non ha una pausa pranzo da dedurre automaticamente. Una sola query
+    per tutti i dipendenti, come get_users_orario_fine_map."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, role, pausa_pranzo_inizio, pausa_pranzo_fine FROM utenti")
+        return {nome: (None if str(ruolo or "").strip().lower() == "admin" else _parse_pausa_pranzo(inizio, fine))
+                for nome, ruolo, inizio, fine in c.fetchall()}
+
+def pausa_pranzo_abituale_di(nome_dipendente, mappa_pause):
+    """Fascia abituale (inizio, fine) di un dipendente dalla mappa di
+    get_users_pausa_pranzo_map(); None per l'admin; fascia di default per un nome
+    non presente tra gli utenti."""
+    if nome_dipendente in mappa_pause:
+        return mappa_pause[nome_dipendente]
+    return _parse_pausa_pranzo("", "")
+
+def sessioni_ingresso_uscita(gruppo_ordinato):
+    """Coppie (ingresso, uscita) di un singolo giorno di un dipendente (gruppo già
+    ordinato per Timestamp), abbinate in ordine come nel resto dell'app."""
+    coda, sessioni = [], []
+    for _, r in gruppo_ordinato.iterrows():
+        if r["Azione"] == "Ingresso":
+            coda.append(r["Timestamp"])
+        elif r["Azione"] == "Uscita" and coda:
+            inizio = coda.pop(0)
+            if pd.notna(inizio) and pd.notna(r["Timestamp"]) and r["Timestamp"] > inizio:
+                sessioni.append((inizio, r["Timestamp"]))
+    return sessioni
+
+def calcola_pausa_giornaliera(gruppo_ordinato, sessioni, data, pausa_abituale):
+    """Secondi di pausa pranzo da sottrarre alle ore lorde di un giorno. Se il
+    dipendente ha timbrato almeno una pausa completa (Inizio Pausa -> Fine Pausa) vale
+    quella realmente timbrata. Altrimenti, se ha una pausa abituale (non l'admin), si
+    deduce la parte della fascia abituale che cade dentro le sue sessioni di lavoro
+    del giorno: chi ha lavorato solo di mattina, per esempio, non perde nulla.
+    Restituisce (secondi, automatica, fascia): 'automatica' è True solo se è stata
+    dedotta la pausa abituale (secondi > 0); 'fascia' è (datetime inizio, datetime
+    fine) di quella pausa, None negli altri casi."""
+    coda, secondi_timbrati = [], 0.0
+    for _, r in gruppo_ordinato.iterrows():
+        if r["Azione"] == "Inizio Pausa":
+            coda.append(r["Timestamp"])
+        elif r["Azione"] == "Fine Pausa" and coda:
+            inizio = coda.pop(0)
+            if pd.notna(inizio) and pd.notna(r["Timestamp"]) and r["Timestamp"] > inizio:
+                secondi_timbrati += (r["Timestamp"] - inizio).total_seconds()
+    if secondi_timbrati > 0:
+        return secondi_timbrati, False, None
+    if not pausa_abituale or not sessioni:
+        return 0.0, False, None
+    inizio_pausa = datetime.datetime.combine(data, pausa_abituale[0])
+    fine_pausa = datetime.datetime.combine(data, pausa_abituale[1])
+    secondi = 0.0
+    for ingresso, uscita in sessioni:
+        sovrapposizione = (min(uscita, fine_pausa) - max(ingresso, inizio_pausa)).total_seconds()
+        if sovrapposizione > 0:
+            secondi += sovrapposizione
+    if secondi <= 0:
+        return 0.0, False, None
+    return secondi, True, (inizio_pausa, fine_pausa)
+
+class IndicePauseFasi:
+    """Toglie la pausa pranzo dalle ORE DI FASE/COMMESSA (Inizio fase -> Fine fase).
+    Una fase resta spesso aperta durante il pranzo (get_fase_aperta la mantiene
+    aperta anche in pausa): quell'ora non è lavorata e non deve finire sulla
+    commessa, che la pausa sia stata timbrata o dedotta in automatico.
+
+    Regola, giorno per giorno, identica a quella di calcola_pausa_giornaliera:
+    - se il dipendente ha almeno una pausa completa timbrata (Inizio Pausa -> Fine
+      Pausa) quel giorno, si sottrae la sovrapposizione con le pause timbrate;
+    - altrimenti, per chi ha una pausa abituale (non l'admin), la sovrapposizione
+      con la fascia abituale (default 12:00-13:00). Una fase conclusa prima di
+      pranzo, o iniziata dopo, non perde nulla.
+    Va costruito con il df normalizzato COMPLETO (che contiene anche le righe di
+    pausa), prima di restringerlo alle sole righe Inizio/Fine fase."""
+
+    def __init__(self, df_normalizzato, mappa_pause=None):
+        self._mappa = get_users_pausa_pranzo_map() if mappa_pause is None else mappa_pause
+        self._timbrate = {}  # (dipendente, data) -> [(inizio, fine), ...]
+        if df_normalizzato is None or df_normalizzato.empty:
+            return
+        pause = df_normalizzato[df_normalizzato["Azione"].isin(["Inizio Pausa", "Fine Pausa"])]
+        for (dip, data), gruppo in pause.groupby(["Dipendente", "Data"]):
+            coda, coppie = [], []
+            for _, r in gruppo.sort_values("Timestamp").iterrows():
+                if r["Azione"] == "Inizio Pausa":
+                    coda.append(r["Timestamp"])
+                elif coda:
+                    inizio = coda.pop(0)
+                    if pd.notna(inizio) and pd.notna(r["Timestamp"]) and r["Timestamp"] > inizio:
+                        coppie.append((inizio, r["Timestamp"]))
+            if coppie:
+                self._timbrate[(dip, data)] = coppie
+
+    def secondi_pausa(self, dipendente, inizio, fine):
+        """Secondi di pausa che cadono dentro l'intervallo [inizio, fine]."""
+        if inizio is None or fine is None or pd.isna(inizio) or pd.isna(fine) or fine <= inizio:
+            return 0.0
+        totale = 0.0
+        giorno = inizio.date()
+        while giorno <= fine.date():
+            inizio_g = max(inizio, datetime.datetime.combine(giorno, datetime.time.min))
+            fine_g = min(fine, datetime.datetime.combine(giorno, datetime.time.max))
+            finestre = self._timbrate.get((dipendente, giorno))
+            if not finestre:
+                abituale = pausa_pranzo_abituale_di(dipendente, self._mappa)
+                finestre = ([(datetime.datetime.combine(giorno, abituale[0]),
+                              datetime.datetime.combine(giorno, abituale[1]))] if abituale else [])
+            for a, b in finestre:
+                sovrapposizione = (min(fine_g, b) - max(inizio_g, a)).total_seconds()
+                if sovrapposizione > 0:
+                    totale += sovrapposizione
+            giorno += datetime.timedelta(days=1)
+        return totale
+
+    def ore_nette(self, dipendente, inizio, fine):
+        """Ore tra inizio e fine al netto della pausa pranzo (mai negative)."""
+        lorde = (fine - inizio).total_seconds()
+        return max(0.0, lorde - self.secondi_pausa(dipendente, inizio, fine)) / 3600
+
+def _ore_fra(indice_pause, dipendente, inizio, fine):
+    """Ore tra due timestamp, nette della pausa se è disponibile l'indice."""
+    if indice_pause is None:
+        return (fine - inizio).total_seconds() / 3600
+    return indice_pause.ore_nette(dipendente, inizio, fine)
+
 GIORNI_SETTIMANA_IT = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 
 def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None):
@@ -5025,6 +5231,8 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
                     (giorni_ferie if row["Tipo"] == "Ferie" else giorni_permesso).add(giorno_corrente)
                 giorno_corrente += datetime.timedelta(days=1)
 
+    pausa_abituale = pausa_pranzo_abituale_di(nome_dipendente, get_users_pausa_pranzo_map())
+
     n_giorni = calendar.monthrange(anno, mese)[1]
     righe = []
     for giorno in range(1, n_giorni + 1):
@@ -5055,25 +5263,15 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
             if luoghi:
                 dove_txt = ", ".join(luoghi)
 
-            # Ore lavorate nette: sessioni Ingresso->Uscita meno le pause pranzo registrate.
-            coda_ingressi, sessioni = [], []
-            for _, r in gruppo.iterrows():
-                if r["Azione"] == "Ingresso":
-                    coda_ingressi.append(r["Timestamp"])
-                elif r["Azione"] == "Uscita" and coda_ingressi:
-                    inizio_sessione = coda_ingressi.pop(0)
-                    if pd.notna(inizio_sessione) and pd.notna(r["Timestamp"]) and r["Timestamp"] > inizio_sessione:
-                        sessioni.append((inizio_sessione, r["Timestamp"]))
+            # Ore lavorate nette: sessioni Ingresso->Uscita meno la pausa pranzo
+            # (quella timbrata; se manca, quella abituale del dipendente).
+            sessioni = sessioni_ingresso_uscita(gruppo)
             secondi_lavorati = sum((fine - inizio).total_seconds() for inizio, fine in sessioni)
-
-            coda_pause, secondi_pausa = [], 0
-            for _, r in gruppo.iterrows():
-                if r["Azione"] == "Inizio Pausa":
-                    coda_pause.append(r["Timestamp"])
-                elif r["Azione"] == "Fine Pausa" and coda_pause:
-                    inizio_pausa = coda_pause.pop(0)
-                    if pd.notna(inizio_pausa) and pd.notna(r["Timestamp"]) and r["Timestamp"] > inizio_pausa:
-                        secondi_pausa += (r["Timestamp"] - inizio_pausa).total_seconds()
+            secondi_pausa, pausa_automatica, fascia_pausa = calcola_pausa_giornaliera(
+                gruppo, sessioni, data_corrente, pausa_abituale)
+            if pausa_automatica:
+                inizio_pausa_txt = f"{fascia_pausa[0].strftime('%H:%M')} (auto)"
+                fine_pausa_txt = f"{fascia_pausa[1].strftime('%H:%M')} (auto)"
 
             ore_nette = max(secondi_lavorati - secondi_pausa, 0) / 3600
             ore_ordinarie = round(min(ore_nette, ORE_ORDINARIE_GIORNALIERE), 2)
@@ -5150,18 +5348,21 @@ def normalize_datetime(df):
     return df
 
 def compute_daily_work(df):
+    """Ore lavorate per dipendente e giorno (Ingresso->Uscita) al netto della pausa
+    pranzo: quella timbrata, oppure, se non c'è, quella abituale impostata in Area
+    Personale (vedi calcola_pausa_giornaliera). Stesso calcolo del cartellino mensile,
+    così le ore sono le stesse ovunque nell'app."""
     df = normalize_datetime(df)
     if df.empty: return pd.DataFrame(columns=["Dipendente", "Data", "Ore_lavorate", "Timbrature"])
+    mappa_pause = get_users_pausa_pranzo_map()
     rows = []
     for (user, work_date), group in df.groupby(["Dipendente", "Data"]):
         group = group.sort_values("Timestamp")
-        total_seconds = 0; ingresso_queue = []
-        for _, row in group.iterrows():
-            if row["Azione"] == "Ingresso": ingresso_queue.append(row["Timestamp"])
-            elif row["Azione"] == "Uscita" and ingresso_queue:
-                start = ingresso_queue.pop(0)
-                if pd.notna(start) and pd.notna(row["Timestamp"]) and row["Timestamp"] > start:
-                    total_seconds += (row["Timestamp"] - start).total_seconds()
+        sessioni = sessioni_ingresso_uscita(group)
+        total_seconds = sum((fine - inizio).total_seconds() for inizio, fine in sessioni)
+        if sessioni and pd.notna(work_date):
+            secondi_pausa, _, _ = calcola_pausa_giornaliera(group, sessioni, work_date, pausa_pranzo_abituale_di(user, mappa_pause))
+            total_seconds = max(total_seconds - secondi_pausa, 0)
         rows.append({"Dipendente": user, "Data": work_date, "Ore_lavorate": total_seconds / 3600, "Timbrature": len(group)})
     return pd.DataFrame(rows)
 
@@ -5198,6 +5399,7 @@ def compute_hours_by_commessa(df, start_date, end_date, employee_name=None):
     if df.empty: return pd.DataFrame(columns=["Dipendente", "Commessa", "Ore_lavorate"])
     df = df[df["Data"].apply(lambda d: start_date <= d <= end_date)]
     if employee_name: df = df[df["Dipendente"] == employee_name]
+    indice_pause = IndicePauseFasi(df)  # le righe di pausa sono ancora nel df
     rows = []
     for (user, date, commessa), group in df.groupby(["Dipendente", "Data", "Commessa"]):
         if not commessa: continue
@@ -5208,7 +5410,7 @@ def compute_hours_by_commessa(df, start_date, end_date, employee_name=None):
             elif row["Azione"] == "Fine fase" and ingresso_queue:
                 start = ingresso_queue.pop(0)
                 if pd.notna(start) and pd.notna(row["Timestamp"]) and row["Timestamp"] > start:
-                    duration = (row["Timestamp"] - start).total_seconds() / 3600
+                    duration = indice_pause.ore_nette(user, start, row["Timestamp"])
                     rows.append({"Dipendente": user, "Commessa": commessa, "Ore_lavorate": duration})
     if not rows: return pd.DataFrame(columns=["Dipendente", "Commessa", "Ore_lavorate"])
     return pd.DataFrame(rows).groupby(["Dipendente", "Commessa"], as_index=False).agg({"Ore_lavorate": "sum"}).assign(Ore_lavorate=lambda d: d["Ore_lavorate"].round(2))
@@ -5220,10 +5422,12 @@ def compute_commessa_gantt_segments(df, start_date, end_date, employee_name):
     rispondere visivamente a 'quando ho lavorato su quale commessa'. Usato nella
     pagina 'Riepilogo personale' insieme a compute_hours_by_commessa (che dà invece il
     totale ore per commessa, senza la dimensione temporale)."""
-    colonne = ["Dipendente", "Commessa", "Fase", "Data", "start", "end"]
+    colonne = ["Dipendente", "Commessa", "Fase", "Data", "start", "end", "Ore"]
     if df is None or df.empty or not employee_name:
         return pd.DataFrame(columns=colonne)
     dfn = normalize_datetime(df)
+    dfn = dfn[(dfn["Dipendente"] == employee_name) & (dfn["Data"] >= start_date) & (dfn["Data"] <= end_date)]
+    indice_pause = IndicePauseFasi(dfn)  # prima di restringere alle sole righe fase
     dfn = dfn[(dfn["Dipendente"] == employee_name) & (dfn["Data"] >= start_date) & (dfn["Data"] <= end_date)
               & (dfn["Azione"].isin(["Inizio fase", "Fine fase"])) & (dfn["Commessa"].astype(str) != "")]
     if dfn.empty:
@@ -5239,7 +5443,8 @@ def compute_commessa_gantt_segments(df, start_date, end_date, employee_name):
                 inizio_ts, fase = coda_inizio.pop(0)
                 if pd.notna(inizio_ts) and pd.notna(riga["Timestamp"]) and riga["Timestamp"] > inizio_ts:
                     righe.append({"Dipendente": employee_name, "Commessa": commessa, "Fase": fase,
-                                  "Data": data_lavoro, "start": inizio_ts, "end": riga["Timestamp"]})
+                                  "Data": data_lavoro, "start": inizio_ts, "end": riga["Timestamp"],
+                                  "Ore": round(indice_pause.ore_nette(employee_name, inizio_ts, riga["Timestamp"]), 4)})
     if not righe:
         return pd.DataFrame(columns=colonne)
     return pd.DataFrame(righe, columns=colonne).sort_values(["Data", "start"]).reset_index(drop=True)
@@ -5256,8 +5461,7 @@ def compute_ore_fasi_per_commessa(df, start_date, end_date, employee_name):
     segmenti = compute_commessa_gantt_segments(df, start_date, end_date, employee_name)
     if segmenti.empty:
         return pd.DataFrame(columns=colonne)
-    segmenti = segmenti.copy()
-    segmenti["Ore"] = (segmenti["end"] - segmenti["start"]).dt.total_seconds() / 3600
+    segmenti = segmenti.copy()  # la colonna Ore dei segmenti è già netta della pausa pranzo
     per_fase = segmenti.groupby(["Commessa", "Fase"], as_index=False)["Ore"].sum()
     per_fase["Ore"] = per_fase["Ore"].round(2)
     totali_commessa = per_fase.groupby("Commessa")["Ore"].sum().sort_values(ascending=False)
@@ -5310,6 +5514,7 @@ def compute_phase_hours_by_employee(df, start_date, end_date, employee_name=None
     df = df[df["Data"].apply(lambda d: start_date <= d <= end_date)]
     if employee_name: df = df[df["Dipendente"] == employee_name]
     if df.empty: return pd.DataFrame(columns=["Dipendente", "Ore_fase"])
+    indice_pause = IndicePauseFasi(df)
     rows = []
     for (user, work_date), group in df.groupby(["Dipendente", "Data"]):
         group = group.sort_values("Timestamp")
@@ -5319,7 +5524,7 @@ def compute_phase_hours_by_employee(df, start_date, end_date, employee_name=None
             elif row["Azione"] == "Fine fase" and fase_queue:
                 start = fase_queue.pop(0)
                 if pd.notna(start) and pd.notna(row["Timestamp"]) and row["Timestamp"] > start:
-                    rows.append({"Dipendente": user, "Ore_fase": (row["Timestamp"] - start).total_seconds() / 3600})
+                    rows.append({"Dipendente": user, "Ore_fase": indice_pause.ore_nette(user, start, row["Timestamp"])})
     if not rows: return pd.DataFrame(columns=["Dipendente", "Ore_fase"])
     return pd.DataFrame(rows).groupby("Dipendente", as_index=False).agg({"Ore_fase": "sum"})
 
@@ -5379,6 +5584,7 @@ def compute_fasi_commessa_ore_effettive(df, start_date, end_date, area_filter=No
         dfn = dfn[dfn["Area"] == area_filter]
     if dfn.empty: return pd.DataFrame(columns=["Commessa", "Fase", "Area", "Ore_effettive"])
 
+    indice_pause = IndicePauseFasi(dfn)
     rows = []
     for (_dip, _date, commessa, fase, area), group in dfn.groupby(["Dipendente", "Data", "Commessa", "Fase", "Area"]):
         if not commessa or not fase: continue
@@ -5389,7 +5595,7 @@ def compute_fasi_commessa_ore_effettive(df, start_date, end_date, area_filter=No
             elif row["Azione"] == "Fine fase" and queue:
                 start = queue.pop(0)
                 if pd.notna(start) and pd.notna(row["Timestamp"]) and row["Timestamp"] > start:
-                    rows.append({"Commessa": commessa, "Fase": fase, "Area": area, "Ore_effettive": (row["Timestamp"] - start).total_seconds() / 3600})
+                    rows.append({"Commessa": commessa, "Fase": fase, "Area": area, "Ore_effettive": indice_pause.ore_nette(_dip, start, row["Timestamp"])})
     if not rows: return pd.DataFrame(columns=["Commessa", "Fase", "Area", "Ore_effettive"])
     return pd.DataFrame(rows).groupby(["Commessa", "Fase", "Area"], as_index=False).agg({"Ore_effettive": "sum"})
 
@@ -5558,6 +5764,8 @@ def render_report_mensile(nome_dipendente, df, key_prefix, mese=None, anno=None)
     st.markdown(f"### Cartellino di {calendar.month_name[mese_sel].capitalize()} {anno_sel}")
     cartellino = compute_cartellino_mensile(df, nome_dipendente, anno_sel, mese_sel, df_requests=richieste_dipendente)
     st.dataframe(cartellino, use_container_width=True)
+    if cartellino["Inizio Pausa"].astype(str).str.contains("(auto)", regex=False).any():
+        st.caption("(auto) = pausa pranzo non timbrata: dedotta in automatico secondo l'orario di pausa abituale impostato in Area Personale.")
 
     totali = compute_totali_cartellino(cartellino, df, nome_dipendente, anno_sel, mese_sel)
     st.markdown("**Totale del mese**")
@@ -5767,7 +5975,7 @@ def render_area_personale(username, key_prefix):
     """Area Personale del dipendente: livello CCNL e data di assunzione (impostati
     dall'amministratore, mostrati come riferimento) più i dati anagrafici che il
     dipendente può inserire o modificare da solo (codice fiscale, data di nascita,
-    distanza casa-lavoro, orario di fine giornata)."""
+    distanza casa-lavoro, orario di fine giornata, pausa pranzo abituale)."""
     st.subheader("🪪 Area Personale")
     dati = get_dati_personali_utente(username)
 
@@ -5788,9 +5996,18 @@ def render_area_personale(username, key_prefix):
         st.caption("L'orario di fine giornata è il tuo turno tipo (a che ora finisci di solito): se un giorno ti dimentichi di timbrare l'Uscita (o di chiudere una fase), il conteggio delle ore su quel giorno si ferma automaticamente a quest'orario invece di restare bloccato o di calcolare ore sbagliate fino alla timbratura successiva.")
         orario_fine_giornata_input = st.time_input("Orario di fine giornata (turno tipo)",
                                                      value=dati["orario_fine_giornata"], key=f"{key_prefix}_ap_orario_fine")
+        pausa_inizio_input = pausa_fine_input = _NON_MODIFICARE
+        if dati["ha_pausa_pranzo"]:
+            st.caption("La pausa pranzo abituale serve quando un giorno non timbri la pausa: in quel caso, dalle ore lavorate viene tolta in automatico la parte di questa fascia che cade nel tuo orario di lavoro. Se timbri la pausa, vale quella timbrata.")
+            col_pp1, col_pp2 = st.columns(2)
+            with col_pp1:
+                pausa_inizio_input = st.time_input("Pausa pranzo abituale: dalle", value=dati["pausa_pranzo_inizio"], key=f"{key_prefix}_ap_pausa_inizio")
+            with col_pp2:
+                pausa_fine_input = st.time_input("Pausa pranzo abituale: alle", value=dati["pausa_pranzo_fine"], key=f"{key_prefix}_ap_pausa_fine")
         if st.form_submit_button("💾 Salva dati personali"):
             ok, errore = aggiorna_dati_personali_utente(username, codice_fiscale_input, data_nascita_input,
-                                                          distanza_km_input, orario_fine_giornata_input)
+                                                          distanza_km_input, orario_fine_giornata_input,
+                                                          pausa_inizio_input, pausa_fine_input)
             if ok:
                 st.success("Dati personali aggiornati.")
                 st.rerun()
