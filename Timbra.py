@@ -535,6 +535,23 @@ def init_db():
                         data_fine_prevista TEXT NOT NULL,
                         PRIMARY KEY (commessa, macro_fase)
                     )''')
+        # Pianificazione PER REPARTO: data di inizio lavori del reparto su una
+        # commessa (se manca vale quella della commessa) e scadenze per macro-fase
+        # del reparto. Le imposta l'admin per qualsiasi reparto, il responsabile
+        # solo per il proprio (vedi render_pianificazione_commessa).
+        c.execute('''CREATE TABLE IF NOT EXISTS pianificazione_reparto (
+                        commessa TEXT NOT NULL,
+                        area TEXT NOT NULL,
+                        data_inizio TEXT NOT NULL,
+                        PRIMARY KEY (commessa, area)
+                    )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS scadenze_macro_fase_reparto (
+                        commessa TEXT NOT NULL,
+                        area TEXT NOT NULL,
+                        macro_fase TEXT NOT NULL,
+                        data_fine_prevista TEXT NOT NULL,
+                        PRIMARY KEY (commessa, area, macro_fase)
+                    )''')
         conn.commit()
 
         # Tabella Template Fasi - fasi/ore standard per tipologia di impianto, riusabili
@@ -1693,6 +1710,59 @@ def imposta_scadenza_macro_fase(commessa, macro_fase, data_fine_prevista):
         conn.commit()
     return True, ""
 
+def _chiave_reparto(area):
+    return (area or "").strip().casefold()
+
+def get_date_inizio_reparti(commessa):
+    """Date di inizio lavori impostate per reparto su questa commessa, come
+    {reparto_normalizzato: 'YYYY-MM-DD'} (chiave in minuscolo e senza spazi
+    superflui, vedi _stesso_reparto). Solo i reparti con una data esplicita."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT area, data_inizio FROM pianificazione_reparto WHERE commessa=?", (commessa,))
+        return {_chiave_reparto(area): data for area, data in c.fetchall()}
+
+def imposta_data_inizio_reparto(commessa, area, data_inizio):
+    """Imposta (o rimuove, passando None/stringa vuota) la data di inizio lavori di un
+    reparto su una commessa. Senza data il reparto parte dalla data di inizio lavori
+    della commessa. Restituisce (ok, messaggio_errore)."""
+    if not commessa or not (area or "").strip():
+        return False, "Commessa e reparto sono obbligatori."
+    area = area.strip()
+    data_inizio = (data_inizio or "").strip()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM pianificazione_reparto WHERE commessa=? AND lower(trim(area))=?", (commessa, _chiave_reparto(area)))
+        if data_inizio:
+            c.execute("INSERT INTO pianificazione_reparto (commessa, area, data_inizio) VALUES (?,?,?)", (commessa, area, data_inizio))
+        conn.commit()
+    return True, ""
+
+def get_scadenze_macro_fase_reparti(commessa):
+    """Scadenze per macro-fase impostate dai reparti su questa commessa, come
+    {(reparto_normalizzato, macro_fase): 'YYYY-MM-DD'}."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT area, macro_fase, data_fine_prevista FROM scadenze_macro_fase_reparto WHERE commessa=?", (commessa,))
+        return {(_chiave_reparto(area), macro_fase): data for area, macro_fase, data in c.fetchall()}
+
+def imposta_scadenza_macro_fase_reparto(commessa, area, macro_fase, data_fine_prevista):
+    """Imposta (o rimuove, passando None/stringa vuota) la scadenza di una macro-fase
+    per un reparto su una commessa. Restituisce (ok, messaggio_errore)."""
+    if not commessa or not (area or "").strip() or not macro_fase:
+        return False, "Commessa, reparto e macro-fase sono obbligatori."
+    area = area.strip()
+    data_fine_prevista = (data_fine_prevista or "").strip()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM scadenze_macro_fase_reparto WHERE commessa=? AND lower(trim(area))=? AND macro_fase=?",
+                  (commessa, _chiave_reparto(area), macro_fase))
+        if data_fine_prevista:
+            c.execute("INSERT INTO scadenze_macro_fase_reparto (commessa, area, macro_fase, data_fine_prevista) VALUES (?,?,?,?)",
+                      (commessa, area, macro_fase, data_fine_prevista))
+        conn.commit()
+    return True, ""
+
 def _aggrega_stati_fasi(stati):
     """Applica a un elenco di stati di fase la regola concordata con Marco per
     calcolare uno stato riassuntivo: Completata se TUTTI gli stati sono Completata;
@@ -1733,6 +1803,9 @@ def elimina_commessa(nome):
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM fasi_commessa WHERE commessa=?", (nome,))
+        c.execute("DELETE FROM scadenze_macro_fase WHERE commessa=?", (nome,))
+        c.execute("DELETE FROM pianificazione_reparto WHERE commessa=?", (nome,))
+        c.execute("DELETE FROM scadenze_macro_fase_reparto WHERE commessa=?", (nome,))
         c.execute("DELETE FROM commesse WHERE nome=?", (nome,))
         conn.commit()
     get_commesse_names.clear()
@@ -2312,10 +2385,12 @@ def compute_gantt_teorico_commessa(commessa):
     non ha ancora fasi."""
     colonne = ["Fase", "Macro-fase", "Area", "Operatore", "Stato", "Inizio", "Fine", "Ore stimate"]
     data_inizio_lavori = get_data_inizio_lavori_commessa(commessa)
-    if not data_inizio_lavori:
-        return pd.DataFrame(columns=colonne), "Imposta prima una data di inizio lavori per questa commessa."
+    inizi_reparto = get_date_inizio_reparti(commessa)
+    if not data_inizio_lavori and not inizi_reparto:
+        return pd.DataFrame(columns=colonne), "Imposta prima una data di inizio lavori per questa commessa (o per almeno un reparto)."
     try:
-        data_inizio_lavori = datetime.date.fromisoformat(str(data_inizio_lavori)[:10])
+        data_inizio_lavori = datetime.date.fromisoformat(str(data_inizio_lavori)[:10]) if data_inizio_lavori else None
+        inizi_reparto = {k: datetime.date.fromisoformat(str(v)[:10]) for k, v in inizi_reparto.items()}
     except ValueError:
         return pd.DataFrame(columns=colonne), "Data di inizio lavori non valida."
     fasi = get_fasi_commessa(commessa)
@@ -2332,7 +2407,11 @@ def compute_gantt_teorico_commessa(commessa):
     righe = []
     for fasi_catena in catene.values():
         fasi_catena.sort(key=lambda r: (ordine_macro_fase.get(r[5], len(MACRO_FASI_DISPONIBILI)), r[0]))
-        cursore = data_inizio_lavori
+        # Il reparto parte dalla sua data di inizio, se l'ha impostata; altrimenti
+        # da quella della commessa. Senza nessuna delle due la catena non si calcola.
+        cursore = inizi_reparto.get(_chiave_reparto(fasi_catena[0][2])) or data_inizio_lavori
+        if cursore is None:
+            continue
         for id_, fase, area_fase, ore, operatore_norm, macro_fase, stato in fasi_catena:
             inizio_eff, fine_eff = _avanza_fase_teorica(cursore, ore, operatore_norm, mappa_assenze, cache_festivita)
             righe.append({
@@ -2345,6 +2424,44 @@ def compute_gantt_teorico_commessa(commessa):
     if df.empty:
         return df, "Questa commessa non ha ancora fasi."
     return df.sort_values(["Inizio", "Macro-fase", "Fase"]).reset_index(drop=True), ""
+
+def reparti_senza_data_inizio(commessa):
+    """Reparti con fasi su questa commessa che NON compaiono nel Gantt teorico perché
+    non hanno una data di inizio propria e la commessa non ne ha una."""
+    if get_data_inizio_lavori_commessa(commessa):
+        return []
+    inizi = get_date_inizio_reparti(commessa)
+    return sorted({row[2] for row in get_fasi_commessa(commessa) if _chiave_reparto(row[2]) not in inizi})
+
+def confronta_scadenze_reparti(gantt_teorico, scadenze_reparti):
+    """Per ogni scadenza di reparto (vedi get_scadenze_macro_fase_reparti) confronta la
+    data prevista con la fine teorica delle fasi di quel reparto e macro-fase:
+    [Reparto, Macro-fase, Scadenza, Fine teorica, Esito]. Esito 'In linea' se la fine
+    teorica non supera la scadenza, altrimenti 'In ritardo di N giorni'; 'n.d.' se il
+    Gantt teorico non ha fasi per quella combinazione."""
+    colonne = ["Reparto", "Macro-fase", "Scadenza", "Fine teorica", "Esito"]
+    righe = []
+    for (area_norm, macro_fase), scadenza in sorted(scadenze_reparti.items()):
+        try:
+            scad = datetime.date.fromisoformat(str(scadenza)[:10])
+        except ValueError:
+            continue
+        nome_area, fine_teorica = area_norm, None
+        if gantt_teorico is not None and not gantt_teorico.empty:
+            sel = gantt_teorico[(gantt_teorico["Area"].map(_chiave_reparto) == area_norm)
+                                & (gantt_teorico["Macro-fase"] == macro_fase)]
+            if not sel.empty:
+                nome_area = sel.iloc[0]["Area"]
+                fine_teorica = max(sel["Fine"])
+        if fine_teorica is None:
+            esito = "n.d."
+        elif fine_teorica <= scad:
+            esito = "In linea"
+        else:
+            esito = f"In ritardo di {(fine_teorica - scad).days} giorni"
+        righe.append({"Reparto": nome_area, "Macro-fase": macro_fase, "Scadenza": scad,
+                      "Fine teorica": fine_teorica if fine_teorica is not None else "-", "Esito": esito})
+    return pd.DataFrame(righe, columns=colonne)
 
 def compute_gantt_effettivo_commessa(commessa, df):
     """Gantt effettivo di una commessa: per ogni fase su cui è stata registrata almeno
@@ -2531,7 +2648,9 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
         st.info("Nessuna commessa ancora creata." if not allow_create_commessa else "Crea prima una commessa qui sopra.")
         return
 
-    commessa_sel = st.selectbox("Commessa", options=commesse, key="fase_commessa_select")
+    commessa_sel = selettore_commessa_filtrato("fase_commessa", key_commessa="fase_commessa_select")
+    if not commessa_sel:
+        return
     mostra_info_commessa(commessa_sel)
 
     mappa_macro_reparto = get_mappa_macro_fase_reparto()
@@ -3040,6 +3159,128 @@ def selettore_commessa_con_filtro_cliente(commesse, etichetta_commessa, key_pref
     return st.selectbox(etichetta_commessa, commesse_filtrate,
                         format_func=lambda c: f"{c} — {mappa_cliente[c]}" if mappa_cliente.get(c) else c,
                         key=f"{key_prefix_widget}_commessa")
+
+OPZIONE_TUTTI = "Tutti"
+
+def filtra_commesse_dettaglio(dettaglio, testo="", cliente=None, anno=None, stato=None, priorita=None, tipologia=None):
+    """Nomi delle commesse (stesso ordine di 'dettaglio', vedi get_commesse_dettaglio)
+    che rispettano TUTTI i filtri indicati. Un filtro vuoto o OPZIONE_TUTTI non
+    limita nulla. 'testo' cerca (senza distinguere maiuscole) dentro nome e cliente;
+    cliente accetta anche OPZIONE_SENZA_CLIENTE."""
+    if dettaglio is None or dettaglio.empty:
+        return []
+    d = dettaglio
+    mask = pd.Series(True, index=d.index)
+    testo = (testo or "").strip().casefold()
+    if testo:
+        mask &= d.apply(lambda r: testo in f"{r['Nome']} {r['Cliente'] or ''}".casefold(), axis=1)
+    clienti = d["Cliente"].fillna("").astype(str).str.strip()
+    if cliente and cliente not in (OPZIONE_TUTTI, OPZIONE_TUTTI_I_CLIENTI):
+        mask &= (clienti == "") if cliente == OPZIONE_SENZA_CLIENTE else (clienti == cliente)
+    if anno and anno != OPZIONE_TUTTI:
+        mask &= d["Anno produzione"].map(lambda a: "" if pd.isna(a) else str(int(a))) == str(anno)
+    if stato and stato != OPZIONE_TUTTI:
+        mask &= d["Stato"].fillna("").astype(str) == stato
+    if priorita and priorita != OPZIONE_TUTTI:
+        mask &= d["Priorità"].fillna("").astype(str) == priorita
+    if tipologia and tipologia != OPZIONE_TUTTI:
+        mask &= d["Tipologia impianto"].fillna("").astype(str).str.strip() == tipologia
+    return list(d.loc[mask, "Nome"])
+
+def selettore_commessa_filtrato(key_prefix, key_commessa, etichetta="Commessa", opzioni_extra=()):
+    """Tendina Commessa preceduta da filtri (ricerca libera su nome/cliente, Cliente,
+    Anno di produzione, Stato, Priorità, Tipologia impianto) per ritrovare in fretta
+    una commessa quando ce ne sono molte. Le voci mostrano 'nome — cliente'.
+    opzioni_extra (es. 'Tutte le commesse') compaiono sempre in testa alla tendina,
+    qualunque filtro sia attivo. Restituisce la voce scelta, oppure None se non resta
+    nessuna commessa (e nessuna opzione extra)."""
+    dettaglio = get_commesse_dettaglio()
+    if dettaglio is None or dettaglio.empty:
+        return opzioni_extra[0] if opzioni_extra else None
+    anni = sorted({str(int(a)) for a in dettaglio["Anno produzione"].dropna()}, reverse=True)
+    clienti = clienti_delle_commesse(list(dettaglio["Nome"]), dict(zip(dettaglio["Nome"], dettaglio["Cliente"].fillna("").astype(str).str.strip())))
+    stati = [x for x in STATI_COMMESSA_DISPONIBILI if x in set(dettaglio["Stato"].fillna(""))]
+    priorita_presenti = [x for x in PRIORITA_COMMESSA_DISPONIBILI if x in set(dettaglio["Priorità"].fillna(""))]
+    tipologie = sorted({str(t).strip() for t in dettaglio["Tipologia impianto"].dropna() if str(t).strip()}, key=str.lower)
+    st.markdown("🔎 **Filtra le commesse**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        testo = st.text_input("Cerca (nome o cliente)", key=f"{key_prefix}_f_testo")
+    with c2:
+        cliente = st.selectbox("🏢 Cliente", [OPZIONE_TUTTI] + clienti, key=f"{key_prefix}_f_cliente")
+    with c3:
+        anno = st.selectbox("📅 Anno produzione", [OPZIONE_TUTTI] + anni, key=f"{key_prefix}_f_anno")
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        stato = st.selectbox("Stato", [OPZIONE_TUTTI] + stati, key=f"{key_prefix}_f_stato")
+    with c5:
+        priorita = st.selectbox("Priorità", [OPZIONE_TUTTI] + priorita_presenti, key=f"{key_prefix}_f_priorita")
+    with c6:
+        tipologia = st.selectbox("Tipologia impianto", [OPZIONE_TUTTI] + tipologie, key=f"{key_prefix}_f_tipologia")
+    nomi = filtra_commesse_dettaglio(dettaglio, testo, cliente, anno, stato, priorita, tipologia)
+    if not nomi and not opzioni_extra:
+        st.warning("Nessuna commessa corrisponde ai filtri selezionati.")
+        return None
+    if not nomi:
+        st.warning("Nessuna commessa corrisponde ai filtri selezionati.")
+    elif len(nomi) < len(dettaglio):
+        st.caption(f"{len(nomi)} commesse su {len(dettaglio)} corrispondono ai filtri.")
+    mappa_cliente = dict(zip(dettaglio["Nome"], dettaglio["Cliente"].fillna("").astype(str).str.strip()))
+    return st.selectbox(etichetta, list(opzioni_extra) + nomi,
+                        format_func=lambda c: f"{c} — {mappa_cliente[c]}" if mappa_cliente.get(c) else c,
+                        key=key_commessa)
+
+LUOGHI_LAVORO = ["Vimek", "Smart", "Trasferta"]
+
+def get_luogo_corrente_timbratura(nome_dipendente):
+    """Modalità di lavoro (luogo, dove_trasferta) da proporre per la PROSSIMA
+    timbratura, più una 'firma' che cambia a ogni nuova timbratura. Si ricava
+    dall'ultima timbratura del dipendente, se è di oggi oppure appartiene a un turno
+    ancora aperto (anche a cavallo della mezzanotte, con la stessa soglia di
+    get_last_timbratura): così Uscita, pause e fasi restano nella modalità scelta
+    all'Ingresso per tutta la giornata, anche se la pagina viene ricaricata o la
+    sessione riparte (prima il selettore tornava a 'Vimek' e l'Uscita di una
+    trasferta veniva registrata come 'Vimek'). Senza timbrature recenti: 'Vimek'."""
+    predefinito = ("Vimek", "", "nessuna")
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT id, Azione, Data, Ora, Luogo, Dettaglio_Trasferta FROM timbrature
+                     WHERE Dipendente = ?
+                     ORDER BY Data DESC, Ora DESC, id DESC
+                     LIMIT 1""", (nome_dipendente,))
+        row = c.fetchone()
+    if not row:
+        return predefinito
+    id_, azione, data_str, ora_str, luogo, dettaglio = row
+    ts = _parse_timbratura_timestamp(data_str, ora_str)
+    if ts is None:
+        return predefinito
+    adesso = get_current_datetime()
+    turno_aperto = azione != "Uscita" and (adesso - ts).total_seconds() / 3600 <= TIMBRATURA_STALE_HOURS
+    if ts.date() != adesso.date() and not turno_aperto:
+        return predefinito
+    luogo = str(luogo or "").strip()
+    if luogo not in LUOGHI_LAVORO:
+        return predefinito
+    dove = ""
+    if luogo == "Trasferta" and dettaglio is not None and str(dettaglio).strip() not in ("", "-", "nan", "None"):
+        dove = str(dettaglio).strip()
+    return luogo, dove, str(id_)
+
+def render_selettore_luogo(nome_dipendente, key_prefix):
+    """Selettore 'Modalità di lavoro' (+ 'Dove?' per la trasferta) delle pagine
+    Timbrature. All'inizio e dopo ogni timbratura si riallinea all'ultima modalità
+    usata (vedi get_luogo_corrente_timbratura); in mezzo, la scelta dell'utente non
+    viene toccata. Restituisce (luogo, dove_trasferta)."""
+    luogo_pred, dove_pred, firma = get_luogo_corrente_timbratura(nome_dipendente)
+    k_luogo, k_dove, k_firma = f"{key_prefix}_luogo_lavoro", f"{key_prefix}_luogo_dove", f"{key_prefix}_luogo_firma"
+    if st.session_state.get(k_firma) != firma:
+        st.session_state[k_luogo] = luogo_pred
+        st.session_state[k_dove] = dove_pred
+        st.session_state[k_firma] = firma
+    luogo = st.radio("Modalità di lavoro:", LUOGHI_LAVORO, horizontal=True, key=k_luogo)
+    dove = st.text_input("📍 Dove?", key=k_dove) if luogo == "Trasferta" else ""
+    return luogo, dove
 
 def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, key_prefix):
     """Blocco '🧩 Fase Lavorativa' della pagina Timbrature, condiviso tra la vista
@@ -4751,7 +4992,70 @@ def render_statistiche_assistenza(df, key_prefix):
     st.markdown("**Dettaglio interventi**")
     st.dataframe(sessioni, use_container_width=True)
 
-def render_pianificazione_commessa(df, key_prefix, puo_modificare=False):
+def render_pianificazione_per_reparto(commessa, key_prefix, reparti_modificabili):
+    """Sezione 'Pianificazione per reparto' di una commessa: per ogni reparto con fasi
+    su di essa, la data di inizio lavori del reparto e le scadenze per macro-fase.
+    Tutti le vedono; le modifica solo chi ha il reparto in reparti_modificabili
+    (admin: tutti; responsabile: solo il proprio)."""
+    st.markdown("---")
+    st.markdown("**🏢 Pianificazione per reparto**")
+    st.caption("Ogni reparto può avere una propria data di inizio lavori (se vuota vale quella della commessa) e proprie scadenze per macro-fase. La data di inizio del reparto guida il Gantt teorico delle sue fasi.")
+    fasi = get_fasi_commessa(commessa)
+    reparti = {}
+    for _id, _fase, area, _ore, _op, macro_fase, _stato in fasi:
+        reparti.setdefault(_chiave_reparto(area), {"nome": (area or "").strip(), "macro": set()})["macro"].add(macro_fase or "Altro")
+    if not reparti:
+        st.info("Questa commessa non ha ancora fasi.")
+        return
+    chiavi_modificabili = {_chiave_reparto(a) for a in (reparti_modificabili or [])}
+    inizi = get_date_inizio_reparti(commessa)
+    scadenze = get_scadenze_macro_fase_reparti(commessa)
+    for chiave, info in sorted(reparti.items(), key=lambda kv: kv[1]["nome"].casefold()):
+        nome = info["nome"]
+        modificabile = chiave in chiavi_modificabili
+        with st.expander(f"{nome}" + (" ✏️" if modificabile else ""), expanded=modificabile):
+            inizio_attuale = inizi.get(chiave)
+            if modificabile:
+                col_d, col_b = st.columns([3, 1])
+                with col_d:
+                    nuovo_inizio = st.date_input(
+                        "Data di inizio lavori del reparto (vuota = quella della commessa)",
+                        value=datetime.date.fromisoformat(inizio_attuale) if inizio_attuale else None,
+                        key=f"{key_prefix}_rep_inizio_{commessa}_{chiave}")
+                with col_b:
+                    if st.button("💾 Salva", key=f"{key_prefix}_rep_btn_inizio_{commessa}_{chiave}"):
+                        ok, errore = imposta_data_inizio_reparto(commessa, nome, nuovo_inizio.isoformat() if nuovo_inizio else "")
+                        if ok:
+                            st.success("Data di inizio del reparto aggiornata.")
+                            st.rerun()
+                        else:
+                            st.error(errore)
+                for macro_fase in sorted(info["macro"]):
+                    valore = scadenze.get((chiave, macro_fase), "")
+                    c_nome, c_data, c_az = st.columns([2, 2, 1])
+                    with c_nome:
+                        st.write(macro_fase)
+                    with c_data:
+                        nuova_scad = st.date_input("Scadenza", value=datetime.date.fromisoformat(valore) if valore else None,
+                                                   key=f"{key_prefix}_rep_scad_{commessa}_{chiave}_{macro_fase}")
+                    with c_az:
+                        if st.button("💾", key=f"{key_prefix}_rep_btn_scad_{commessa}_{chiave}_{macro_fase}"):
+                            ok, errore = imposta_scadenza_macro_fase_reparto(commessa, nome, macro_fase, nuova_scad.isoformat() if nuova_scad else "")
+                            if ok:
+                                st.success(f"Scadenza di '{macro_fase}' aggiornata.")
+                                st.rerun()
+                            else:
+                                st.error(errore)
+            else:
+                st.write(f"Data di inizio lavori del reparto: **{inizio_attuale or 'quella della commessa'}**")
+                righe = [{"Macro-fase": mf, "Scadenza prevista": scadenze[(chiave, mf)]}
+                         for mf in sorted(info["macro"]) if (chiave, mf) in scadenze]
+                if righe:
+                    st.dataframe(pd.DataFrame(righe), use_container_width=True)
+                else:
+                    st.caption("Nessuna scadenza impostata per questo reparto.")
+
+def render_pianificazione_commessa(df, key_prefix, puo_modificare=False, reparti_modificabili=None):
     """Pagina 'Pianificazione' (Gantt): visibile a TUTTI (admin, responsabile, utente
     semplice) per qualsiasi commessa, con due Gantt - teorico (calcolato da zero, vedi
     compute_gantt_teorico_commessa) ed effettivo (dalle timbrature reali, vedi
@@ -4762,7 +5066,10 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False):
     La tendina Commessa include anche 'Tutte le commesse (vista d'insieme)' - prima
     mancava, segnalato da Marco - che mostra un Gantt con un intervallo per commessa
     (non fase per fase, vedi compute_gantt_teorico_tutte_commesse/
-    compute_gantt_effettivo_tutte_commesse), sola consultazione per tutti."""
+    compute_gantt_effettivo_tutte_commesse), sola consultazione per tutti.
+    La sezione 'Pianificazione per reparto' (data di inizio e scadenze di ciascun
+    reparto) è modificabile dall'admin per tutti i reparti (puo_modificare) e da un
+    responsabile solo per il proprio (reparti_modificabili=[suo reparto])."""
     st.subheader("📅 Pianificazione commessa (Gantt)")
     commesse_disponibili = get_commesse_names()
     if not commesse_disponibili:
@@ -4770,7 +5077,8 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False):
         return
 
     OPZIONE_TUTTE_LE_COMMESSE = "📊 Tutte le commesse (vista d'insieme)"
-    commessa_scelta = st.selectbox("Commessa", options=[OPZIONE_TUTTE_LE_COMMESSE] + commesse_disponibili, key=f"{key_prefix}_pianificazione_commessa")
+    commessa_scelta = selettore_commessa_filtrato(f"{key_prefix}_pianificazione", key_commessa=f"{key_prefix}_pianificazione_commessa",
+                                                   opzioni_extra=(OPZIONE_TUTTE_LE_COMMESSE,))
 
     if commessa_scelta == OPZIONE_TUTTE_LE_COMMESSE:
         # Vista d'insieme richiesta da Marco ("non è possibile visualizzare il
@@ -4863,10 +5171,19 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False):
     else:
         st.info("Nessuna scadenza impostata per questa commessa.")
 
+    if puo_modificare:
+        reparti_da_modificare = sorted({(row[2] or "").strip() for row in get_fasi_commessa(commessa_scelta)})
+    else:
+        reparti_da_modificare = list(reparti_modificabili or [])
+    render_pianificazione_per_reparto(commessa_scelta, key_prefix, reparti_da_modificare)
+
     st.markdown("---")
     st.markdown("**📐 Gantt teorico**")
-    st.caption("Calcolato dalla data di inizio lavori e dalle ore stimate di ogni fase (8 ore/giorno per l'operatore assegnato), saltando sabati, domeniche, festività italiane e le ferie/permessi già approvati dell'operatore.")
+    st.caption("Calcolato dalla data di inizio lavori (del reparto, se impostata, altrimenti della commessa) e dalle ore stimate di ogni fase (8 ore/giorno per l'operatore assegnato), saltando sabati, domeniche, festività italiane e le ferie/permessi già approvati dell'operatore.")
     gantt_teorico, messaggio_teorico = compute_gantt_teorico_commessa(commessa_scelta)
+    reparti_esclusi = reparti_senza_data_inizio(commessa_scelta) if not gantt_teorico.empty else []
+    if reparti_esclusi:
+        st.warning("Non compaiono nel Gantt teorico, perché senza data di inizio (né propria né della commessa): " + ", ".join(reparti_esclusi) + ".")
     if messaggio_teorico:
         st.info(messaggio_teorico)
     else:
@@ -4880,6 +5197,10 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False):
         ).properties(height=32 * len(gantt_teorico_chart) + 80)
         st.altair_chart(chart_teorico, use_container_width=True)
         st.dataframe(gantt_teorico, use_container_width=True)
+        confronto = confronta_scadenze_reparti(gantt_teorico, get_scadenze_macro_fase_reparti(commessa_scelta))
+        if not confronto.empty:
+            st.markdown("**Scadenze dei reparti a confronto con il Gantt teorico**")
+            st.dataframe(confronto, use_container_width=True)
 
     st.markdown("---")
     st.markdown("**✅ Gantt effettivo**")
@@ -6753,8 +7074,7 @@ else:
                     
             elif pagina_utente == "Timbrature":
                 st.subheader(f"Area Timbratura: {dipendente_scelto}")
-                luogo_scelto = st.radio("Modalità di lavoro:", ["Vimek", "Smart", "Trasferta"], horizontal=True)
-                dove_trasferta = st.text_input("📍 Dove?") if luogo_scelto == "Trasferta" else ""
+                luogo_scelto, dove_trasferta = render_selettore_luogo(dipendente_scelto, "resp_timbra")
 
                 # Verifica stato dell'ultima timbratura per disabilitare pulsanti illogici
                 last_action = get_last_timbratura(dipendente_scelto)
@@ -7013,7 +7333,8 @@ else:
                 render_disponibilita_team(area_default=area_responsabile, forza_area=True, key_prefix="resp")
 
             elif resp_page == "📅 Pianificazione":
-                render_pianificazione_commessa(df, key_prefix="resp_pianificazione", puo_modificare=False)
+                render_pianificazione_commessa(df, key_prefix="resp_pianificazione", puo_modificare=False,
+                                               reparti_modificabili=[area_responsabile])
 
         elif modalita == "🧳 Trasferte Service":
             st.session_state["_ultima_pagina_vista"] = "🧳 Trasferte Service"
@@ -7093,8 +7414,7 @@ else:
 
         elif pagina_utente == "Timbrature":
             st.subheader(f"Area Timbratura: {dipendente_scelto}")
-            luogo_scelto = st.radio("Modalità di lavoro:", ["Vimek", "Smart", "Trasferta"], horizontal=True)
-            dove_trasferta = st.text_input("📍 Dove?") if luogo_scelto == "Trasferta" else ""
+            luogo_scelto, dove_trasferta = render_selettore_luogo(dipendente_scelto, "utente_timbra")
 
             # Verifica stato dell'ultima timbratura per disabilitare pulsanti illogici
             last_action = get_last_timbratura(dipendente_scelto)
