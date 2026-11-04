@@ -2562,7 +2562,29 @@ def _avanza_fase_teorica(data_inizio, ore_da_coprire, dipendente, mappa_assenze,
         ultimo_giorno_lavorato = data_inizio_effettiva
     return data_inizio_effettiva, ultimo_giorno_lavorato
 
-def compute_gantt_teorico_commessa(commessa):
+def _carica_dati_pianificazione_tutte_le_commesse():
+    """Date di inizio lavori, date di inizio per reparto e fasi di TUTTE le commesse in
+    sole 3 query, per i Gantt d'insieme: prima ogni commessa faceva le sue query una
+    per una (con un database remoto come Turso ogni query è un viaggio in rete, quindi
+    con molte commesse il Gantt d'insieme impiegava decine di secondi). Restituisce
+    (inizi_lavori, inizi_reparto, fasi): {commessa: data}, {commessa: {reparto: data}},
+    {commessa: [fasi]} con le stesse strutture di get_data_inizio_lavori_commessa,
+    get_date_inizio_reparti e get_fasi_commessa."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, data_inizio_lavori FROM commesse")
+        inizi_lavori = {nome: data for nome, data in c.fetchall() if data}
+        c.execute("SELECT commessa, area, data_inizio FROM pianificazione_reparto")
+        inizi_reparto = {}
+        for commessa, area, data in c.fetchall():
+            inizi_reparto.setdefault(commessa, {})[_chiave_reparto(area)] = data
+        c.execute("SELECT commessa, id, fase, area, ore_stimate, operatore_assegnato, macro_fase, stato FROM fasi_commessa ORDER BY commessa, area, fase")
+        fasi = {}
+        for commessa, id_, fase, area_, ore, operatore, macro_fase, stato in c.fetchall():
+            fasi.setdefault(commessa, []).append((id_, fase, area_, ore, operatore or "", macro_fase or "", stato or "Da iniziare"))
+    return inizi_lavori, inizi_reparto, fasi
+
+def compute_gantt_teorico_commessa(commessa, dati_precaricati=None, mappa_assenze=None):
     """Gantt teorico di una commessa: per ogni fase, la finestra Inizio-Fine prevista
     calcolata da zero (non da dati reali). Le fasi assegnate allo stesso operatore si
     susseguono nell'ordine di MACRO_FASI_DISPONIBILI (poi di creazione): fasi di
@@ -2571,10 +2593,16 @@ def compute_gantt_teorico_commessa(commessa):
     volta, una "catena" per reparto (non potendo sapere chi le farà, si assume che sul
     reparto lavori una persona alla volta su queste). Restituisce (df, messaggio): df è
     vuoto con un messaggio esplicativo se manca la data di inizio lavori o la commessa
-    non ha ancora fasi."""
+    non ha ancora fasi. dati_precaricati (uso interno dei Gantt d'insieme) è l'esito di
+    _carica_dati_pianificazione_tutte_le_commesse(): evita le query per singola commessa."""
     colonne = ["Fase", "Macro-fase", "Area", "Operatore", "Stato", "Inizio", "Fine", "Ore stimate"]
-    data_inizio_lavori = get_data_inizio_lavori_commessa(commessa)
-    inizi_reparto = get_date_inizio_reparti(commessa)
+    if dati_precaricati is not None:
+        tutti_inizi_lavori, tutti_inizi_reparto, tutte_fasi = dati_precaricati
+        data_inizio_lavori = tutti_inizi_lavori.get(commessa)
+        inizi_reparto = dict(tutti_inizi_reparto.get(commessa, {}))
+    else:
+        data_inizio_lavori = get_data_inizio_lavori_commessa(commessa)
+        inizi_reparto = get_date_inizio_reparti(commessa)
     if not data_inizio_lavori and not inizi_reparto:
         return pd.DataFrame(columns=colonne), "Imposta prima una data di inizio lavori per questa commessa (o per almeno un reparto)."
     try:
@@ -2582,7 +2610,7 @@ def compute_gantt_teorico_commessa(commessa):
         inizi_reparto = {k: datetime.date.fromisoformat(str(v)[:10]) for k, v in inizi_reparto.items()}
     except ValueError:
         return pd.DataFrame(columns=colonne), "Data di inizio lavori non valida."
-    fasi = get_fasi_commessa(commessa)
+    fasi = tutte_fasi.get(commessa, []) if dati_precaricati is not None else get_fasi_commessa(commessa)
     if not fasi:
         return pd.DataFrame(columns=colonne), "Questa commessa non ha ancora fasi."
     ordine_macro_fase = {mf: i for i, mf in enumerate(MACRO_FASI_DISPONIBILI)}
@@ -2591,7 +2619,8 @@ def compute_gantt_teorico_commessa(commessa):
         operatore_norm = (operatore or "").strip()
         chiave_catena = (area, operatore_norm) if operatore_norm else (area, "__non_assegnato__")
         catene.setdefault(chiave_catena, []).append((id_, fase, area, ore, operatore_norm, macro_fase, stato))
-    mappa_assenze = get_mappa_assenze_approvate()
+    if mappa_assenze is None:
+        mappa_assenze = get_mappa_assenze_approvate()
     cache_festivita = {}
     righe = []
     for fasi_catena in catene.values():
@@ -2652,24 +2681,33 @@ def confronta_scadenze_reparti(gantt_teorico, scadenze_reparti):
                       "Fine teorica": fine_teorica if fine_teorica is not None else "-", "Esito": esito})
     return pd.DataFrame(righe, columns=colonne)
 
-def compute_gantt_effettivo_commessa(commessa, df):
+def compute_gantt_effettivo_commessa(commessa, df, df_normalizzato=None, fasi=None):
     """Gantt effettivo di una commessa: per ogni fase su cui è stata registrata almeno
     una timbratura 'Inizio fase', la finestra dal primo giorno lavorato all'ultimo
     (preso direttamente dalle timbrature reali: qui le ore lavorate in un giorno
     possono anche superare le 8, a differenza del Gantt teorico). Una fase il cui stato
     non è 'Completata' viene mostrata come ancora in corso, con la finestra estesa fino
-    a oggi. Le fasi non ancora iniziate non compaiono."""
+    a oggi. Le fasi non ancora iniziate non compaiono.
+    df_normalizzato e fasi (uso interno dei Gantt d'insieme) sono le timbrature già
+    normalizzate con normalize_datetime e le fasi già caricate: evitano di rielaborare
+    tutto lo storico e di rifare le query per ogni commessa."""
     colonne = ["Fase", "Macro-fase", "Area", "Operatore", "Stato", "Inizio", "Fine", "In corso", "Ore stimate"]
     if not commessa:
         return pd.DataFrame(columns=colonne)
-    fasi = get_fasi_commessa(commessa)
+    if fasi is None:
+        fasi = get_fasi_commessa(commessa)
     if not fasi:
         return pd.DataFrame(columns=colonne)
     info_fasi = {fase: (area, ore, (operatore or "").strip(), macro_fase or "Altro", stato)
                  for _id, fase, area, ore, operatore, macro_fase, stato in fasi}
-    if df is None or df.empty:
-        return pd.DataFrame(columns=colonne)
-    dfn = normalize_datetime(df)
+    if df_normalizzato is not None:
+        dfn = df_normalizzato
+        if dfn.empty:
+            return pd.DataFrame(columns=colonne)
+    else:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=colonne)
+        dfn = normalize_datetime(df)
     dfn = dfn[(dfn["Commessa"] == commessa) & (dfn["Azione"].isin(["Inizio fase", "Fine fase"]))]
     dfn_inizio = dfn[dfn["Azione"] == "Inizio fase"]
     dfn_fine = dfn[dfn["Azione"] == "Fine fase"]
@@ -2713,8 +2751,10 @@ def compute_gantt_teorico_tutte_commesse():
     mappa_stato = dict(zip(dettaglio["Nome"], dettaglio["Stato"])) if not dettaglio.empty else {}
     mappa_cliente = dict(zip(dettaglio["Nome"], dettaglio["Cliente"])) if not dettaglio.empty else {}
     righe = []
+    dati_precaricati = _carica_dati_pianificazione_tutte_le_commesse()
+    mappa_assenze = get_mappa_assenze_approvate()
     for commessa in get_commesse_names():
-        gantt, _ = compute_gantt_teorico_commessa(commessa)
+        gantt, _ = compute_gantt_teorico_commessa(commessa, dati_precaricati, mappa_assenze)
         if gantt.empty:
             continue
         righe.append({
@@ -2740,8 +2780,19 @@ def compute_gantt_effettivo_tutte_commesse(df):
     mappa_stato = dict(zip(dettaglio["Nome"], dettaglio["Stato"])) if not dettaglio.empty else {}
     mappa_cliente = dict(zip(dettaglio["Nome"], dettaglio["Cliente"])) if not dettaglio.empty else {}
     righe = []
+    # Normalizzazione delle timbrature fatta UNA volta sola (prima veniva rifatta su
+    # tutto lo storico per ogni commessa) e fasi caricate in blocco.
+    _, _, tutte_fasi = _carica_dati_pianificazione_tutte_le_commesse()
+    per_commessa = {}
+    if df is not None and not df.empty:
+        dfn_tutto = normalize_datetime(df)
+        dfn_tutto = dfn_tutto[dfn_tutto["Azione"].isin(["Inizio fase", "Fine fase"])]
+        per_commessa = {nome: g for nome, g in dfn_tutto.groupby("Commessa")}
     for commessa in get_commesse_names():
-        gantt = compute_gantt_effettivo_commessa(commessa, df)
+        if commessa not in per_commessa:
+            continue
+        gantt = compute_gantt_effettivo_commessa(commessa, df, df_normalizzato=per_commessa[commessa],
+                                                 fasi=tutte_fasi.get(commessa, []))
         if gantt.empty:
             continue
         righe.append({
@@ -3383,16 +3434,22 @@ def filtra_commesse_dettaglio(dettaglio, testo="", cliente=None, anno=None, stat
         mask &= d["Tipologia impianto"].fillna("").astype(str).str.strip() == tipologia
     return list(d.loc[mask, "Nome"])
 
-def selettore_commessa_filtrato(key_prefix, key_commessa, etichetta="Commessa", opzioni_extra=()):
+def selettore_commessa_filtrato(key_prefix, key_commessa, etichetta="Commessa", opzioni_extra=(), restituisci_nomi=False):
     """Tendina Commessa preceduta da filtri (ricerca libera su nome/cliente, Cliente,
     Anno di produzione, Stato, Priorità, Tipologia impianto) per ritrovare in fretta
     una commessa quando ce ne sono molte. Le voci mostrano 'nome — cliente'.
     opzioni_extra (es. 'Tutte le commesse') compaiono sempre in testa alla tendina,
     qualunque filtro sia attivo. Restituisce la voce scelta, oppure None se non resta
-    nessuna commessa (e nessuna opzione extra)."""
+    nessuna commessa (e nessuna opzione extra).
+    Con restituisci_nomi=True restituisce invece la coppia (voce scelta, nomi): 'nomi'
+    è la lista delle commesse che rispettano i filtri attivi, oppure None quando nessun
+    filtro restringe l'elenco. Serve a chi, scegliendo un'opzione extra come 'Tutte le
+    commesse', vuole comunque limitarsi alle commesse filtrate (es. di un cliente)."""
+    def _esito(scelta, nomi_filtrati):
+        return (scelta, nomi_filtrati) if restituisci_nomi else scelta
     dettaglio = get_commesse_dettaglio()
     if dettaglio is None or dettaglio.empty:
-        return opzioni_extra[0] if opzioni_extra else None
+        return _esito(opzioni_extra[0] if opzioni_extra else None, None)
     anni = sorted({str(int(a)) for a in dettaglio["Anno produzione"].dropna()}, reverse=True)
     clienti = clienti_delle_commesse(list(dettaglio["Nome"]), dict(zip(dettaglio["Nome"], dettaglio["Cliente"].fillna("").astype(str).str.strip())))
     stati = [x for x in STATI_COMMESSA_DISPONIBILI if x in set(dettaglio["Stato"].fillna(""))]
@@ -3414,17 +3471,43 @@ def selettore_commessa_filtrato(key_prefix, key_commessa, etichetta="Commessa", 
     with c6:
         tipologia = st.selectbox("Tipologia impianto", [OPZIONE_TUTTI] + tipologie, key=f"{key_prefix}_f_tipologia")
     nomi = filtra_commesse_dettaglio(dettaglio, testo, cliente, anno, stato, priorita, tipologia)
+    nomi_attivi = nomi if len(nomi) < len(dettaglio) else None
     if not nomi and not opzioni_extra:
         st.warning("Nessuna commessa corrisponde ai filtri selezionati.")
-        return None
+        return _esito(None, nomi_attivi)
     if not nomi:
         st.warning("Nessuna commessa corrisponde ai filtri selezionati.")
     elif len(nomi) < len(dettaglio):
         st.caption(f"{len(nomi)} commesse su {len(dettaglio)} corrispondono ai filtri.")
     mappa_cliente = dict(zip(dettaglio["Nome"], dettaglio["Cliente"].fillna("").astype(str).str.strip()))
-    return st.selectbox(etichetta, list(opzioni_extra) + nomi,
-                        format_func=lambda c: f"{c} — {mappa_cliente[c]}" if mappa_cliente.get(c) else c,
-                        key=key_commessa)
+    scelta = st.selectbox(etichetta, list(opzioni_extra) + nomi,
+                          format_func=lambda c: f"{c} — {mappa_cliente[c]}" if mappa_cliente.get(c) else c,
+                          key=key_commessa)
+    return _esito(scelta, nomi_attivi)
+
+def produttivita_commesse_filtrata(df, start, end, area_filter, scelta, nomi_filtrati):
+    """compute_produttivita_commesse limitato alla commessa scelta oppure, con 'Tutte le
+    commesse', alle commesse che rispettano i filtri del selettore (es. di un cliente).
+    Restituisce (tabella, filtrata): 'filtrata' è True se l'elenco è stato ristretto dai
+    filtri, per scegliere il messaggio giusto quando la tabella è vuota."""
+    filtro_nome, solo_commesse = commesse_da_considerare(scelta, nomi_filtrati)
+    tabella = compute_produttivita_commesse(df, start, end, area_filter=area_filter, commessa_filter=filtro_nome)
+    if solo_commesse is not None and not tabella.empty:
+        tabella = tabella[tabella["Commessa"].isin(solo_commesse)]
+    return tabella, solo_commesse is not None
+
+def commesse_da_considerare(scelta, nomi_filtrati, opzioni_extra=("Tutte le commesse",)):
+    """Dato l'esito di selettore_commessa_filtrato(restituisci_nomi=True), restituisce
+    (commessa_filter, elenco_commesse): commessa_filter va passato a
+    compute_produttivita_commesse (None = nessun limite per nome), elenco_commesse è la
+    lista di commesse a cui limitare ulteriormente i risultati (None = nessun limite).
+    Con una commessa precisa si usa solo quella; con 'Tutte le commesse' si usano le
+    commesse che rispettano i filtri (es. tutte quelle di un cliente)."""
+    if scelta is None:
+        return None, []
+    if scelta in opzioni_extra:
+        return None, (list(nomi_filtrati) if nomi_filtrati is not None else None)
+    return scelta, None
 
 LUOGHI_LAVORO = ["Vimek", "Smart", "Trasferta"]
 
@@ -5448,8 +5531,9 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False, reparti
         return
 
     OPZIONE_TUTTE_LE_COMMESSE = "📊 Tutte le commesse (vista d'insieme)"
-    commessa_scelta = selettore_commessa_filtrato(f"{key_prefix}_pianificazione", key_commessa=f"{key_prefix}_pianificazione_commessa",
-                                                   opzioni_extra=(OPZIONE_TUTTE_LE_COMMESSE,))
+    commessa_scelta, nomi_filtrati_pian = selettore_commessa_filtrato(
+        f"{key_prefix}_pianificazione", key_commessa=f"{key_prefix}_pianificazione_commessa",
+        opzioni_extra=(OPZIONE_TUTTE_LE_COMMESSE,), restituisci_nomi=True)
 
     if commessa_scelta == OPZIONE_TUTTE_LE_COMMESSE:
         # Vista d'insieme richiesta da Marco ("non è possibile visualizzare il
@@ -5464,6 +5548,8 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False, reparti
         st.markdown("**📐 Gantt teorico — tutte le commesse**")
         st.caption("Calcolato dalla data di inizio lavori e dalle ore stimate delle fasi di ogni commessa (vedi Gantt teorico della singola commessa per i dettagli).")
         gantt_teorico_tutte = compute_gantt_teorico_tutte_commesse()
+        if nomi_filtrati_pian is not None and not gantt_teorico_tutte.empty:
+            gantt_teorico_tutte = gantt_teorico_tutte[gantt_teorico_tutte["Commessa"].isin(nomi_filtrati_pian)]
         if gantt_teorico_tutte.empty:
             st.info("Nessuna commessa ha ancora sia una data di inizio lavori sia delle fasi: imposta questi due dati sulla singola commessa per vederla comparire qui.")
         else:
@@ -5474,6 +5560,8 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False, reparti
         st.markdown("**✅ Gantt effettivo — tutte le commesse**")
         st.caption("Dalle timbrature reali: per ogni commessa, dal primo giorno lavorato all'ultimo (prolungato fino a oggi per quelle ancora in corso).")
         gantt_effettivo_tutte = compute_gantt_effettivo_tutte_commesse(df)
+        if nomi_filtrati_pian is not None and not gantt_effettivo_tutte.empty:
+            gantt_effettivo_tutte = gantt_effettivo_tutte[gantt_effettivo_tutte["Commessa"].isin(nomi_filtrati_pian)]
         if gantt_effettivo_tutte.empty:
             st.info("Nessuna commessa ha ancora fasi lavorate.")
         else:
@@ -7191,15 +7279,16 @@ else:
 
             st.markdown("---")
             st.write("#### Per fase (ore stimate vs ore effettive)")
-            commesse_options = ["Tutte le commesse"] + get_commesse_names()
-            commessa_filtro = st.selectbox("Filtra per commessa", options=commesse_options, key="resoconto_commessa_filtro")
-            produttivita_dettaglio = compute_produttivita_commesse(
-                df, commessa_start, commessa_end,
-                area_filter=None,
-                commessa_filter=None if commessa_filtro == "Tutte le commesse" else commessa_filtro
-            )
+            commessa_filtro, nomi_filtrati_fase = selettore_commessa_filtrato(
+                "resoconto_fase", key_commessa="resoconto_commessa_filtro", etichetta="Commessa",
+                opzioni_extra=("Tutte le commesse",), restituisci_nomi=True)
+            produttivita_dettaglio, filtrata_fase = produttivita_commesse_filtrata(
+                df, commessa_start, commessa_end, None, commessa_filtro, nomi_filtrati_fase)
             if produttivita_dettaglio.empty:
-                st.info("Nessuna fase con ore stimate configurata. Vai su 'Gestione Commesse' per crearle.")
+                if filtrata_fase:
+                    st.info("Nessuna fase da mostrare per le commesse che corrispondono ai filtri.")
+                else:
+                    st.info("Nessuna fase con ore stimate configurata. Vai su 'Gestione Commesse' per crearle.")
             else:
                 st.dataframe(produttivita_dettaglio, use_container_width=True)
                 chart_data = produttivita_dettaglio.melt(
@@ -7220,10 +7309,16 @@ else:
             if not commesse_per_traccia:
                 st.info("Nessuna commessa configurata.")
             else:
-                commessa_traccia = st.selectbox("Commessa", options=commesse_per_traccia, key="resoconto_commessa_traccia")
-                mostra_info_commessa(commessa_traccia)
-                storico_commessa = get_storico_attivita_commessa(commessa_traccia, df)
-                if storico_commessa.empty:
+                commessa_traccia = selettore_commessa_filtrato(
+                    "resoconto_traccia", key_commessa="resoconto_commessa_traccia", etichetta="Commessa")
+                if commessa_traccia is None:
+                    storico_commessa = None
+                else:
+                    mostra_info_commessa(commessa_traccia)
+                    storico_commessa = get_storico_attivita_commessa(commessa_traccia, df)
+                if storico_commessa is None:
+                    pass
+                elif storico_commessa.empty:
                     st.info("Nessuna lavorazione registrata finora su questa commessa.")
                 else:
                     st.dataframe(storico_commessa, use_container_width=True)
@@ -7657,13 +7752,11 @@ else:
                 resp_commessa_start = st.date_input("Inizio", value=datetime.date.today().replace(day=1), key="resp_commessa_start")
                 resp_commessa_end = st.date_input("Fine", value=datetime.date.today(), key="resp_commessa_end")
 
-                commesse_options_resp = ["Tutte le commesse"] + get_commesse_names()
-                commessa_filtro_resp = st.selectbox("Filtra per commessa", options=commesse_options_resp, key="resp_commessa_filtro")
-                produttivita_resp = compute_produttivita_commesse(
-                    df, resp_commessa_start, resp_commessa_end,
-                    area_filter=area_responsabile,
-                    commessa_filter=None if commessa_filtro_resp == "Tutte le commesse" else commessa_filtro_resp
-                )
+                commessa_filtro_resp, nomi_filtrati_resp = selettore_commessa_filtrato(
+                    "resp_resoconto_fase", key_commessa="resp_commessa_filtro", etichetta="Commessa",
+                    opzioni_extra=("Tutte le commesse",), restituisci_nomi=True)
+                produttivita_resp, _ = produttivita_commesse_filtrata(
+                    df, resp_commessa_start, resp_commessa_end, area_responsabile, commessa_filtro_resp, nomi_filtrati_resp)
                 if produttivita_resp.empty:
                     st.info("Nessuna fase con ore stimate configurata per il tuo reparto. Vai su 'Gestione fasi commessa' per crearle.")
                 else:
