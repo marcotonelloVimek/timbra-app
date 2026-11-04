@@ -3525,7 +3525,7 @@ def filtra_commesse_dettaglio(dettaglio, testo="", cliente=None, anno=None, stat
         mask &= d["Tipologia impianto"].fillna("").astype(str).str.strip() == tipologia
     return list(d.loc[mask, "Nome"])
 
-def selettore_commessa_filtrato(key_prefix, key_commessa, etichetta="Commessa", opzioni_extra=(), restituisci_nomi=False):
+def selettore_commessa_filtrato(key_prefix, key_commessa, etichetta="Commessa", opzioni_extra=(), restituisci_nomi=False, valore_iniziale=None):
     """Tendina Commessa preceduta da filtri (ricerca libera su nome/cliente, Cliente,
     Anno di produzione, Stato, Priorità, Tipologia impianto) per ritrovare in fretta
     una commessa quando ce ne sono molte. Le voci mostrano 'nome — cliente'.
@@ -3535,7 +3535,9 @@ def selettore_commessa_filtrato(key_prefix, key_commessa, etichetta="Commessa", 
     Con restituisci_nomi=True restituisce invece la coppia (voce scelta, nomi): 'nomi'
     è la lista delle commesse che rispettano i filtri attivi, oppure None quando nessun
     filtro restringe l'elenco. Serve a chi, scegliendo un'opzione extra come 'Tutte le
-    commesse', vuole comunque limitarsi alle commesse filtrate (es. di un cliente)."""
+    commesse', vuole comunque limitarsi alle commesse filtrate (es. di un cliente).
+    valore_iniziale: commessa da preselezionare (es. quella già salvata in una trasferta
+    che si sta modificando) quando rientra tra quelle che passano i filtri."""
     def _esito(scelta, nomi_filtrati):
         return (scelta, nomi_filtrati) if restituisci_nomi else scelta
     dettaglio = get_commesse_dettaglio()
@@ -3571,7 +3573,9 @@ def selettore_commessa_filtrato(key_prefix, key_commessa, etichetta="Commessa", 
     elif len(nomi) < len(dettaglio):
         st.caption(f"{len(nomi)} commesse su {len(dettaglio)} corrispondono ai filtri.")
     mappa_cliente = dict(zip(dettaglio["Nome"], dettaglio["Cliente"].fillna("").astype(str).str.strip()))
-    scelta = st.selectbox(etichetta, list(opzioni_extra) + nomi,
+    opzioni_finali = list(opzioni_extra) + nomi
+    indice = opzioni_finali.index(valore_iniziale) if valore_iniziale in opzioni_finali else 0
+    scelta = st.selectbox(etichetta, opzioni_finali, index=indice,
                           format_func=lambda c: f"{c} — {mappa_cliente[c]}" if mappa_cliente.get(c) else c,
                           key=key_commessa)
     return _esito(scelta, nomi_attivi)
@@ -4021,6 +4025,12 @@ def valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezio
         return False, "Inserisci il numero del volo."
     return True, ""
 
+def _errore_database_leggibile(azione, e):
+    """Messaggio da mostrare (invece di far andare in errore l'intera pagina) quando il
+    database rifiuta un'operazione: tipo e testo dell'errore, così si capisce la causa."""
+    testo = " ".join(str(e).split())[:300]
+    return f"Impossibile {azione}: errore del database ({type(e).__name__}: {testo}). Riprova; se si ripete segnala questo messaggio."
+
 def crea_trasferta(dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi_selezionati,
                     dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio,
                     note, creata_da, viaggio=None):
@@ -4035,26 +4045,29 @@ def crea_trasferta(dipendente, data_inizio, data_fine, commessa, stato, indirizz
     ok, errore = valida_viaggio(viaggio)
     if not ok:
         return False, errore
-    cliente = get_cliente_commessa(commessa)
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("""INSERT INTO trasferte
-                     (dipendente, data_inizio, data_fine, commessa, cliente, stato, indirizzo, albergo, mezzi,
-                      dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio,
-                      note, creata_da, data_creazione)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (dipendente, data_inizio.isoformat(), data_fine.isoformat(), commessa, cliente,
-                   str(stato or "").strip(), str(indirizzo or "").strip(), str(albergo or "").strip(),
-                   ",".join(mezzi_selezionati),
-                   str(dettaglio_auto or "").strip() if "Auto" in mezzi_selezionati else "",
-                   1 if (auto_propria and "Auto" in mezzi_selezionati) else 0,
-                   str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
-                   str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
-                   str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
-                   str(note or "").strip(), creata_da, datetime.date.today().isoformat()))
-        if viaggio:
-            _scrivi_viaggio(c, c.lastrowid, viaggio)
-        conn.commit()
+    try:
+        cliente = get_cliente_commessa(commessa)
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("""INSERT INTO trasferte
+                         (dipendente, data_inizio, data_fine, commessa, cliente, stato, indirizzo, albergo, mezzi,
+                          dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio,
+                          note, creata_da, data_creazione)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (dipendente, data_inizio.isoformat(), data_fine.isoformat(), commessa, cliente,
+                       str(stato or "").strip(), str(indirizzo or "").strip(), str(albergo or "").strip(),
+                       ",".join(mezzi_selezionati),
+                       str(dettaglio_auto or "").strip() if "Auto" in mezzi_selezionati else "",
+                       1 if (auto_propria and "Auto" in mezzi_selezionati) else 0,
+                       str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
+                       str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
+                       str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
+                       str(note or "").strip(), creata_da, datetime.date.today().isoformat()))
+            if viaggio:
+                _scrivi_viaggio(c, c.lastrowid, viaggio)
+            conn.commit()
+    except Exception as e:
+        return False, _errore_database_leggibile("salvare la trasferta", e)
     return True, ""
 
 def get_trasferte_dettaglio():
@@ -4152,26 +4165,29 @@ def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commess
         ok, errore = valida_viaggio(viaggio)
         if not ok:
             return False, errore
-    cliente = get_cliente_commessa(commessa)
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("""UPDATE trasferte SET data_inizio=?, data_fine=?, commessa=?, cliente=?, stato=?, indirizzo=?,
-                            albergo=?, mezzi=?, dettaglio_auto=?, auto_propria=?, dettaglio_treno=?, dettaglio_aereo=?,
-                            dettaglio_auto_noleggio=?, note=? WHERE id=?""",
-                  (data_inizio.isoformat(), data_fine.isoformat(), commessa, cliente,
-                   str(stato or "").strip(), str(indirizzo or "").strip(), str(albergo or "").strip(),
-                   ",".join(mezzi_selezionati),
-                   str(dettaglio_auto or "").strip() if "Auto" in mezzi_selezionati else "",
-                   1 if (auto_propria and "Auto" in mezzi_selezionati) else 0,
-                   str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
-                   str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
-                   str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
-                   str(note or "").strip(), trasferta_id))
-        righe_modificate = c.rowcount
-        _svuota_cache_ore_viaggio()          # la data di inizio potrebbe essere cambiata
-        if righe_modificate and viaggio != "invariato":     # None = nessun viaggio previsto (azzera la stima)
-            _scrivi_viaggio(c, trasferta_id, viaggio)
-        conn.commit()
+    try:
+        cliente = get_cliente_commessa(commessa)
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("""UPDATE trasferte SET data_inizio=?, data_fine=?, commessa=?, cliente=?, stato=?, indirizzo=?,
+                                albergo=?, mezzi=?, dettaglio_auto=?, auto_propria=?, dettaglio_treno=?, dettaglio_aereo=?,
+                                dettaglio_auto_noleggio=?, note=? WHERE id=?""",
+                      (data_inizio.isoformat(), data_fine.isoformat(), commessa, cliente,
+                       str(stato or "").strip(), str(indirizzo or "").strip(), str(albergo or "").strip(),
+                       ",".join(mezzi_selezionati),
+                       str(dettaglio_auto or "").strip() if "Auto" in mezzi_selezionati else "",
+                       1 if (auto_propria and "Auto" in mezzi_selezionati) else 0,
+                       str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
+                       str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
+                       str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
+                       str(note or "").strip(), trasferta_id))
+            righe_modificate = c.rowcount
+            _svuota_cache_ore_viaggio()          # la data di inizio potrebbe essere cambiata
+            if righe_modificate and viaggio != "invariato":     # None = nessun viaggio previsto (azzera la stima)
+                _scrivi_viaggio(c, trasferta_id, viaggio)
+            conn.commit()
+    except Exception as e:
+        return False, _errore_database_leggibile("modificare la trasferta", e)
     if righe_modificate == 0:
         return False, "Trasferta non trovata (potrebbe essere stata eliminata nel frattempo)."
     return True, ""
@@ -4382,7 +4398,8 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     if not commesse_disponibili_trasf:
         st.warning("Nessuna commessa configurata: creane una in 'Gestione Commesse' prima di programmare una trasferta (serve a determinare il cliente).")
         return
-    commessa_scelta_trasf = st.selectbox("Commessa (determina il cliente)", commesse_disponibili_trasf, key=f"{key_prefix}_trasf_commessa")
+    commessa_scelta_trasf = selettore_commessa_filtrato(f"{key_prefix}_trasf", key_commessa=f"{key_prefix}_trasf_commessa",
+                                                         etichetta="Commessa (determina il cliente)")
     cliente_derivato_trasf = get_cliente_commessa(commessa_scelta_trasf)
     st.text_input("Cliente (ricavato dalla commessa)", value=cliente_derivato_trasf or "(nessun cliente impostato per questa commessa)",
                   disabled=True, key=f"{key_prefix}_trasf_cliente_display")
@@ -4468,12 +4485,11 @@ def render_trasferte_programmate(key_prefix):
         else:
             st.caption(f"Operatore: {dati_mod['dipendente']} (non modificabile qui: per cambiare operatore elimina la trasferta, se non ha ancora un report collegato, e ricreala).")
 
-            commesse_opzioni_mod = list(commesse_disponibili_trasf)
-            if dati_mod["commessa"] and dati_mod["commessa"] not in commesse_opzioni_mod:
-                commesse_opzioni_mod = [dati_mod["commessa"]] + commesse_opzioni_mod
-            indice_commessa_mod = commesse_opzioni_mod.index(dati_mod["commessa"]) if dati_mod["commessa"] in commesse_opzioni_mod else 0
-            commessa_mod = st.selectbox("Commessa (determina il cliente)", commesse_opzioni_mod, index=indice_commessa_mod,
-                                         key=f"{key_prefix}_trasf_mod_commessa_{trasferta_id_modifica}")
+            commessa_mod = selettore_commessa_filtrato(
+                f"{key_prefix}_trasf_mod_{trasferta_id_modifica}", key_commessa=f"{key_prefix}_trasf_mod_commessa_{trasferta_id_modifica}",
+                etichetta="Commessa (determina il cliente)", valore_iniziale=dati_mod["commessa"])
+            if commessa_mod is None:
+                commessa_mod = dati_mod["commessa"]       # nessuna commessa passa i filtri: resta quella già salvata
             cliente_derivato_mod = get_cliente_commessa(commessa_mod)
             st.text_input("Cliente (ricavato dalla commessa)", value=cliente_derivato_mod or "(nessun cliente impostato per questa commessa)",
                           disabled=True, key=f"{key_prefix}_trasf_mod_cliente_display_{trasferta_id_modifica}")
