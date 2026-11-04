@@ -755,6 +755,7 @@ def init_db():
             ("commessa", "TEXT"), ("cliente", "TEXT"), ("stato", "TEXT"), ("indirizzo", "TEXT"),
             ("albergo", "TEXT"), ("mezzi", "TEXT"), ("dettaglio_auto", "TEXT"),
             ("dettaglio_treno", "TEXT"), ("dettaglio_aereo", "TEXT"), ("dettaglio_auto_noleggio", "TEXT"),
+            ("auto_propria", "INTEGER NOT NULL DEFAULT 0"),
             # Costi di alloggio e trasporto della trasferta (inseriti a mano da chi
             # gestisce l'area Costi): il costo del personale in trasferta invece si
             # calcola sempre in automatico dalle ore lavorate, non si salva qui.
@@ -4047,28 +4048,46 @@ def crea_trasferta(dipendente, data_inizio, data_fine, commessa, stato, indirizz
         return False, errore
     try:
         cliente = get_cliente_commessa(commessa)
-        with db_connect() as conn:
-            c = conn.cursor()
-            c.execute("""INSERT INTO trasferte
-                         (dipendente, data_inizio, data_fine, commessa, cliente, stato, indirizzo, albergo, mezzi,
-                          dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio,
-                          note, creata_da, data_creazione)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                      (dipendente, data_inizio.isoformat(), data_fine.isoformat(), commessa, cliente,
-                       str(stato or "").strip(), str(indirizzo or "").strip(), str(albergo or "").strip(),
-                       ",".join(mezzi_selezionati),
-                       str(dettaglio_auto or "").strip() if "Auto" in mezzi_selezionati else "",
-                       1 if (auto_propria and "Auto" in mezzi_selezionati) else 0,
-                       str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
-                       str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
-                       str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
-                       str(note or "").strip(), creata_da, datetime.date.today().isoformat()))
-            if viaggio:
-                _scrivi_viaggio(c, c.lastrowid, viaggio)
-            conn.commit()
     except Exception as e:
         return False, _errore_database_leggibile("salvare la trasferta", e)
-    return True, ""
+    valori = {
+        "dipendente": dipendente, "data_inizio": data_inizio.isoformat(), "data_fine": data_fine.isoformat(),
+        "commessa": commessa, "cliente": cliente,
+        "stato": str(stato or "").strip(), "indirizzo": str(indirizzo or "").strip(), "albergo": str(albergo or "").strip(),
+        "mezzi": ",".join(mezzi_selezionati),
+        "dettaglio_auto": str(dettaglio_auto or "").strip() if "Auto" in mezzi_selezionati else "",
+        "auto_propria": 1 if (auto_propria and "Auto" in mezzi_selezionati) else 0,
+        "dettaglio_treno": str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
+        "dettaglio_aereo": str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
+        "dettaglio_auto_noleggio": str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
+        "note": str(note or "").strip(), "creata_da": creata_da, "data_creazione": datetime.date.today().isoformat(),
+    }
+    # Colonne vecchie: un database creato con una versione precedente del programma ha
+    # ancora le colonne 'mezzo', 'dettaglio_mezzo', 'cliente_luogo', e 'mezzo' può essere
+    # NOT NULL senza valore predefinito (SQLite non permette di togliere il vincolo): in
+    # quel caso l'INSERT fallisce con "NOT NULL constraint failed: trasferte.mezzo".
+    # Quando succede si riprova compilando anche quella colonna (mezzo = i mezzi scelti,
+    # le altre vuote), senza dover modificare la tabella.
+    legacy_noti = {"mezzo": valori["mezzi"], "dettaglio_mezzo": "", "cliente_luogo": cliente or ""}
+    ultimo_errore = None
+    for _tentativo in range(6):
+        try:
+            with db_connect() as conn:
+                c = conn.cursor()
+                colonne = list(valori.keys())
+                c.execute(f"INSERT INTO trasferte ({', '.join(colonne)}) VALUES ({', '.join('?' * len(colonne))})",
+                          tuple(valori[col] for col in colonne))
+                if viaggio:
+                    _scrivi_viaggio(c, c.lastrowid, viaggio)
+                conn.commit()
+            return True, ""
+        except Exception as e:
+            ultimo_errore = e
+            m = re.search(r"NOT NULL constraint failed: trasferte\.(\w+)", str(e))
+            if not m or m.group(1) in valori:
+                break
+            valori[m.group(1)] = legacy_noti.get(m.group(1), "")   # colonna vecchia obbligatoria: la compila e riprova
+    return False, _errore_database_leggibile("salvare la trasferta", ultimo_errore)
 
 def get_trasferte_dettaglio():
     """Tutte le trasferte programmate, più recenti prima, per la tabella riassuntiva
@@ -4575,6 +4594,11 @@ def render_trasferte_programmate(key_prefix):
 # ciò che l'app già registra (timbrature, modalità di lavoro scelta, fase aperta,
 # trasferte programmate, ferie/permessi approvati): non c'è nessuna posizione GPS.
 PAGINA_SITUAZIONE_SERVICE = "📍 Situazione Service"
+# Sotto-menu delle trasferte (uguali per amministratore, responsabile e utenti Service).
+PAGINA_NUOVA_TRASFERTA = "Programmazione nuova Trasferta"
+PAGINA_TRASFERTE_PROGRAMMATE = "Trasferte programmate"
+PAGINA_STATISTICHE_ASSISTENZA = "🛠️ Statistiche Assistenza"
+PAGINE_TRASFERTE = [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_STATISTICHE_ASSISTENZA]
 
 def calcola_situazione_operatore(righe, adesso):
     """Stato di un dipendente a partire dalle sue timbrature recenti. 'righe' sono tuple
@@ -4714,14 +4738,19 @@ def render_report_interventi_ricevuti(key_prefix):
                 st.image(dati_foto, caption=nome_file, use_container_width=True)
 
 
-def render_gestione_trasferte_service(attore_nome, key_prefix):
-    """Vista combinata usata da responsabile e utente semplice dell'area Service:
-    mostra insieme, come un'unica pagina, le due sotto-pagine 'Nuova trasferta' e
-    'Trasferte programmate' - la suddivisione in sotto-menu separati è stata
-    richiesta da Marco solo per la pagina dell'amministratore."""
-    render_nuova_trasferta(attore_nome, key_prefix)
-    st.markdown("---")
+def render_trasferte_programmate_service(key_prefix):
+    """'Trasferte programmate' per responsabile e utente semplice dell'area Service:
+    l'elenco delle trasferte e, sotto, i report intervento ricevuti (l'amministratore
+    li ha come pagina a parte). La programmazione di una nuova trasferta e le
+    Statistiche Assistenza sono sotto-menu separati, come per l'amministratore."""
     render_trasferte_programmate(key_prefix)
+    st.markdown("---")
+    st.markdown("**Report interventi ricevuti**")
+    report_service = get_report_interventi_dettaglio()
+    if report_service.empty:
+        st.info("Nessun report intervento inviato finora.")
+    else:
+        st.dataframe(report_service, use_container_width=True)
 
 
 def render_report_intervento(dipendente_nome, df, key_prefix):
@@ -7746,9 +7775,9 @@ else:
         admin_page = render_menu_a_categorie([
             ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto"]),
-            ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🛠️ Statistiche Assistenza", "🌱 Sostenibilità (Smart Working)"]),
+            ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
             ("👥 Risorse Umane", ["Cartellini dipendenti"]),
-            ("🧳 Trasferte e Team", ["Programmazione nuova Trasferta", "Trasferte programmate", "Report interventi ricevuti", "📅 Disponibilità Team", PAGINA_SITUAZIONE_SERVICE]),
+            ("🧳 Trasferte e Team", PAGINE_TRASFERTE + ["Report interventi ricevuti", "📅 Disponibilità Team", PAGINA_SITUAZIONE_SERVICE]),
             ("💰 Costi", ["💰 Costi commesse"]),
             ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
         ], key_prefix="admin_menu", titolo_categoria="Sezione amministratore")
@@ -8435,18 +8464,20 @@ else:
                                                reparti_modificabili=[area_responsabile])
 
         elif modalita == "🧳 Trasferte Service":
-            st.session_state["_ultima_pagina_vista"] = "🧳 Trasferte Service"
-            df = carica_dati_db()
-            render_gestione_trasferte_service(user_info["name"], key_prefix="resp_service")
-            st.markdown("---")
-            st.markdown("**Report interventi ricevuti**")
-            report_area_service = get_report_interventi_dettaglio()
-            if report_area_service.empty:
-                st.info("Nessun report intervento inviato finora.")
-            else:
-                st.dataframe(report_area_service, use_container_width=True)
-            st.markdown("---")
-            render_statistiche_assistenza(df, key_prefix="resp_assistenza")
+            trasferte_page = render_menu_a_categorie([
+                ("🧳 Trasferte", PAGINE_TRASFERTE),
+            ], key_prefix="resp_trasferte_menu", titolo_categoria="Sezione Trasferte")
+            st.session_state["_ultima_pagina_vista"] = trasferte_page
+
+            if trasferte_page == PAGINA_NUOVA_TRASFERTA:
+                render_nuova_trasferta(user_info["name"], key_prefix="resp_service")
+
+            elif trasferte_page == PAGINA_TRASFERTE_PROGRAMMATE:
+                render_trasferte_programmate_service(key_prefix="resp_service")
+
+            elif trasferte_page == PAGINA_STATISTICHE_ASSISTENZA:
+                df = carica_dati_db()
+                render_statistiche_assistenza(df, key_prefix="resp_assistenza")
 
         elif modalita == "👥 Risorse Umane":
             st.session_state["_ultima_pagina_vista"] = "Cartellini dipendenti"
@@ -8475,8 +8506,6 @@ else:
         dipendente_scelto = user_info["name"]
         pagine_service_utente = ["📷 Report Intervento"]
         if is_area_service(user_info["area"]):
-            pagine_service_utente.append("🧳 Trasferte Service")
-            pagine_service_utente.append("🛠️ Statistiche Assistenza")
             pagine_service_utente.append(PAGINA_SITUAZIONE_SERVICE)
         categorie_utente = [
             ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
@@ -8485,6 +8514,10 @@ else:
             ("🧳 Service", pagine_service_utente),
             ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
         ]
+        # Le trasferte (programmazione, elenco, statistiche) hanno una categoria a sé,
+        # solo per chi fa parte dell'area Service.
+        if is_area_service(user_info["area"]):
+            categorie_utente.insert(4, ("🧳 Trasferte", PAGINE_TRASFERTE))
         # La categoria Costi compare solo per chi fa parte dell'area Costi, come il
         # Service: per tutti gli altri utenti non c'è alcuna voce sui costi.
         if is_area_amministrazione(user_info["area"]):
@@ -8495,7 +8528,7 @@ else:
         pagina_utente = render_menu_a_categorie(
             categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
-        if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE):
+        if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE):
             df = carica_dati_db()
 
         if pagina_utente == "Profilo":
@@ -8645,15 +8678,11 @@ else:
         elif pagina_utente == "📷 Report Intervento":
             render_report_intervento(dipendente_scelto, df, key_prefix="user")
 
-        elif pagina_utente == "🧳 Trasferte Service":
-            render_gestione_trasferte_service(user_info["name"], key_prefix="user_service")
-            st.markdown("---")
-            st.markdown("**Report interventi ricevuti**")
-            report_utente_service = get_report_interventi_dettaglio()
-            if report_utente_service.empty:
-                st.info("Nessun report intervento inviato finora.")
-            else:
-                st.dataframe(report_utente_service, use_container_width=True)
+        elif pagina_utente == PAGINA_NUOVA_TRASFERTA:
+            render_nuova_trasferta(user_info["name"], key_prefix="user_service")
+
+        elif pagina_utente == PAGINA_TRASFERTE_PROGRAMMATE:
+            render_trasferte_programmate_service(key_prefix="user_service")
 
         elif pagina_utente == "🛠️ Statistiche Assistenza":
             render_statistiche_assistenza(df, key_prefix="user_assistenza")
