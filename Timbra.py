@@ -13,6 +13,10 @@ import hashlib
 import secrets
 import re
 import base64
+import json
+import time
+import urllib.parse
+import urllib.request
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
@@ -755,6 +759,16 @@ def init_db():
             # gestisce l'area Costi): il costo del personale in trasferta invece si
             # calcola sempre in automatico dalle ore lavorate, non si salva qui.
             ("costo_alloggio", "REAL DEFAULT 0"), ("costo_trasporto", "REAL DEFAULT 0"),
+            # Viaggio: stima teorica (punto di partenza, destinazione, partenza prevista,
+            # km, ore dell'andata, se è andata e ritorno, ore totali previste: l'admin
+            # può correggerle a mano) e ore effettive indicate dall'operatore nel report
+            # della trasferta. NULL = non pianificato / non ancora indicato.
+            ("viaggio_partenza", "TEXT"), ("viaggio_destinazione", "TEXT"), ("viaggio_partenza_dt", "TEXT"),
+            ("viaggio_km", "REAL"), ("viaggio_ore_andata", "REAL"), ("viaggio_andata_ritorno", "INTEGER DEFAULT 1"),
+            ("viaggio_ore_teoriche", "REAL"), ("viaggio_ore_effettive", "REAL"), ("viaggio_ore_effettive_il", "TEXT"),
+            # 1 = le ore di viaggio effettive si aggiungono al cartellino (l'operatore non
+            # timbra in viaggio); 0 = sono solo un dato statistico (timbra già: niente doppio conteggio).
+            ("viaggio_da_pagare", "INTEGER DEFAULT 0"),
         ]:
             try:
                 c.execute(f"ALTER TABLE trasferte ADD COLUMN {colonna_trasferta} {tipo_colonna}")
@@ -780,6 +794,12 @@ def init_db():
         # (il giorno specifico a cui si riferiscono le ore calcolate dalle timbrature)
         try:
             c.execute("ALTER TABLE report_interventi ADD COLUMN data_intervento TEXT")
+            conn.commit()
+        except db_migration_error_classes():
+            pass  # Colonna già esistente
+        # Ore di viaggio effettive dichiarate in questo report (vedi salva_report_intervento)
+        try:
+            c.execute("ALTER TABLE report_interventi ADD COLUMN ore_viaggio REAL")
             conn.commit()
         except db_migration_error_classes():
             pass  # Colonna già esistente
@@ -848,6 +868,47 @@ def _parse_timbratura_timestamp(data_str, ora_str):
         return None
     return timestamp.to_pydatetime() if hasattr(timestamp, "to_pydatetime") else timestamp
 
+# Stato di timbratura di un dipendente (ultima timbratura, ultima fase, ultima pausa)
+# letto con UNA sola query. La pagina Timbrature chiedeva le stesse informazioni più
+# volte a ogni clic (ultima timbratura, "sono dentro?", "sono in pausa?", "c'è una fase
+# aperta?", modalità di lavoro...), una query ciascuna: con un database remoto come
+# Turso ogni query è un viaggio in rete. Durante UNA esecuzione dell'interfaccia
+# (_STATO_TIMBRATURA_RUN_ATTIVO) la risposta viene ricordata; ogni nuova esecuzione
+# riparte da zero e chi scrive una timbratura la svuota (vedi _svuota_stato_timbratura).
+# Fuori dall'interfaccia (test, script) non ricorda nulla: legge sempre dal database.
+_STATO_TIMBRATURA_RUN = {}
+_STATO_TIMBRATURA_RUN_ATTIVO = False
+
+def _svuota_stato_timbratura():
+    _STATO_TIMBRATURA_RUN.clear()
+
+def _stato_timbratura_utente(nome_dipendente):
+    """{'ultima': riga|None, 'fase': riga|None, 'pausa': riga|None}: ultima timbratura
+    in assoluto (id, Azione, Data, Ora, Luogo, Dettaglio_Trasferta), ultima di tipo
+    Inizio/Fine fase (Azione, Commessa, Fase) e ultima di tipo Inizio/Fine Pausa
+    (Azione)."""
+    if _STATO_TIMBRATURA_RUN_ATTIVO and nome_dipendente in _STATO_TIMBRATURA_RUN:
+        return _STATO_TIMBRATURA_RUN[nome_dipendente]
+    ordine = "ORDER BY Data DESC, Ora DESC, id DESC LIMIT 1"
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute(f"""SELECT * FROM (SELECT 'ultima' AS k, id, Azione, Data, Ora, Luogo, Dettaglio_Trasferta, Commessa, Fase
+                                      FROM timbrature WHERE Dipendente = ? {ordine})
+                      UNION ALL
+                      SELECT * FROM (SELECT 'fase' AS k, id, Azione, Data, Ora, Luogo, Dettaglio_Trasferta, Commessa, Fase
+                                      FROM timbrature WHERE Dipendente = ? AND Azione IN ('Inizio fase', 'Fine fase') {ordine})
+                      UNION ALL
+                      SELECT * FROM (SELECT 'pausa' AS k, id, Azione, Data, Ora, Luogo, Dettaglio_Trasferta, Commessa, Fase
+                                      FROM timbrature WHERE Dipendente = ? AND Azione IN ('Inizio Pausa', 'Fine Pausa') {ordine})""",
+                  (nome_dipendente, nome_dipendente, nome_dipendente))
+        righe = c.fetchall()
+    stato = {"ultima": None, "fase": None, "pausa": None}
+    for riga in righe:
+        stato[riga[0]] = tuple(riga[1:])
+    if _STATO_TIMBRATURA_RUN_ATTIVO:
+        _STATO_TIMBRATURA_RUN[nome_dipendente] = stato
+    return stato
+
 def get_last_timbratura(nome_dipendente):
     """Recupera l'ultima timbratura registrata per un dipendente, a prescindere dal
     giorno in cui è stata fatta (così un turno che attraversa la mezzanotte non
@@ -859,16 +920,10 @@ def get_last_timbratura(nome_dipendente):
     (ignorata, non bloccante), invece di essere considerato valido per sempre: un
     dato anomalo non deve poter eludere il controllo di anzianità e restare aperto
     all'infinito."""
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("""SELECT Azione, Data, Ora FROM timbrature
-                     WHERE Dipendente = ?
-                     ORDER BY Data DESC, Ora DESC, id DESC
-                     LIMIT 1""", (nome_dipendente,))
-        row = c.fetchone()
-    if not row:
+    riga = _stato_timbratura_utente(nome_dipendente)["ultima"]
+    if not riga:
         return None
-    azione, data_str, ora_str = row
+    _id, azione, data_str, ora_str = riga[:4]
     ultimo_timestamp = _parse_timbratura_timestamp(data_str, ora_str)
     if ultimo_timestamp is None:
         return None
@@ -897,15 +952,10 @@ def get_fase_aperta(nome_dipendente):
     is_clocked_in), la fase non è più considerata aperta."""
     if not is_clocked_in(nome_dipendente):
         return None
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("""SELECT Azione, Commessa, Fase FROM timbrature
-                     WHERE Dipendente = ? AND Azione IN ('Inizio fase', 'Fine fase')
-                     ORDER BY Data DESC, Ora DESC, id DESC LIMIT 1""", (nome_dipendente,))
-        row = c.fetchone()
-    if not row or row[0] != "Inizio fase":
+    riga = _stato_timbratura_utente(nome_dipendente)["fase"]
+    if not riga or riga[1] != "Inizio fase":
         return None
-    return (row[1], row[2])
+    return (riga[6], riga[7])
 
 def is_pausa_attiva(nome_dipendente):
     """True se il dipendente è in questo momento in pausa pranzo (tra le sole
@@ -915,13 +965,8 @@ def is_pausa_attiva(nome_dipendente):
     pranzo senza dover prima chiudere la fase in corso)."""
     if not is_clocked_in(nome_dipendente):
         return False
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("""SELECT Azione FROM timbrature
-                     WHERE Dipendente = ? AND Azione IN ('Inizio Pausa', 'Fine Pausa')
-                     ORDER BY Data DESC, Ora DESC, id DESC LIMIT 1""", (nome_dipendente,))
-        row = c.fetchone()
-    return bool(row) and row[0] == "Inizio Pausa"
+    riga = _stato_timbratura_utente(nome_dipendente)["pausa"]
+    return bool(riga) and riga[1] == "Inizio Pausa"
 
 def validate_timbratura(nome_dipendente, tipo_azione):
     """
@@ -1181,7 +1226,7 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
         story.append(Spacer(1, 0.2*inch))
 
         if not cartellino_df.empty:
-            intestazione = ["Giorno", "Ingresso", "Uscita", "Inizio\nPausa", "Fine\nPausa", "Dove", "Ore\nord.", "Ore\nstraord.", "Ore\narrot.", "Ore per\nportale"]
+            intestazione = ["Giorno", "Ingresso", "Uscita", "Inizio\nPausa", "Fine\nPausa", "Dove", "Ore\nord.", "Ore\nstraord.", "Ore\nviaggio", "Ore\narrot.", "Ore per\nportale"]
             table_data = [intestazione]
             for _, row in cartellino_df.iterrows():
                 table_data.append([
@@ -1193,10 +1238,11 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
                     str(row.get("Dove", "-"))[:20],
                     str(row.get("Ore ordinarie", 0)),
                     str(row.get("Ore straordinarie", 0)),
+                    str(row.get("Ore viaggio", 0)),
                     str(row.get("Ore Arrotondate", 0)),
                     str(row.get("Ore Per Portale", "0,00")),
                 ])
-            col_widths = [1.0*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 1.7*inch, 0.65*inch, 0.75*inch, 0.7*inch, 0.8*inch]
+            col_widths = [1.0*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 1.7*inch, 0.65*inch, 0.75*inch, 0.65*inch, 0.7*inch, 0.8*inch]
             table = Table(table_data, colWidths=col_widths, repeatRows=1)
             stile_tabella = [
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(VIMEK_NAVY)),
@@ -1216,13 +1262,14 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
         if not cartellino_df.empty and cartellino_df["Inizio Pausa"].astype(str).str.contains("(auto)", regex=False).any():
             story.append(Paragraph("(auto) = pausa pranzo non timbrata: dedotta in automatico secondo l'orario di pausa abituale del dipendente.", info_style))
             story.append(Spacer(1, 0.1*inch))
-        story.append(Paragraph("Ore arrot. = ore straordinarie arrotondate alla mezz'ora. Ore per portale = ore totali del giorno (ordinarie + straordinarie arrotondate) nel formato del portale paghe, ore,minuti: 8,30 = 8 ore e 30 minuti.", info_style))
+        story.append(Paragraph("Ore arrot. = ore straordinarie arrotondate alla mezz'ora. Ore viaggio = ore di viaggio effettive delle trasferte, pagate come ore di lavoro e attribuite al primo giorno della trasferta. Ore per portale = ore totali del giorno (ordinarie + straordinarie arrotondate + viaggio arrotondate alla mezz'ora) nel formato del portale paghe, ore,minuti: 8,30 = 8 ore e 30 minuti.", info_style))
         story.append(Spacer(1, 0.1*inch))
         story.append(Paragraph("<b>Totali del mese</b>", styles['Heading2']))
         story.append(Paragraph(
             f"Giorni lavorati: {totali['giorni_lavorati']} &nbsp;|&nbsp; "
             f"Ore ordinarie: {totali['ore_ordinarie']:.2f}h &nbsp;|&nbsp; "
             f"Ore straordinarie: {totali['ore_straordinarie']:.2f}h &nbsp;|&nbsp; "
+            f"Ore viaggio: {totali.get('ore_viaggio', 0.0):.2f}h &nbsp;|&nbsp; "
             f"Ore su commesse: {totali['ore_su_commesse']:.2f}h", info_style))
         story.append(Paragraph(
             f"Straordinari arrotondati: {totali['ore_straordinarie_arrotondate']:.2f}h &nbsp;|&nbsp; "
@@ -1580,6 +1627,7 @@ def aggiungi_fase_area(area, fase):
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO fasi_area (area, fase) VALUES (?, ?)", (area, fase.strip()))
         conn.commit()
+    _tutte_le_voci_fasi_area.clear()
     return True
 
 
@@ -1590,6 +1638,7 @@ def rimuovi_fase_area(area, fase):
         c = conn.cursor()
         c.execute("DELETE FROM fasi_area WHERE area=? AND fase=?", (area, fase))
         conn.commit()
+    _tutte_le_voci_fasi_area.clear()
     return True
 
 # --- ATTIVITÀ DI REPARTO (non legate a una commessa) ---
@@ -1615,7 +1664,18 @@ def _precarica_attivita_reparto(versione_elenchi):
                     c.execute("INSERT OR IGNORE INTO fasi_area (area, fase) VALUES (?, ?)", (area_pre, voce))
                 c.execute("INSERT INTO attivita_reparto_precompilate (area) VALUES (?)", (area_pre,))
         conn.commit()
+    _tutte_le_voci_fasi_area.clear()
     return True
+
+@st.cache_data(ttl=30)
+def _tutte_le_voci_fasi_area():
+    """Tutte le coppie (reparto, voce) della tabella fasi_area, in cache per 30 secondi
+    (si invalida con .clear() quando le voci cambiano): leggerla a ogni clic costava un
+    viaggio in rete."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT area, fase FROM fasi_area")
+        return [(area_db, fase) for area_db, fase in c.fetchall()]
 
 def get_attivita_reparto(area):
     """Attività fisse del reparto (ordinate, senza duplicati); lista vuota se il
@@ -1623,13 +1683,10 @@ def get_attivita_reparto(area):
     _precarica_attivita_reparto(repr(sorted((a, tuple(v)) for a, v in ATTIVITA_REPARTO_PREDEFINITE.items())))
     if not (area or "").strip():
         return []
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("SELECT area, fase FROM fasi_area")
-        voci = {}
-        for area_db, fase in c.fetchall():
-            if _stesso_reparto(area_db, area) and (fase or "").strip():
-                voci.setdefault(fase.strip().casefold(), fase.strip())
+    voci = {}
+    for area_db, fase in _tutte_le_voci_fasi_area():
+        if _stesso_reparto(area_db, area) and (fase or "").strip():
+            voci.setdefault(fase.strip().casefold(), fase.strip())
     return sorted(voci.values(), key=str.casefold)
 
 def aggiungi_attivita_reparto(area, attivita):
@@ -1648,6 +1705,7 @@ def aggiungi_attivita_reparto(area, attivita):
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO fasi_area (area, fase) VALUES (?, ?)", (area, attivita))
         conn.commit()
+    _tutte_le_voci_fasi_area.clear()
     return True, ""
 
 def rimuovi_attivita_reparto(area, attivita):
@@ -1663,6 +1721,7 @@ def rimuovi_attivita_reparto(area, attivita):
         for id_ in ids:
             c.execute("DELETE FROM fasi_area WHERE id=?", (id_,))
         conn.commit()
+    _tutte_le_voci_fasi_area.clear()
     return (True, "") if ids else (False, "Attività non trovata.")
 
 def render_gestione_attivita_reparto(key_prefix, scope_area=None):
@@ -2174,6 +2233,21 @@ def render_gestione_template_fasi(scope_area=None, attore=""):
                     st.rerun()
 
 @st.cache_data(ttl=30)
+def _fasi_di_tutte_le_commesse():
+    """Fasi di TUTTE le commesse in un'unica query, {commessa: [(id, fase, area,
+    ore_stimate, operatore_assegnato, macro_fase, stato), ...]}. Prima ogni commessa
+    aveva la sua query (e la sua cache): con un database remoto, aprire una tendina o
+    una pagina che passa in rassegna più commesse costava un viaggio in rete ciascuna.
+    In cache per 30 secondi; si invalida con get_fasi_commessa.clear() (vedi sotto),
+    come prima."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT commessa, id, fase, area, ore_stimate, operatore_assegnato, macro_fase, stato FROM fasi_commessa ORDER BY commessa, area, fase")
+        fasi = {}
+        for commessa, id_, fase, area_, ore, operatore, macro_fase, stato in c.fetchall():
+            fasi.setdefault(commessa, []).append((id_, fase, area_, ore, operatore or "", macro_fase or "", stato or "Da iniziare"))
+    return fasi
+
 def get_fasi_commessa(commessa, area=None):
     """Fasi configurate per una commessa (eventualmente filtrate per area), con ore
     stimate, operatore assegnato (stringa vuota se non ancora assegnata a nessuno),
@@ -2182,15 +2256,15 @@ def get_fasi_commessa(commessa, area=None):
     posizione di prima (retrocompatibile con il codice che li usa per indice), gli
     ultimi due sono stati aggiunti in coda. In cache per lo stesso motivo di
     get_commesse_names(): invalidata con .clear() da ogni funzione che
-    aggiunge/modifica/elimina una fase, il suo operatore assegnato o il suo stato."""
-    with db_connect() as conn:
-        c = conn.cursor()
-        if area and area != "Tutte le aree":
-            c.execute("SELECT id, fase, area, ore_stimate, operatore_assegnato, macro_fase, stato FROM fasi_commessa WHERE commessa=? AND LOWER(TRIM(area))=LOWER(TRIM(?)) ORDER BY fase", (commessa, area))
-        else:
-            c.execute("SELECT id, fase, area, ore_stimate, operatore_assegnato, macro_fase, stato FROM fasi_commessa WHERE commessa=? ORDER BY area, fase", (commessa,))
-        return [(id_, fase, area_, ore, operatore or "", macro_fase or "", stato or "Da iniziare")
-                for id_, fase, area_, ore, operatore, macro_fase, stato in c.fetchall()]
+    aggiunge/modifica/elimina una fase, il suo operatore assegnato o il suo stato
+    (get_fasi_commessa.clear è l'invalidazione della cache in blocco, vedi sotto)."""
+    fasi = _fasi_di_tutte_le_commesse().get(commessa, [])
+    if area and area != "Tutte le aree":
+        area_norm = str(area).strip().casefold()
+        return sorted((f for f in fasi if str(f[2] or "").strip().casefold() == area_norm), key=lambda f: str(f[1]).encode("utf-8"))
+    return sorted(fasi, key=lambda f: (str(f[2] or "").encode("utf-8"), str(f[1]).encode("utf-8")))
+
+get_fasi_commessa.clear = _fasi_di_tutte_le_commesse.clear
 
 def get_fasi_per_commessa_e_area(commessa, area):
     """Solo i nomi delle fasi disponibili per la tendina di timbratura (Inizio fase),
@@ -2209,13 +2283,19 @@ def get_commesse_assegnate_a_operatore(dipendente, area):
     if not dipendente or not area:
         return []
     ordine_priorita = {"Alta": 0, "Media": 1, "Bassa": 2}
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("""SELECT DISTINCT co.nome, co.priorita FROM commesse co
-                     JOIN fasi_commessa f ON f.commessa = co.nome
-                     WHERE LOWER(TRIM(f.area)) = LOWER(TRIM(?)) AND (f.operatore_assegnato IS NULL OR TRIM(f.operatore_assegnato) = '' OR TRIM(f.operatore_assegnato) = TRIM(?))
-                       AND co.stato IN ('Da iniziare', 'In corso')""", (area, dipendente or ""))
-        righe = c.fetchall()
+    # Dai dati già in cache (commesse e fasi), senza query proprie: era una JOIN fatta
+    # a ogni clic sulla pagina Timbrature.
+    area_norm = str(area).strip().casefold()
+    dipendente_norm = str(dipendente or "").strip()
+    fasi_per_commessa = _fasi_di_tutte_le_commesse()
+    dettaglio = get_commesse_dettaglio()
+    righe = []
+    for nome, stato, priorita in zip(dettaglio["Nome"], dettaglio["Stato"], dettaglio["Priorità"]):
+        if stato not in ("Da iniziare", "In corso"):
+            continue
+        if any(str(f[2] or "").strip().casefold() == area_norm and (not f[4].strip() or f[4].strip() == dipendente_norm)
+               for f in fasi_per_commessa.get(nome, [])):
+            righe.append((nome, priorita if isinstance(priorita, str) else None))
     righe.sort(key=lambda r: (ordine_priorita.get(r[1], 1), r[0]))
     return [nome for nome, _priorita in righe]
 
@@ -3044,6 +3124,17 @@ def carica_dati_db():
     df = df.rename(columns={"Dettaglio_Trasferta": "Dettaglio Trasferta", "Dettaglio_Fase": "Dettaglio Fase"})
     return df
 
+def carica_timbrature_utente_giorno(nome_dipendente, giorno):
+    """Timbrature di un solo dipendente in un solo giorno, con le stesse colonne di
+    carica_dati_db(): è tutto ciò che serve alla tabella "Le tue timbrature di oggi",
+    che prima si ricavava dall'intero storico di tutti i dipendenti."""
+    with db_connect() as conn:
+        df = pd.read_sql("SELECT Data, Dipendente, Ora, Azione, Luogo, Dettaglio_Trasferta, Commessa, Fase, Dettaglio_Fase, Ruolo FROM timbrature WHERE Dipendente = ? AND Data = ? ORDER BY id",
+                         conn, params=(nome_dipendente, giorno.isoformat()))
+    if df.empty:
+        return pd.DataFrame(columns=EXPECTED_COLS)
+    return df.rename(columns={"Dettaglio_Trasferta": "Dettaglio Trasferta", "Dettaglio_Fase": "Dettaglio Fase"})
+
 def registra_orario(nome_dipendente, tipo_azione, luogo_lavoro, dettaglio, commessa="", fase="", dettaglio_fase="", ruolo=""):
     # Validazione timbratura
     valida, messaggio, stato = validate_timbratura(nome_dipendente, tipo_azione)
@@ -3080,6 +3171,7 @@ def registra_orario(nome_dipendente, tipo_azione, luogo_lavoro, dettaglio, comme
                   (data_str, nome_dipendente, ora_str, tipo_azione, luogo_lavoro, dettaglio, commessa, fase, dettaglio_fase, ruolo, stato))
         conn.commit()
     carica_dati_db.clear()  # la nuova timbratura deve essere visibile subito, non solo dopo la cache
+    _svuota_stato_timbratura()
 
     if fase_da_chiudere:
         st.info(f"🧩 La fase '{fase_da_chiudere[1]}' su '{fase_da_chiudere[0]}' era ancora aperta: chiusa automaticamente con l'uscita.")
@@ -3246,6 +3338,7 @@ def approva_rettifica(rettifica_id, admin_username):
                   ("Approvato", admin_username, rettifica_id))
         conn.commit()
     carica_dati_db.clear()  # è stata aggiunta una nuova timbratura (quella rettificata)
+    _svuota_stato_timbratura()
 
     # 📧 Invia email di notifica al dipendente
     email_dipendente = dipendente.replace(" ", ".").lower() + "@azienda.com"
@@ -3339,13 +3432,12 @@ def get_cliente_e_tipologia_commessa(commessa):
     evitare errori quando si lavora su più commesse simili)."""
     if not commessa:
         return "", ""
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("SELECT cliente, tipologia_impianto FROM commesse WHERE nome = ?", (commessa,))
-        row = c.fetchone()
-        if not row:
-            return "", ""
-        return row[0] or "", row[1] or ""
+    dettaglio = get_commesse_dettaglio()    # già in cache: nessuna query per ogni commessa scelta
+    riga = dettaglio[dettaglio["Nome"] == commessa]
+    if riga.empty:
+        return "", ""
+    cliente, tipologia = riga.iloc[0]["Cliente"], riga.iloc[0]["Tipologia impianto"]
+    return (cliente if isinstance(cliente, str) else "") or "", (tipologia if isinstance(tipologia, str) else "") or ""
 
 def mostra_info_commessa(commessa):
     """Mostra cliente e tipologia impianto della commessa appena scelta in una
@@ -3364,10 +3456,9 @@ OPZIONE_SENZA_CLIENTE = "(senza cliente)"
 def get_mappa_cliente_commesse():
     """Mappa {nome_commessa: cliente} di tutte le commesse (stringa vuota se il
     cliente non è stato inserito in 'Gestione Commesse')."""
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("SELECT nome, cliente FROM commesse")
-        return {nome: (cliente or "").strip() for nome, cliente in c.fetchall()}
+    dettaglio = get_commesse_dettaglio()    # già in cache
+    return {nome: (cliente.strip() if isinstance(cliente, str) else "")
+            for nome, cliente in zip(dettaglio["Nome"], dettaglio["Cliente"])}
 
 def clienti_delle_commesse(commesse, mappa_cliente):
     """Clienti distinti (in ordine alfabetico, senza distinguere maiuscole) delle
@@ -3521,16 +3612,10 @@ def get_luogo_corrente_timbratura(nome_dipendente):
     sessione riparte (prima il selettore tornava a 'Vimek' e l'Uscita di una
     trasferta veniva registrata come 'Vimek'). Senza timbrature recenti: 'Vimek'."""
     predefinito = ("Vimek", "", "nessuna")
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("""SELECT id, Azione, Data, Ora, Luogo, Dettaglio_Trasferta FROM timbrature
-                     WHERE Dipendente = ?
-                     ORDER BY Data DESC, Ora DESC, id DESC
-                     LIMIT 1""", (nome_dipendente,))
-        row = c.fetchone()
+    row = _stato_timbratura_utente(nome_dipendente)["ultima"]
     if not row:
         return predefinito
-    id_, azione, data_str, ora_str, luogo, dettaglio = row
+    id_, azione, data_str, ora_str, luogo, dettaglio = row[:6]
     ts = _parse_timbratura_timestamp(data_str, ora_str)
     if ts is None:
         return predefinito
@@ -3653,6 +3738,271 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
         commessa_chiudi, fase_chiudi = fase_aperta
         registra_orario(dipendente_scelto, "Fine fase", luogo_scelto, dove_trasferta, commessa_chiudi, fase_chiudi)
 
+# --- VIAGGIO DELLA TRASFERTA: STIMA TEORICA E ORE EFFETTIVE ---
+# La stima usa servizi gratuiti di OpenStreetMap, senza chiavi: Nominatim per trasformare
+# un indirizzo in coordinate e il server pubblico di OSRM per il percorso in auto. Sono
+# servizi pubblici con limiti di uso corretto (Nominatim: al massimo una richiesta al
+# secondo, con un nome applicazione riconoscibile), adatti all'uso interno di un'azienda.
+# Il percorso è in AUTO e NON tiene conto di traffico né dell'orario di partenza: per
+# treno o aereo, o se il tempo reale previsto è diverso, le ore si correggono a mano.
+URL_NOMINATIM = "https://nominatim.openstreetmap.org/search"
+URL_OSRM = "https://router.project-osrm.org/route/v1/driving"
+USER_AGENT_VIAGGI = "Timbra-Vimek/1.0 (gestionale interno trasferte)"
+ORE_MAX_VIAGGIO = 200.0
+_PAUSA_NOMINATIM_SECONDI = 1.1
+
+class ErroreViaggio(Exception):
+    """Errore comprensibile (da mostrare all'utente) nel calcolo del viaggio."""
+
+def _scarica_json(url):
+    """GET di un indirizzo che risponde in JSON (sostituibile nei test)."""
+    richiesta = urllib.request.Request(url, headers={"User-Agent": USER_AGENT_VIAGGI, "Accept": "application/json"})
+    with urllib.request.urlopen(richiesta, timeout=12) as risposta:
+        return json.loads(risposta.read().decode("utf-8"))
+
+_FETCH_JSON = _scarica_json
+
+def _chiedi_json(url):
+    try:
+        return _FETCH_JSON(url)
+    except Exception as e:
+        raise ErroreViaggio(f"Servizio di calcolo percorso non raggiungibile ({type(e).__name__}). Riprova tra poco oppure inserisci le ore a mano.")
+
+@st.cache_data(ttl=86400)
+def geocodifica_indirizzo(testo):
+    """(latitudine, longitudine, nome trovato) di un indirizzo, oppure None se non
+    trovato. Il risultato resta in cache un giorno (anche per rispettare i limiti di
+    Nominatim); un errore di rete NON viene messo in cache."""
+    testo = (testo or "").strip()
+    if not testo:
+        return None
+    dati = _chiedi_json(f"{URL_NOMINATIM}?q={urllib.parse.quote(testo)}&format=jsonv2&limit=1")
+    if not dati:
+        return None
+    try:
+        return float(dati[0]["lat"]), float(dati[0]["lon"]), str(dati[0].get("display_name") or testo)
+    except (KeyError, ValueError, TypeError, IndexError):
+        raise ErroreViaggio("Risposta inattesa dal servizio degli indirizzi.")
+
+def calcola_percorso_auto(lat1, lon1, lat2, lon2):
+    """(km, ore) del percorso in auto più veloce tra due punti."""
+    dati = _chiedi_json(f"{URL_OSRM}/{lon1:.6f},{lat1:.6f};{lon2:.6f},{lat2:.6f}?overview=false")
+    try:
+        if dati.get("code") != "Ok":
+            raise ErroreViaggio("Nessun percorso in auto trovato tra i due punti (es. servono traghetto o aereo): inserisci le ore a mano.")
+        percorso = dati["routes"][0]
+        return float(percorso["distance"]) / 1000.0, float(percorso["duration"]) / 3600.0
+    except (KeyError, ValueError, TypeError, IndexError):
+        raise ErroreViaggio("Risposta inattesa dal servizio dei percorsi.")
+
+def giorni_di_viaggio(partenza_dt, ore_andata):
+    """Giorni di calendario toccati dal viaggio di andata (1 se si arriva lo stesso
+    giorno della partenza). Senza partenza indicata: giorni 'pieni' stimati a 8 ore al giorno."""
+    if partenza_dt is None:
+        return max(1, math.ceil(float(ore_andata or 0) / 8.0))
+    arrivo = partenza_dt + datetime.timedelta(hours=float(ore_andata or 0))
+    return (arrivo.date() - partenza_dt.date()).days + 1
+
+def formatta_durata(ore):
+    """5.5 -> '5 h 30 min'."""
+    minuti = int(round(float(ore or 0) * 60))
+    return f"{minuti // 60} h {minuti % 60:02d} min"
+
+def stima_viaggio(partenza, destinazione, partenza_dt=None, andata_ritorno=True):
+    """Stima teorica del viaggio in auto. Restituisce un dizionario con km, ore di
+    andata, ore totali (raddoppiate se andata e ritorno), arrivo previsto, giorni e
+    le coordinate dei due punti. Solleva ErroreViaggio se un indirizzo non si trova o
+    il servizio non risponde."""
+    if not (partenza or "").strip():
+        raise ErroreViaggio("Indica il punto di partenza.")
+    if not (destinazione or "").strip():
+        raise ErroreViaggio("Indica la destinazione (o compila Indirizzo e Stato della trasferta).")
+    punto_a = geocodifica_indirizzo(partenza)
+    if punto_a is None:
+        raise ErroreViaggio(f"Punto di partenza non trovato: '{partenza}'. Prova con via, città e Stato.")
+    if _PAUSA_NOMINATIM_SECONDI:
+        time.sleep(_PAUSA_NOMINATIM_SECONDI)     # Nominatim: massimo una richiesta al secondo
+    punto_b = geocodifica_indirizzo(destinazione)
+    if punto_b is None:
+        raise ErroreViaggio(f"Destinazione non trovata: '{destinazione}'. Prova con via, città e Stato.")
+    km, ore_andata = calcola_percorso_auto(punto_a[0], punto_a[1], punto_b[0], punto_b[1])
+    return {
+        "km": round(km, 1), "ore_andata": round(ore_andata, 2),
+        "ore_totali": round(ore_andata * (2 if andata_ritorno else 1), 2),
+        "andata_ritorno": bool(andata_ritorno),
+        "arrivo": (partenza_dt + datetime.timedelta(hours=ore_andata)) if partenza_dt else None,
+        "giorni": giorni_di_viaggio(partenza_dt, ore_andata),
+        "da": punto_a, "a": punto_b,
+    }
+
+def url_google_maps(partenza, destinazione):
+    """Link per aprire il percorso su Google Maps (solo un collegamento: nessuna chiave
+    né costi, serve a controllare il percorso e a vedere il traffico previsto)."""
+    return ("https://www.google.com/maps/dir/?api=1&travelmode=driving"
+            f"&origin={urllib.parse.quote_plus(partenza or '')}&destination={urllib.parse.quote_plus(destinazione or '')}")
+
+def valida_viaggio(viaggio):
+    """Controllo dei dati di viaggio prima del salvataggio. Restituisce (ok, errore)."""
+    if not viaggio:
+        return True, ""
+    try:
+        ore = float(viaggio.get("ore_teoriche") or 0)
+        km = float(viaggio.get("km") or 0)
+    except (TypeError, ValueError):
+        return False, "Le ore di viaggio previste devono essere un numero."
+    if ore < 0 or km < 0:
+        return False, "Ore e chilometri di viaggio non possono essere negativi."
+    if ore > ORE_MAX_VIAGGIO:
+        return False, f"Le ore di viaggio previste sembrano troppe (massimo {ORE_MAX_VIAGGIO:.0f})."
+    return True, ""
+
+def _scrivi_viaggio(cursore, trasferta_id, viaggio):
+    """Salva (o azzera, se viaggio è vuoto) la parte 'viaggio previsto' di una trasferta.
+    Le ore effettive non si toccano mai da qui. Il flag 'da pagare' (le ore effettive si
+    aggiungono al cartellino) è indipendente dalla stima: può esserci senza ore previste."""
+    da_pagare = 1 if (viaggio and viaggio.get("da_pagare")) else 0
+    cursore.execute("UPDATE trasferte SET viaggio_da_pagare=? WHERE id=?", (da_pagare, trasferta_id))
+    _svuota_cache_ore_viaggio()
+    if viaggio and float(viaggio.get("ore_teoriche") or 0) > 0:
+        pdt = viaggio.get("partenza_dt")
+        cursore.execute("""UPDATE trasferte SET viaggio_partenza=?, viaggio_destinazione=?, viaggio_partenza_dt=?, viaggio_km=?,
+                                  viaggio_ore_andata=?, viaggio_andata_ritorno=?, viaggio_ore_teoriche=? WHERE id=?""",
+                        (str(viaggio.get("partenza") or "").strip(), str(viaggio.get("destinazione") or "").strip(),
+                         pdt.isoformat(timespec="minutes") if hasattr(pdt, "isoformat") else (pdt or None),
+                         float(viaggio.get("km") or 0), float(viaggio.get("ore_andata") or 0),
+                         1 if viaggio.get("andata_ritorno", True) else 0, float(viaggio["ore_teoriche"]), trasferta_id))
+    else:
+        cursore.execute("""UPDATE trasferte SET viaggio_partenza=NULL, viaggio_destinazione=NULL, viaggio_partenza_dt=NULL, viaggio_km=NULL,
+                                  viaggio_ore_andata=NULL, viaggio_andata_ritorno=1, viaggio_ore_teoriche=NULL WHERE id=?""", (trasferta_id,))
+
+@st.cache_data(ttl=30)
+def get_ore_viaggio_da_pagare_mese(anno, mese):
+    """{(dipendente, giorno): ore} delle ore di viaggio EFFETTIVE da aggiungere al
+    cartellino nel mese indicato: solo le trasferte con l'opzione 'da pagare' attiva e
+    con le ore effettive già indicate dall'operatore. Tutte le ore di una trasferta sono
+    attribuite al suo PRIMO giorno (scelta di Marco), quindi il mese è quello di
+    data_inizio. Una sola query per tutti i dipendenti, in cache 30 secondi."""
+    primo = datetime.date(anno, mese, 1).isoformat()
+    ultimo = datetime.date(anno, mese, calendar.monthrange(anno, mese)[1]).isoformat()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT dipendente, data_inizio, viaggio_ore_effettive FROM trasferte
+                     WHERE viaggio_da_pagare = 1 AND viaggio_ore_effettive > 0 AND data_inizio >= ? AND data_inizio <= ?""", (primo, ultimo))
+        righe = c.fetchall()
+    mappa = {}
+    for dipendente, data_inizio, ore in righe:
+        try:
+            giorno = datetime.date.fromisoformat(str(data_inizio)[:10])
+        except ValueError:
+            continue
+        mappa[(dipendente, giorno)] = round(mappa.get((dipendente, giorno), 0.0) + float(ore), 2)
+    return mappa
+
+def _svuota_cache_ore_viaggio():
+    get_ore_viaggio_da_pagare_mese.clear()
+
+def imposta_ore_viaggio_effettive(trasferta_id, dipendente, ore):
+    """Registra sulla trasferta le ore di viaggio effettive (totale, andata e ritorno)
+    indicate dall'operatore. Vale per qualsiasi trasferta dell'operatore, anche già
+    conclusa o con rapporto già consegnato (recupero retroattivo). Restituisce (ok, errore)."""
+    try:
+        ore = float(ore)
+    except (TypeError, ValueError):
+        return False, "Le ore di viaggio devono essere un numero."
+    if ore <= 0 or ore > ORE_MAX_VIAGGIO:
+        return False, f"Le ore di viaggio devono essere maggiori di zero e al massimo {ORE_MAX_VIAGGIO:.0f}."
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE trasferte SET viaggio_ore_effettive=?, viaggio_ore_effettive_il=? WHERE id=? AND dipendente=?",
+                  (round(ore, 2), datetime.date.today().isoformat(), trasferta_id, dipendente))
+        modificate = c.rowcount
+        conn.commit()
+    _svuota_cache_ore_viaggio()
+    if modificate == 0:
+        return False, "Trasferta non trovata tra le tue."
+    return True, ""
+
+def get_trasferte_senza_ore_viaggio(dipendente):
+    """Trasferte dell'operatore con almeno un report intervento già consegnato ma senza
+    ore di viaggio effettive: servono a completare a posteriori i rapporti passati."""
+    with db_connect() as conn:
+        return pd.read_sql("""SELECT t.id AS ID, t.data_inizio AS Dal, t.data_fine AS Al, t.cliente AS Cliente,
+                                     t.viaggio_ore_teoriche AS 'Ore viaggio previste'
+                              FROM trasferte t
+                              WHERE t.dipendente = ? AND t.viaggio_ore_effettive IS NULL
+                                AND EXISTS (SELECT 1 FROM report_interventi r WHERE r.trasferta_id = t.id)
+                              ORDER BY t.data_inizio DESC, t.id DESC""", conn, params=(dipendente,))
+
+def render_stima_viaggio(key_prefix, iniziale=None, destinazione_trasferta="", data_default=None):
+    """Blocco 'Viaggio previsto' del modulo trasferta: punto di partenza, destinazione,
+    giorno e ora di partenza, andata e ritorno; calcola km, ore, arrivo e giorni, mostra
+    la mappa e un link a Google Maps, e lascia correggere a mano le ore totali (per
+    treno, aereo o stime diverse). Restituisce il dizionario da salvare con la trasferta
+    (vedi crea_trasferta/aggiorna_trasferta) oppure None se non c'è nessun viaggio previsto."""
+    iniziale = iniziale or {}
+    st.markdown("**🧭 Viaggio previsto (stima teorica)**")
+    st.caption("Percorso in auto da OpenStreetMap, senza traffico né orari: per treno, aereo o un tempo diverso correggi le ore a mano. "
+               "Le ore effettive le indica l'operatore nel report della trasferta.")
+    k = f"{key_prefix}_viaggio"
+    col_a, col_b = st.columns(2)
+    with col_a:
+        partenza = st.text_input("📍 Punto di partenza", value=iniziale.get("partenza", ""), key=f"{k}_partenza",
+                                 placeholder="es. Via ..., Borgoricco, Italia")
+    with col_b:
+        destinazione_scritta = st.text_input("🏁 Destinazione", value=iniziale.get("destinazione", ""), key=f"{k}_destinazione",
+                                             placeholder="vuoto = Indirizzo e Stato della trasferta")
+    destinazione = (destinazione_scritta or "").strip() or (destinazione_trasferta or "").strip()
+    pdt_iniziale = iniziale.get("partenza_dt")
+    col_c, col_d, col_e = st.columns(3)
+    with col_c:
+        giorno_partenza = st.date_input("📅 Giorno di partenza", value=(pdt_iniziale.date() if pdt_iniziale else (data_default or datetime.date.today())), key=f"{k}_giorno")
+    with col_d:
+        ora_partenza = st.time_input("🕕 Ora di partenza", value=(pdt_iniziale.time() if pdt_iniziale else datetime.time(6, 0)), key=f"{k}_ora")
+    with col_e:
+        andata_ritorno = st.checkbox("Andata e ritorno", value=bool(iniziale.get("andata_ritorno", True)), key=f"{k}_ar")
+    partenza_dt = datetime.datetime.combine(giorno_partenza, ora_partenza) if giorno_partenza and ora_partenza else None
+
+    chiave_stima, chiave_ver = f"{k}_stima", f"{k}_ver"
+    if st.button("🧭 Calcola tempo di viaggio", key=f"{k}_calcola"):
+        try:
+            st.session_state[chiave_stima] = stima_viaggio(partenza, destinazione, partenza_dt, andata_ritorno)
+            st.session_state[chiave_ver] = st.session_state.get(chiave_ver, 0) + 1
+        except ErroreViaggio as e:
+            st.session_state.pop(chiave_stima, None)
+            st.error(str(e))
+    stima = st.session_state.get(chiave_stima)
+    if stima:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Distanza", f"{stima['km']:.0f} km")
+        col2.metric("Andata", formatta_durata(stima["ore_andata"]))
+        col3.metric("Totale", formatta_durata(stima["ore_totali"]))
+        col4.metric("Giorni di viaggio", stima["giorni"])
+        if stima["arrivo"]:
+            st.caption(f"Arrivo previsto all'andata: {stima['arrivo'].strftime('%d/%m/%Y %H:%M')}")
+        try:
+            st.map(pd.DataFrame({"lat": [stima["da"][0], stima["a"][0]], "lon": [stima["da"][1], stima["a"][1]]}))
+        except Exception:
+            pass
+    if partenza.strip() and destinazione:
+        st.markdown(f"[🗺️ Apri il percorso su Google Maps]({url_google_maps(partenza, destinazione)})")
+
+    da_pagare = st.checkbox("💶 Aggiungi le ore di viaggio effettive al cartellino (pagate come ore di lavoro)",
+                            value=bool(iniziale.get("da_pagare", False)), key=f"{k}_da_pagare",
+                            help="Spunta se l'operatore NON timbra durante il viaggio: le ore indicate nel report vengono aggiunte al cartellino, tutte nel primo giorno della trasferta. "
+                                 "Se invece timbra Ingresso/Uscita anche in viaggio, lascia vuoto: sono già nelle ore timbrate e contarle di nuovo le pagherebbe due volte.")
+    # Ore totali modificabili: la chiave cambia a ogni nuovo calcolo, così il campo si riallinea al valore calcolato.
+    valore_ore = stima["ore_totali"] if stima else float(iniziale.get("ore_teoriche") or 0.0)
+    ore_totali = st.number_input("Ore di viaggio previste (totale, modificabili)", min_value=0.0, max_value=ORE_MAX_VIAGGIO, step=0.25,
+                                 value=float(valore_ore), key=f"{k}_ore_{st.session_state.get(chiave_ver, 0)}")
+    if (not ore_totali or ore_totali <= 0) and not da_pagare:
+        return None
+    return {
+        "partenza": partenza.strip(), "destinazione": destinazione, "partenza_dt": partenza_dt,
+        "km": stima["km"] if stima else float(iniziale.get("km") or 0.0),
+        "ore_andata": stima["ore_andata"] if stima else float(iniziale.get("ore_andata") or 0.0),
+        "andata_ritorno": andata_ritorno, "ore_teoriche": float(ore_totali or 0.0), "da_pagare": bool(da_pagare),
+    }
+
 def valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati, dettaglio_auto, dettaglio_treno, dettaglio_aereo):
     """Validazione dati di una trasferta prima del salvataggio. Restituisce (ok, errore)."""
     if not dipendente:
@@ -3673,12 +4023,16 @@ def valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezio
 
 def crea_trasferta(dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi_selezionati,
                     dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio,
-                    note, creata_da):
+                    note, creata_da, viaggio=None):
     """Programma una nuova trasferta per un operatore, su una commessa (da cui si
     ricava il cliente), con uno o più mezzi di trasporto insieme (es. aereo per
-    arrivare + auto a noleggio per muoversi sul posto). Restituisce (ok, errore)."""
+    arrivare + auto a noleggio per muoversi sul posto). 'viaggio' (facoltativo) è il
+    viaggio previsto, vedi render_stima_viaggio. Restituisce (ok, errore)."""
     ok, errore = valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati,
                                    dettaglio_auto, dettaglio_treno, dettaglio_aereo)
+    if not ok:
+        return False, errore
+    ok, errore = valida_viaggio(viaggio)
     if not ok:
         return False, errore
     cliente = get_cliente_commessa(commessa)
@@ -3698,6 +4052,8 @@ def crea_trasferta(dipendente, data_inizio, data_fine, commessa, stato, indirizz
                    str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
                    str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
                    str(note or "").strip(), creata_da, datetime.date.today().isoformat()))
+        if viaggio:
+            _scrivi_viaggio(c, c.lastrowid, viaggio)
         conn.commit()
     return True, ""
 
@@ -3710,8 +4066,14 @@ def get_trasferte_dettaglio():
                                     albergo AS Albergo, mezzi AS Mezzi, dettaglio_auto AS Targa,
                                     CASE WHEN auto_propria=1 THEN 'Sì' ELSE 'No' END AS 'Auto propria',
                                     dettaglio_treno AS 'Numero treno', dettaglio_aereo AS 'Numero volo',
-                                    dettaglio_auto_noleggio AS 'Note noleggio', note AS Note, creata_da AS 'Programmata da'
+                                    dettaglio_auto_noleggio AS 'Note noleggio', note AS Note, creata_da AS 'Programmata da',
+                                    viaggio_partenza AS 'Viaggio da', viaggio_ore_teoriche AS 'Ore viaggio previste',
+                                    viaggio_ore_effettive AS 'Ore viaggio effettive',
+                                    CASE WHEN viaggio_da_pagare=1 THEN 'Sì' ELSE 'No' END AS 'Viaggio nel cartellino'
                              FROM trasferte ORDER BY data_inizio DESC, id DESC""", conn)
+    for col in ("Ore viaggio previste", "Ore viaggio effettive"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")      # colonna tutta vuota = oggetti None: la rende numerica
+    df["Scostamento viaggio (h)"] = (df["Ore viaggio effettive"] - df["Ore viaggio previste"]).round(2)
     return df
 
 def get_trasferte_dipendente(dipendente):
@@ -3720,9 +4082,12 @@ def get_trasferte_dipendente(dipendente):
     precompilare da sola il campo 'Cliente/Luogo' invece di farlo riscrivere a mano."""
     with db_connect() as conn:
         df = pd.read_sql("""SELECT id AS ID, data_inizio AS Dal, data_fine AS Al, cliente AS Cliente, stato AS Stato,
-                                    indirizzo AS Indirizzo
+                                    indirizzo AS Indirizzo, viaggio_ore_teoriche AS 'Ore viaggio previste',
+                                    viaggio_ore_effettive AS 'Ore viaggio effettive'
                              FROM trasferte WHERE dipendente = ? ORDER BY data_inizio DESC, id DESC""",
                           conn, params=(dipendente,))
+    for col in ("Ore viaggio previste", "Ore viaggio effettive"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
@@ -3733,14 +4098,25 @@ def get_trasferta_by_id(trasferta_id):
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""SELECT dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi,
-                            dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio, note
+                            dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio, note,
+                            viaggio_partenza, viaggio_destinazione, viaggio_partenza_dt, viaggio_km, viaggio_ore_andata,
+                            viaggio_andata_ritorno, viaggio_ore_teoriche, viaggio_ore_effettive, viaggio_da_pagare
                      FROM trasferte WHERE id = ?""", (trasferta_id,))
         riga = c.fetchone()
     if not riga:
         return None
     (dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi,
-     dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio, note) = riga
+     dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio, note,
+     v_partenza, v_destinazione, v_partenza_dt, v_km, v_ore_andata, v_ar, v_ore_teoriche, v_ore_effettive, v_da_pagare) = riga
+    try:
+        v_dt = datetime.datetime.fromisoformat(str(v_partenza_dt)) if v_partenza_dt else None
+    except ValueError:
+        v_dt = None
     return {
+        "viaggio": ({"partenza": v_partenza or "", "destinazione": v_destinazione or "", "partenza_dt": v_dt,
+                     "km": v_km or 0.0, "ore_andata": v_ore_andata or 0.0, "andata_ritorno": bool(v_ar) if v_ar is not None else True,
+                     "ore_teoriche": v_ore_teoriche or 0.0, "da_pagare": bool(v_da_pagare)} if (v_ore_teoriche or v_da_pagare) else None),
+        "ore_viaggio_effettive": v_ore_effettive,
         "dipendente": dipendente,
         "data_inizio": datetime.date.fromisoformat(str(data_inizio)[:10]),
         "data_fine": datetime.date.fromisoformat(str(data_fine)[:10]),
@@ -3760,7 +4136,7 @@ def get_trasferta_by_id(trasferta_id):
 
 def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo,
                         mezzi_selezionati, dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo,
-                        dettaglio_auto_noleggio, note):
+                        dettaglio_auto_noleggio, note, viaggio="invariato"):
     """Modifica una trasferta già programmata, ad esempio per correggere un errore di
     data, indirizzo, albergo o mezzo scoperto dopo la creazione. A differenza della
     cancellazione, la modifica è permessa anche se la trasferta ha già un report
@@ -3772,6 +4148,10 @@ def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commess
                                    dettaglio_auto, dettaglio_treno, dettaglio_aereo)
     if not ok:
         return False, errore
+    if viaggio != "invariato":
+        ok, errore = valida_viaggio(viaggio)
+        if not ok:
+            return False, errore
     cliente = get_cliente_commessa(commessa)
     with db_connect() as conn:
         c = conn.cursor()
@@ -3788,6 +4168,9 @@ def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commess
                    str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
                    str(note or "").strip(), trasferta_id))
         righe_modificate = c.rowcount
+        _svuota_cache_ore_viaggio()          # la data di inizio potrebbe essere cambiata
+        if righe_modificate and viaggio != "invariato":     # None = nessun viaggio previsto (azzera la stima)
+            _scrivi_viaggio(c, trasferta_id, viaggio)
         conn.commit()
     if righe_modificate == 0:
         return False, "Trasferta non trovata (potrebbe essere stata eliminata nel frattempo)."
@@ -3803,6 +4186,7 @@ def elimina_trasferta(trasferta_id):
             return False, "Questa trasferta ha già un report intervento collegato: elimina prima quello."
         c.execute("DELETE FROM trasferte WHERE id = ?", (trasferta_id,))
         conn.commit()
+    _svuota_cache_ore_viaggio()
     return True, ""
 
 def aggiorna_costi_trasferta(trasferta_id, costo_alloggio, costo_trasporto):
@@ -3857,15 +4241,23 @@ def calcola_ore_lavorate_periodo(df, dipendente, data_inizio, data_fine):
                             (giornaliero["Data"] >= data_inizio) & (giornaliero["Data"] <= data_fine)]
     return round(float(filtrato["Ore_lavorate"].sum()), 2) if not filtrato.empty else 0.0
 
-def salva_report_intervento(trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, foto_caricate, data_intervento=None):
+def salva_report_intervento(trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, foto_caricate, data_intervento=None, ore_viaggio=None):
     """Salva il report di un intervento (testo + eventuali foto compresse) per una
     trasferta del dipendente. Le ore di lavoro sono calcolate dal chiamante dalle
     timbrature reali (vedi calcola_ore_lavorate_periodo), non inserite a mano. Se
     viene indicato un giorno dell'intervento, deve rientrare nel periodo Dal/Al della
     trasferta selezionata: altrimenti le ore calcolate finirebbero per riferirsi a un
-    giorno che non c'entra nulla con quella trasferta. Restituisce (ok, errore)."""
+    giorno che non c'entra nulla con quella trasferta. ore_viaggio (facoltativo) sono le
+    ore di viaggio effettive di tutta la trasferta (andata e ritorno): se indicate (>0)
+    vengono salvate anche sulla trasferta. Restituisce (ok, errore)."""
     if not descrizione or not str(descrizione).strip():
         return False, "Inserisci una descrizione del lavoro svolto."
+    if ore_viaggio:
+        try:
+            if not (0 < float(ore_viaggio) <= ORE_MAX_VIAGGIO):
+                raise ValueError
+        except (TypeError, ValueError):
+            return False, f"Le ore di viaggio devono essere maggiori di zero e al massimo {ORE_MAX_VIAGGIO:.0f}."
     with db_connect() as conn:
         c = conn.cursor()
         if data_intervento is not None:
@@ -3878,13 +4270,17 @@ def salva_report_intervento(trasferta_id, dipendente, cliente_luogo, descrizione
                     return False, (f"Il giorno dell'intervento ({data_intervento_iso}) deve rientrare nel periodo della "
                                    f"trasferta selezionata ({data_inizio_trasferta} → {data_fine_trasferta}).")
         c.execute("""INSERT INTO report_interventi
-                     (trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, data_intervento, data_creazione)
-                     VALUES (?,?,?,?,?,?,?,?,?)""",
+                     (trasferta_id, dipendente, cliente_luogo, descrizione, ore_lavoro, commessa, fase, data_intervento, data_creazione, ore_viaggio)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
                   (trasferta_id, dipendente, str(cliente_luogo or "").strip(), str(descrizione).strip(),
                    float(ore_lavoro) if ore_lavoro else 0.0, commessa, fase,
                    data_intervento.isoformat() if hasattr(data_intervento, "isoformat") else data_intervento,
-                   datetime.date.today().isoformat()))
+                   datetime.date.today().isoformat(), round(float(ore_viaggio), 2) if ore_viaggio else None))
         report_id = c.lastrowid
+        if ore_viaggio:
+            c.execute("UPDATE trasferte SET viaggio_ore_effettive=?, viaggio_ore_effettive_il=? WHERE id=?",
+                      (round(float(ore_viaggio), 2), datetime.date.today().isoformat(), trasferta_id))
+            _svuota_cache_ore_viaggio()
         oggi_str = datetime.date.today().isoformat()
         for foto in (foto_caricate or []):
             dati_foto = comprimi_immagine_upload(foto)
@@ -4025,14 +4421,21 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     if "Auto a noleggio" in mezzi_scelti_trasf:
         dettaglio_noleggio_trasf = st.text_input("Note auto a noleggio (agenzia, prenotazione, ecc. - opzionale)", key=f"{key_prefix}_trasf_noleggio")
 
+    st.markdown("---")
+    viaggio_trasf = render_stima_viaggio(f"{key_prefix}_trasf", destinazione_trasferta=", ".join(x for x in (indirizzo_trasf, stato_trasf) if (x or "").strip()),
+                                         data_default=data_inizio_trasf)
+    st.markdown("---")
+
     note_trasf = st.text_area("Note (opzionale)", key=f"{key_prefix}_trasf_note")
 
     if st.button("💾 Programma trasferta", key=f"{key_prefix}_trasf_salva"):
         ok, errore = crea_trasferta(operatore_scelto, data_inizio_trasf, data_fine_trasf, commessa_scelta_trasf,
                                      stato_trasf, indirizzo_trasf, albergo_trasf, mezzi_scelti_trasf,
                                      dettaglio_auto_trasf, auto_propria_trasf, dettaglio_treno_trasf,
-                                     dettaglio_aereo_trasf, dettaglio_noleggio_trasf, note_trasf, attore_nome)
+                                     dettaglio_aereo_trasf, dettaglio_noleggio_trasf, note_trasf, attore_nome, viaggio=viaggio_trasf)
         if ok:
+            for chiave_viaggio in (f"{key_prefix}_trasf_viaggio_stima", f"{key_prefix}_trasf_viaggio_ver"):
+                st.session_state.pop(chiave_viaggio, None)     # la prossima trasferta riparte senza la stima di questa
             st.success(f"Trasferta programmata per {operatore_scelto}.")
             st.rerun()
         else:
@@ -4115,13 +4518,21 @@ def render_trasferte_programmate(key_prefix):
                 dettaglio_noleggio_mod = st.text_input("Note auto a noleggio (agenzia, prenotazione, ecc. - opzionale)",
                                                         value=dettaglio_noleggio_mod, key=f"{key_prefix}_trasf_mod_noleggio_{trasferta_id_modifica}")
 
+            st.markdown("---")
+            viaggio_mod = render_stima_viaggio(f"{key_prefix}_trasf_mod_{trasferta_id_modifica}", iniziale=dati_mod["viaggio"],
+                                               destinazione_trasferta=", ".join(x for x in (indirizzo_mod, stato_mod) if (x or "").strip()),
+                                               data_default=data_inizio_mod)
+            if dati_mod["ore_viaggio_effettive"]:
+                st.caption(f"Ore di viaggio effettive indicate dall'operatore nel report: **{formatta_durata(dati_mod['ore_viaggio_effettive'])}**")
+            st.markdown("---")
+
             note_mod = st.text_area("Note (opzionale)", value=dati_mod["note"], key=f"{key_prefix}_trasf_mod_note_{trasferta_id_modifica}")
 
             if st.button("💾 Salva modifiche", key=f"{key_prefix}_trasf_mod_salva_{trasferta_id_modifica}"):
                 ok, errore = aggiorna_trasferta(trasferta_id_modifica, dati_mod["dipendente"], data_inizio_mod, data_fine_mod,
                                                  commessa_mod, stato_mod, indirizzo_mod, albergo_mod, mezzi_mod,
                                                  dettaglio_auto_mod, auto_propria_mod, dettaglio_treno_mod, dettaglio_aereo_mod,
-                                                 dettaglio_noleggio_mod, note_mod)
+                                                 dettaglio_noleggio_mod, note_mod, viaggio=viaggio_mod)
                 if ok:
                     st.success("Trasferta aggiornata.")
                     st.rerun()
@@ -4142,6 +4553,127 @@ def render_trasferte_programmate(key_prefix):
                 else:
                     st.error(errore)
 
+
+# --- SITUAZIONE IN TEMPO REALE DELL'AREA SERVICE ---
+# Dove sono e cosa stanno facendo, ora, i dipendenti dell'area Service. Si ricava SOLO da
+# ciò che l'app già registra (timbrature, modalità di lavoro scelta, fase aperta,
+# trasferte programmate, ferie/permessi approvati): non c'è nessuna posizione GPS.
+PAGINA_SITUAZIONE_SERVICE = "📍 Situazione Service"
+
+def calcola_situazione_operatore(righe, adesso):
+    """Stato di un dipendente a partire dalle sue timbrature recenti. 'righe' sono tuple
+    (id, Azione, Data, Ora, Luogo, Dettaglio_Trasferta, Commessa, Fase, Dettaglio_Fase).
+    Stesse regole della pagina Timbrature (ultima timbratura per Data, Ora, id; turno
+    'dimenticato' oltre TIMBRATURA_STALE_HOURS). Restituisce un dizionario con stato,
+    dove, attivita, commessa, ultima (testo con l'orario)."""
+    risultato = {"stato": "⚪ Non timbrato", "dove": "-", "attivita": "-", "commessa": "", "ultima": "-"}
+    if not righe:
+        return risultato
+    ordinate = sorted(righe, key=lambda r: (str(r[2]), str(r[3]), r[0]))
+    ultima = ordinate[-1]
+    ts = _parse_timbratura_timestamp(ultima[2], ultima[3])
+    if ts is None:
+        return risultato
+    risultato["ultima"] = ts.strftime("%H:%M") if ts.date() == adesso.date() else ts.strftime("%d/%m %H:%M")
+    if ultima[1] == "Uscita":
+        risultato["stato"] = "🔴 Uscito" if ts.date() == adesso.date() else "⚪ Non timbrato"
+        return risultato
+    if (adesso - ts).total_seconds() / 3600 > TIMBRATURA_STALE_HOURS:
+        return risultato              # ingresso dimenticato da molte ore: non si considera "al lavoro"
+    ultima_pausa = next((r for r in reversed(ordinate) if r[1] in ("Inizio Pausa", "Fine Pausa")), None)
+    ultima_fase = next((r for r in reversed(ordinate) if r[1] in ("Inizio fase", "Fine fase")), None)
+    in_pausa = bool(ultima_pausa) and ultima_pausa[1] == "Inizio Pausa"
+    risultato["stato"] = "☕ In pausa" if in_pausa else "🟢 Al lavoro"
+    luogo = str(ultima[4] or "").strip()
+    dettaglio = str(ultima[5] or "").strip()
+    if luogo == "Trasferta":
+        risultato["dove"] = "In trasferta" + (f" — {dettaglio}" if dettaglio not in ("", "-", "nan", "None") else "")
+    elif luogo == "Smart":
+        risultato["dove"] = "Smart working"
+    elif luogo == "Vimek":
+        risultato["dove"] = "In sede (Vimek)"
+    elif luogo:
+        risultato["dove"] = luogo
+    if ultima_fase and ultima_fase[1] == "Inizio fase":
+        commessa, fase, nota = ultima_fase[6] or "", ultima_fase[7] or "", str(ultima_fase[8] or "").strip()
+        if commessa == ATTIVITA_REPARTO:
+            risultato["attivita"] = f"Attività di reparto: {fase}" + (f" ({nota})" if nota else "")
+        elif commessa == ATTIVITA_VARIE:
+            risultato["attivita"] = "Varie" + (f": {nota}" if nota else "")
+        else:
+            risultato["attivita"] = f"{commessa} → {fase}"
+            risultato["commessa"] = commessa
+    return risultato
+
+def get_situazione_service(adesso=None):
+    """Tabella (una riga per dipendente dell'area Service) con stato, dove si trova,
+    attività in corso, cliente, ultima timbratura, trasferta di oggi ed eventuale
+    ferie/permesso. Sempre letta dal database (nessuna cache): è la vista 'in tempo
+    reale'. Poche query in blocco, non una per dipendente."""
+    adesso = adesso or get_current_datetime()
+    oggi = adesso.date()
+    colonne = ["Dipendente", "Stato", "Dove", "Attività in corso", "Cliente", "Ultima timbratura", "Trasferta di oggi", "Assenza"]
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome FROM utenti WHERE LOWER(TRIM(COALESCE(area,''))) = 'service' AND LOWER(COALESCE(role,'')) IN ('user','responsabile') ORDER BY nome")
+        nomi = [r[0] for r in c.fetchall()]
+        if not nomi:
+            return pd.DataFrame(columns=colonne)
+        segnaposto = ",".join("?" for _ in nomi)
+        da = (oggi - datetime.timedelta(days=3)).isoformat()
+        c.execute(f"""SELECT Dipendente, id, Azione, Data, Ora, Luogo, Dettaglio_Trasferta, Commessa, Fase, Dettaglio_Fase
+                      FROM timbrature WHERE Dipendente IN ({segnaposto}) AND Data >= ?""", (*nomi, da))
+        per_dip = {}
+        for riga in c.fetchall():
+            per_dip.setdefault(riga[0], []).append(tuple(riga[1:]))
+        c.execute(f"""SELECT dipendente, cliente, indirizzo, stato, albergo FROM trasferte
+                      WHERE dipendente IN ({segnaposto}) AND data_inizio <= ? AND data_fine >= ?
+                      ORDER BY data_inizio, id""", (*nomi, oggi.isoformat(), oggi.isoformat()))
+        trasferte = {}
+        for dip, cliente, indirizzo, stato, albergo in c.fetchall():
+            testo = ", ".join(x for x in ((cliente or "").strip(), ", ".join(y for y in ((indirizzo or "").strip(), (stato or "").strip()) if y)) if x)
+            trasferte.setdefault(dip, []).append(testo or "(dettagli non indicati)")
+        c.execute("SELECT nome, cliente FROM commesse")
+        clienti = {n: (cl or "").strip() for n, cl in c.fetchall()}
+    assenze = get_mappa_assenze_approvate()
+    righe = []
+    for nome in nomi:
+        sit = calcola_situazione_operatore(per_dip.get(nome, []), adesso)
+        ore_assenza = assenze.get((nome, oggi), 0.0)
+        assenza = "Ferie" if ore_assenza >= 8 else (f"Permesso ({ore_assenza:g}h)" if ore_assenza > 0 else "")
+        righe.append({
+            "Dipendente": nome, "Stato": sit["stato"], "Dove": sit["dove"], "Attività in corso": sit["attivita"],
+            "Cliente": clienti.get(sit["commessa"], ""), "Ultima timbratura": sit["ultima"],
+            "Trasferta di oggi": " | ".join(trasferte.get(nome, [])), "Assenza": assenza,
+        })
+    ordine = {"🟢": 0, "☕": 1, "🔴": 2, "⚪": 3}
+    righe.sort(key=lambda r: (ordine.get(r["Stato"][:1], 9), r["Dipendente"]))
+    return pd.DataFrame(righe, columns=colonne)
+
+def render_situazione_service(key_prefix):
+    """Pagina 'Situazione Service': chi è al lavoro, dove (sede, smart working, trasferta e
+    dove), con quale attività e per quale cliente, in questo momento. Si aggiorna da sola
+    ogni 60 secondi (come le altre pagine di sola visualizzazione) e col pulsante."""
+    st.subheader("📍 Situazione Service")
+    adesso = get_current_datetime()
+    col_ora, col_btn = st.columns([3, 1])
+    col_ora.caption(f"Aggiornato alle {adesso.strftime('%H:%M:%S')} del {adesso.strftime('%d/%m/%Y')} · si aggiorna da solo ogni minuto")
+    col_btn.button("🔄 Aggiorna ora", key=f"{key_prefix}_situazione_aggiorna")
+    tabella = get_situazione_service(adesso)
+    if tabella.empty:
+        st.info("Nessun dipendente nell'area Service.")
+        return
+    conteggi = tabella["Stato"].str[:1].value_counts()
+    in_trasferta = int(tabella["Dove"].astype(str).str.startswith("In trasferta").sum())
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Al lavoro", int(conteggi.get("🟢", 0)))
+    c2.metric("In pausa", int(conteggi.get("☕", 0)))
+    c3.metric("In trasferta", in_trasferta)
+    c4.metric("Usciti", int(conteggi.get("🔴", 0)))
+    c5.metric("Non timbrati", int(conteggi.get("⚪", 0)))
+    st.dataframe(tabella, use_container_width=True, hide_index=True)
+    st.caption("Si ricava dalle timbrature (modalità di lavoro e fase aperta), dalle trasferte programmate e da ferie/permessi approvati: non c'è la posizione GPS. "
+               "'Non timbrato' = nessun ingresso oggi.")
 
 def render_report_interventi_ricevuti(key_prefix):
     """Sotto-pagina 'Report interventi ricevuti': elenco di tutti i report
@@ -4237,6 +4769,17 @@ def render_report_intervento(dipendente_nome, df, key_prefix):
                 fase_scelta_rep = st.selectbox("Fase (opzionale)", ["(nessuna)"] + fasi_rep, key=f"{key_prefix}_rep_fase")
                 fase_rep = fase_scelta_rep if fase_scelta_rep != "(nessuna)" else None
 
+    st.markdown("**🚗 Ore di viaggio**")
+    prev_rep = riga_trasferta_scelta.get("Ore viaggio previste")
+    eff_rep = riga_trasferta_scelta.get("Ore viaggio effettive")
+    if pd.notna(prev_rep) and prev_rep:
+        st.caption(f"Viaggio previsto per questa trasferta: **{formatta_durata(prev_rep)}** in totale (andata e ritorno se previsto).")
+    if pd.notna(eff_rep) and eff_rep:
+        st.caption(f"Hai già indicato **{formatta_durata(eff_rep)}** di viaggio effettivo per questa trasferta: inserendo un nuovo valore lo sostituisci.")
+    ore_viaggio_rep = st.number_input("Ore di viaggio effettive di tutta la trasferta (andata + ritorno; 0 = non indicare)",
+                                      min_value=0.0, max_value=ORE_MAX_VIAGGIO, step=0.25, value=0.0,
+                                      key=f"{key_prefix}_rep_ore_viaggio_{trasferta_id_scelta}")
+
     if not PIL_AVAILABLE:
         st.caption("ℹ️ Le foto verranno salvate senza compressione (libreria Pillow non disponibile).")
     foto_caricate = st.file_uploader("Foto dell'intervento (opzionale, puoi caricarne più di una)",
@@ -4246,12 +4789,36 @@ def render_report_intervento(dipendente_nome, df, key_prefix):
     if st.button("💾 Salva report intervento", key=f"{key_prefix}_rep_salva"):
         ok, errore = salva_report_intervento(trasferta_id_scelta, dipendente_nome, cliente_luogo_rep,
                                               descrizione_rep, ore_calcolate_rep, commessa_rep, fase_rep, foto_caricate,
-                                              data_intervento=giorno_intervento_rep)
+                                              data_intervento=giorno_intervento_rep, ore_viaggio=ore_viaggio_rep or None)
         if ok:
             st.success("Report salvato.")
             st.rerun()
         else:
             st.error(errore)
+
+    # Recupero retroattivo: trasferte con un rapporto già consegnato ma senza le ore di viaggio.
+    mancanti = get_trasferte_senza_ore_viaggio(dipendente_nome)
+    if not mancanti.empty:
+        st.markdown("---")
+        st.markdown("**🕓 Completa le ore di viaggio dei rapporti già consegnati**")
+        st.caption("Queste trasferte hanno già un rapporto, ma non le ore di viaggio effettive: indicale qui e verranno registrate sulla trasferta.")
+        opzioni_mancanti = [f"#{id_} - {dal} → {al}" + (f" ({cliente})" if cliente else "")
+                            for id_, dal, al, cliente in zip(mancanti["ID"], mancanti["Dal"], mancanti["Al"], mancanti["Cliente"])]
+        mappa_mancanti = dict(zip(opzioni_mancanti, mancanti["ID"].tolist()))
+        scelta_mancante = st.selectbox("Trasferta da completare", opzioni_mancanti, key=f"{key_prefix}_rep_viaggio_retro_sel")
+        id_mancante = mappa_mancanti[scelta_mancante]
+        previste_mancante = mancanti[mancanti["ID"] == id_mancante].iloc[0]["Ore viaggio previste"]
+        if pd.notna(previste_mancante) and previste_mancante:
+            st.caption(f"Viaggio previsto: {formatta_durata(previste_mancante)}")
+        ore_retro = st.number_input("Ore di viaggio effettive (andata + ritorno)", min_value=0.0, max_value=ORE_MAX_VIAGGIO, step=0.25, value=0.0,
+                                    key=f"{key_prefix}_rep_viaggio_retro_ore_{id_mancante}")
+        if st.button("💾 Registra ore di viaggio", key=f"{key_prefix}_rep_viaggio_retro_salva"):
+            ok_retro, errore_retro = imposta_ore_viaggio_effettive(id_mancante, dipendente_nome, ore_retro)
+            if ok_retro:
+                st.success("Ore di viaggio registrate.")
+                st.rerun()
+            else:
+                st.error(errore_retro)
 
     st.markdown("---")
     st.markdown("**I tuoi report inviati**")
@@ -5969,7 +6536,8 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
     """Cartellino mensile di un dipendente: una riga per ogni giorno del mese con
     ingresso/uscita, inizio/fine pausa pranzo, luogo di lavoro, ore ordinarie e ore
     straordinarie (oltre ORE_ORDINARIE_GIORNALIERE ore/giorno, al netto della pausa
-    pranzo). I giorni coperti da una richiesta di ferie/permesso approvata vengono
+    pranzo), più le 'Ore viaggio' delle trasferte con l'opzione "aggiungi al cartellino"
+    (colonna a parte, nel primo giorno della trasferta, comprese nelle Ore Per Portale). I giorni coperti da una richiesta di ferie/permesso approvata vengono
     marcati come tali. Non elenca più le commesse/fasi lavorate giorno per giorno
     (c'era una colonna 'Commesse/Fasi'): tolta su richiesta di Marco, che quel
     dettaglio lo consulta già nella pagina 'Riepilogo personale' e qui, nel
@@ -5996,6 +6564,10 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
                 giorno_corrente += datetime.timedelta(days=1)
 
     pausa_abituale = pausa_pranzo_abituale_di(nome_dipendente, get_users_pausa_pranzo_map())
+
+    # Ore di viaggio effettive delle trasferte con l'opzione "aggiungi al cartellino":
+    # tutte nel primo giorno della trasferta (vedi get_ore_viaggio_da_pagare_mese).
+    ore_viaggio_mese = {g: o for (dip, g), o in get_ore_viaggio_da_pagare_mese(anno, mese).items() if dip == nome_dipendente}
 
     n_giorni = calendar.monthrange(anno, mese)[1]
     righe = []
@@ -6041,6 +6613,9 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
             ore_ordinarie = round(min(ore_nette, ORE_ORDINARIE_GIORNALIERE), 2)
             ore_straordinarie = round(max(ore_nette - ORE_ORDINARIE_GIORNALIERE, 0), 2)
 
+        ore_viaggio = round(float(ore_viaggio_mese.get(data_corrente, 0.0)), 2)
+        if dove_txt == "-" and ore_viaggio > 0:
+            dove_txt = "Viaggio (trasferta)"
         if dove_txt == "-":
             if data_corrente in giorni_ferie:
                 dove_txt = "Ferie"
@@ -6061,8 +6636,11 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
             "Dove": dove_txt,
             "Ore ordinarie": ore_ordinarie,
             "Ore straordinarie": ore_straordinarie,
+            "Ore viaggio": ore_viaggio,
             "Ore Arrotondate": ore_arrotondate,
-            "Ore Per Portale": formato_ore_portale(arrotonda_mezz_ora(ore_ordinarie) + ore_arrotondate),
+            # Ore per il portale paghe: ordinarie + straordinarie arrotondate + ore di
+            # viaggio (anch'esse alla mezz'ora, come le ordinarie).
+            "Ore Per Portale": formato_ore_portale(arrotonda_mezz_ora(ore_ordinarie) + ore_arrotondate + arrotonda_mezz_ora(ore_viaggio)),
         })
 
     return pd.DataFrame(righe)
@@ -6075,14 +6653,18 @@ def compute_totali_cartellino(cartellino_df, df, nome_dipendente, anno, mese):
     if cartellino_df is None or cartellino_df.empty:
         ore_ordinarie_tot, ore_straordinarie_tot, giorni_lavorati = 0.0, 0.0, 0
         ore_arrotondate_tot, ore_totali_arrotondate = 0.0, 0.0
+        ore_viaggio_tot = 0.0
     else:
         ore_ordinarie_tot = round(float(cartellino_df["Ore ordinarie"].sum()), 2)
         ore_straordinarie_tot = round(float(cartellino_df["Ore straordinarie"].sum()), 2)
         # Si sommano i valori GIÀ arrotondati giorno per giorno (non si arrotonda il
         # totale del mese): è quello che finisce in busta paga giorno per giorno.
         ore_arrotondate_tot = float(cartellino_df["Ore Arrotondate"].sum())
-        ore_totali_arrotondate = float(sum(arrotonda_mezz_ora(o) for o in cartellino_df["Ore ordinarie"])) + ore_arrotondate_tot
-        giorni_lavorati = int(((cartellino_df["Ore ordinarie"] + cartellino_df["Ore straordinarie"]) > 0).sum())
+        ore_viaggio_tot = round(float(cartellino_df["Ore viaggio"].sum()), 2) if "Ore viaggio" in cartellino_df.columns else 0.0
+        ore_viaggio_arrotondate = float(sum(arrotonda_mezz_ora(o) for o in cartellino_df["Ore viaggio"])) if "Ore viaggio" in cartellino_df.columns else 0.0
+        ore_totali_arrotondate = float(sum(arrotonda_mezz_ora(o) for o in cartellino_df["Ore ordinarie"])) + ore_arrotondate_tot + ore_viaggio_arrotondate
+        viaggio_giornaliero = cartellino_df["Ore viaggio"] if "Ore viaggio" in cartellino_df.columns else 0
+        giorni_lavorati = int(((cartellino_df["Ore ordinarie"] + cartellino_df["Ore straordinarie"] + viaggio_giornaliero) > 0).sum())
 
     inizio_mese = datetime.date(anno, mese, 1)
     fine_mese = datetime.date(anno, mese, calendar.monthrange(anno, mese)[1])
@@ -6092,6 +6674,7 @@ def compute_totali_cartellino(cartellino_df, df, nome_dipendente, anno, mese):
     return {
         "ore_ordinarie": ore_ordinarie_tot,
         "ore_straordinarie": ore_straordinarie_tot,
+        "ore_viaggio": ore_viaggio_tot,
         "ore_straordinarie_arrotondate": ore_arrotondate_tot,
         "ore_totali_arrotondate": ore_totali_arrotondate,
         "ore_per_portale": formato_ore_portale(ore_totali_arrotondate),
@@ -6554,11 +7137,13 @@ def render_report_mensile(nome_dipendente, df, key_prefix, mese=None, anno=None)
     col_t2.metric("Ore ordinarie", f"{totali['ore_ordinarie']:.2f}h")
     col_t3.metric("Ore straordinarie", f"{totali['ore_straordinarie']:.2f}h")
     col_t4.metric("Ore su commesse", f"{totali['ore_su_commesse']:.2f}h")
-    col_a1, col_a2, col_a3 = st.columns(3)
+    col_a1, col_a2, col_a3, col_a4 = st.columns(4)
     col_a1.metric("Straordinari arrotondati (mezz'ora)", f"{totali['ore_straordinarie_arrotondate']:.2f}h")
-    col_a2.metric("Ore totali arrotondate", f"{totali['ore_totali_arrotondate']:.2f}h")
-    col_a3.metric("Ore Per Portale", totali["ore_per_portale"])
-    st.caption("Ore Per Portale = ore totali (ordinarie + straordinarie arrotondate alla mezz'ora) nel formato ore,minuti richiesto dal portale paghe: 8,30 = 8 ore e 30 minuti (non 8,5).")
+    col_a2.metric("Ore di viaggio", f"{totali['ore_viaggio']:.2f}h")
+    col_a3.metric("Ore totali arrotondate", f"{totali['ore_totali_arrotondate']:.2f}h")
+    col_a4.metric("Ore Per Portale", totali["ore_per_portale"])
+    st.caption("Ore Per Portale = ore totali (ordinarie + straordinarie arrotondate + ore di viaggio, alla mezz'ora) nel formato ore,minuti richiesto dal portale paghe: 8,30 = 8 ore e 30 minuti (non 8,5). "
+               "Le ore di viaggio sono quelle effettive delle trasferte con l'opzione \"aggiungi al cartellino\", attribuite al primo giorno della trasferta.")
 
     st.markdown("---")
     st.markdown("**Saldo ferie e permessi (maturati fino a questo mese)**")
@@ -6621,7 +7206,7 @@ def compute_riepilogo_hr_mensile(df, anno, mese, dipendenti, df_requests=None, d
     uscite non corrispondenti, vedi _giorni_con_timbrature_anomale) e 'In sospeso'
     (rettifiche e richieste ferie/permessi del mese ancora 'In attesa': finché
     non sono approvate/rifiutate il cartellino potrebbe cambiare)."""
-    colonne = ["Dipendente", "Area", "Giorni lavorati", "Ore ordinarie", "Ore straordinarie",
+    colonne = ["Dipendente", "Area", "Giorni lavorati", "Ore ordinarie", "Ore straordinarie", "Ore viaggio",
                "Ore Arrotondate", "Ore Per Portale", "Giorni ferie", "Ore permesso", "Giorni da verificare", "In sospeso"]
     mappa_area = get_users_area_map()
     inizio_mese = datetime.date(anno, mese, 1)
@@ -6665,6 +7250,7 @@ def compute_riepilogo_hr_mensile(df, anno, mese, dipendenti, df_requests=None, d
             "Dipendente": nome, "Area": mappa_area.get(nome, ""),
             "Giorni lavorati": totali["giorni_lavorati"],
             "Ore ordinarie": totali["ore_ordinarie"], "Ore straordinarie": totali["ore_straordinarie"],
+            "Ore viaggio": totali["ore_viaggio"],
             "Ore Arrotondate": totali["ore_straordinarie_arrotondate"], "Ore Per Portale": totali["ore_per_portale"],
             "Giorni ferie": giorni_ferie, "Ore permesso": round(ore_permesso, 2),
             "Giorni da verificare": len(_giorni_con_timbrature_anomale(df, nome, anno, mese)),
@@ -7128,8 +7714,15 @@ else:
     st.sidebar.button("Logout", on_click=logout)
     st.subheader(f"Benvenuto, {user_info['name']}!")
 
-    df = carica_dati_db()
-    
+    # Le timbrature di tutti NON si caricano più qui, a ogni clic e per ogni pagina: la
+    # pagina "Timbrature" personale non le usa (le sue servono solo quelle di oggi, vedi
+    # carica_timbrature_utente_giorno) e ricaricare l'intero storico, dopo ogni
+    # timbratura e ogni 30 secondi, era tra le cause della lentezza. Ogni ramo qui sotto
+    # le carica con carica_dati_db() appena sa quale pagina deve mostrare.
+    df = None
+    _STATO_TIMBRATURA_RUN.clear()
+    _STATO_TIMBRATURA_RUN_ATTIVO = True   # vedi _stato_timbratura_utente
+
     if user_info["role"] == "admin":
         st.info("Sei connesso come amministratore. Puoi visualizzare i timbri di tutti gli utenti.")
         st.markdown("---")
@@ -7139,11 +7732,12 @@ else:
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto"]),
             ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🛠️ Statistiche Assistenza", "🌱 Sostenibilità (Smart Working)"]),
             ("👥 Risorse Umane", ["Cartellini dipendenti"]),
-            ("🧳 Trasferte e Team", ["Programmazione nuova Trasferta", "Trasferte programmate", "Report interventi ricevuti", "📅 Disponibilità Team"]),
+            ("🧳 Trasferte e Team", ["Programmazione nuova Trasferta", "Trasferte programmate", "Report interventi ricevuti", "📅 Disponibilità Team", PAGINA_SITUAZIONE_SERVICE]),
             ("💰 Costi", ["💰 Costi commesse"]),
             ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
         ], key_prefix="admin_menu", titolo_categoria="Sezione amministratore")
         st.session_state["_ultima_pagina_vista"] = admin_page
+        df = carica_dati_db()
 
         if admin_page == "Dati e Presenze":
             st.subheader("📊 Pannello Amministrazione")
@@ -7482,6 +8076,9 @@ else:
         if admin_page == "📅 Disponibilità Team":
             render_disponibilita_team(key_prefix="admin")
 
+        if admin_page == PAGINA_SITUAZIONE_SERVICE:
+            render_situazione_service(key_prefix="admin")
+
         if not df.empty and admin_page == "Dati e Presenze":
             st.markdown("---")
             export_df = prepare_registro_for_export(df, selected_user=selected_user, start_date=start_date, end_date=end_date)
@@ -7522,6 +8119,7 @@ else:
             pagine_service_resp = ["📷 Report Intervento"]
             if is_area_service(user_info["area"]):
                 pagine_service_resp.append("🛠️ Statistiche Assistenza")
+                pagine_service_resp.append(PAGINA_SITUAZIONE_SERVICE)
             pagina_utente = render_menu_a_categorie([
                 ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
                 ("👤 Profilo", ["Profilo"]),
@@ -7530,6 +8128,8 @@ else:
                 ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
             ], key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
             st.session_state["_ultima_pagina_vista"] = pagina_utente
+            if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE):
+                df = carica_dati_db()
 
             if pagina_utente == "Profilo":
                 st.subheader("👤 Profilo personale")
@@ -7592,7 +8192,7 @@ else:
 
                 st.markdown("---")
                 st.write("Le tue timbrature di oggi:")
-                st.dataframe(get_day_records(df, datetime.date.today(), user_name=dipendente_scelto), use_container_width=True)
+                st.dataframe(carica_timbrature_utente_giorno(dipendente_scelto, datetime.date.today()), use_container_width=True)
             
             elif pagina_utente == "Riepilogo personale":
                 st.subheader("📊 Riepilogo Ore Lavorate")
@@ -7635,6 +8235,9 @@ else:
 
             elif pagina_utente == "🛠️ Statistiche Assistenza":
                 render_statistiche_assistenza(df, key_prefix="resp_personale_assistenza")
+
+            elif pagina_utente == PAGINA_SITUAZIONE_SERVICE:
+                render_situazione_service(key_prefix="resp_personale")
 
             elif pagina_utente == "Richiesta ferie/permessi":
                 st.subheader("Richiesta ferie / permessi")
@@ -7681,6 +8284,7 @@ else:
                 ("📅 Disponibilità", ["📅 Disponibilità Team"]),
             ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
             st.session_state["_ultima_pagina_vista"] = resp_page
+            df = carica_dati_db()
 
             if resp_page == "Timbrature del team":
                 st.subheader(f"📋 Timbrature - Area: {area_responsabile}")
@@ -7816,6 +8420,7 @@ else:
 
         elif modalita == "🧳 Trasferte Service":
             st.session_state["_ultima_pagina_vista"] = "🧳 Trasferte Service"
+            df = carica_dati_db()
             render_gestione_trasferte_service(user_info["name"], key_prefix="resp_service")
             st.markdown("---")
             st.markdown("**Report interventi ricevuti**")
@@ -7829,6 +8434,7 @@ else:
 
         elif modalita == "👥 Risorse Umane":
             st.session_state["_ultima_pagina_vista"] = "Cartellini dipendenti"
+            df = carica_dati_db()
             render_risorse_umane(df, key_prefix="resp_hr")
 
         elif modalita == "💰 Gestione Costi":
@@ -7837,6 +8443,7 @@ else:
                 ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
             ], key_prefix="resp_costi_menu", titolo_categoria="Sezione Costi")
             st.session_state["_ultima_pagina_vista"] = costi_page
+            df = carica_dati_db()
 
             if costi_page == "💰 Costi commesse":
                 render_gestione_costi(df, key_prefix="resp_costi")
@@ -7854,6 +8461,7 @@ else:
         if is_area_service(user_info["area"]):
             pagine_service_utente.append("🧳 Trasferte Service")
             pagine_service_utente.append("🛠️ Statistiche Assistenza")
+            pagine_service_utente.append(PAGINA_SITUAZIONE_SERVICE)
         categorie_utente = [
             ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
             ("👤 Profilo", ["Profilo"]),
@@ -7871,6 +8479,8 @@ else:
         pagina_utente = render_menu_a_categorie(
             categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
+        if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE):
+            df = carica_dati_db()
 
         if pagina_utente == "Profilo":
             st.subheader("👤 Profilo personale")
@@ -7933,7 +8543,7 @@ else:
 
             st.markdown("---")
             st.write("Le tue timbrature di oggi:")
-            st.dataframe(get_day_records(df, datetime.date.today(), user_name=dipendente_scelto), use_container_width=True)
+            st.dataframe(carica_timbrature_utente_giorno(dipendente_scelto, datetime.date.today()), use_container_width=True)
 
         elif pagina_utente == "Riepilogo personale":
             richieste = carica_richieste()
@@ -8031,6 +8641,9 @@ else:
 
         elif pagina_utente == "🛠️ Statistiche Assistenza":
             render_statistiche_assistenza(df, key_prefix="user_assistenza")
+
+        elif pagina_utente == PAGINA_SITUAZIONE_SERVICE:
+            render_situazione_service(key_prefix="user")
 
         elif pagina_utente == "Cartellini dipendenti":
             render_risorse_umane(df, key_prefix="user_hr")
