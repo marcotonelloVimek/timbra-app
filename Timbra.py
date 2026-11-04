@@ -2711,16 +2711,21 @@ def compute_gantt_teorico_tutte_commesse():
     messaggio esplicativo."""
     dettaglio = get_commesse_dettaglio()
     mappa_stato = dict(zip(dettaglio["Nome"], dettaglio["Stato"])) if not dettaglio.empty else {}
+    mappa_cliente = dict(zip(dettaglio["Nome"], dettaglio["Cliente"])) if not dettaglio.empty else {}
     righe = []
     for commessa in get_commesse_names():
         gantt, _ = compute_gantt_teorico_commessa(commessa)
         if gantt.empty:
             continue
         righe.append({
-            "Commessa": commessa, "Stato": mappa_stato.get(commessa) or "-",
-            "Inizio": gantt["Inizio"].min(), "Fine": gantt["Fine"].max(), "N. fasi": len(gantt),
+            "Commessa": commessa, "Cliente": (mappa_cliente.get(commessa) or "").strip(),
+            "Stato": mappa_stato.get(commessa) or "-",
+            # "Numero fasi" e non "N. fasi": il punto nel nome di un campo viene letto
+            # da Vega-Lite come campo annidato, e nel suggerimento sul grafico il valore
+            # compariva come NaN.
+            "Inizio": gantt["Inizio"].min(), "Fine": gantt["Fine"].max(), "Numero fasi": len(gantt),
         })
-    colonne = ["Commessa", "Stato", "Inizio", "Fine", "N. fasi"]
+    colonne = ["Commessa", "Cliente", "Stato", "Inizio", "Fine", "Numero fasi"]
     if not righe:
         return pd.DataFrame(columns=colonne)
     return pd.DataFrame(righe, columns=colonne).sort_values("Inizio").reset_index(drop=True)
@@ -2733,17 +2738,19 @@ def compute_gantt_effettivo_tutte_commesse(df):
     corso. Le commesse senza alcuna fase ancora iniziata non compaiono qui."""
     dettaglio = get_commesse_dettaglio()
     mappa_stato = dict(zip(dettaglio["Nome"], dettaglio["Stato"])) if not dettaglio.empty else {}
+    mappa_cliente = dict(zip(dettaglio["Nome"], dettaglio["Cliente"])) if not dettaglio.empty else {}
     righe = []
     for commessa in get_commesse_names():
         gantt = compute_gantt_effettivo_commessa(commessa, df)
         if gantt.empty:
             continue
         righe.append({
-            "Commessa": commessa, "Stato": mappa_stato.get(commessa) or "-",
+            "Commessa": commessa, "Cliente": (mappa_cliente.get(commessa) or "").strip(),
+            "Stato": mappa_stato.get(commessa) or "-",
             "Inizio": gantt["Inizio"].min(), "Fine": gantt["Fine"].max(),
-            "In corso": bool(gantt["In corso"].any()), "N. fasi lavorate": len(gantt),
+            "In corso": bool(gantt["In corso"].any()), "Fasi lavorate": len(gantt),
         })
-    colonne = ["Commessa", "Stato", "Inizio", "Fine", "In corso", "N. fasi lavorate"]
+    colonne = ["Commessa", "Cliente", "Stato", "Inizio", "Fine", "In corso", "Fasi lavorate"]
     if not righe:
         return pd.DataFrame(columns=colonne)
     return pd.DataFrame(righe, columns=colonne).sort_values("Inizio").reset_index(drop=True)
@@ -5335,6 +5342,27 @@ def render_attivita_reparto(df, key_prefix, scope_area=None, attore=""):
         compute_ore_attivita_non_commessa(df, ATTIVITA_VARIE, inizio, fine, area_f, dip_f),
         "Nessuna ora timbrata su 'Varie' nel periodo selezionato.", "Descrizioni")
 
+def _grafico_gantt_tutte_commesse(gantt, tooltip_extra):
+    """Grafico a barre della vista d'insieme (una barra per commessa, sia teorico sia
+    effettivo): a sinistra, sotto il numero della commessa, il nome del cliente (se c'è),
+    e il cliente compare anche nel suggerimento che si apre passando sopra la barra.
+    'gantt' ha le colonne Commessa, Cliente, Stato, Inizio, Fine più quelle indicate in
+    tooltip_extra."""
+    dati = gantt.copy()
+    dati["Fine (esclusa)"] = pd.to_datetime(dati["Fine"]) + pd.Timedelta(days=1)
+    # Etichetta su due righe 'commessa|cliente' (il separatore è spezzato da labelExpr);
+    # senza cliente resta il solo nome della commessa.
+    dati["Etichetta"] = [
+        f"{str(c).replace('|', '/')}|{str(cl).replace('|', '/')}" if str(cl or "").strip() else str(c).replace("|", "/")
+        for c, cl in zip(dati["Commessa"], dati["Cliente"])]
+    return alt.Chart(dati).mark_bar().encode(
+        x=alt.X("Inizio:T", title="Data"), x2="Fine (esclusa):T",
+        y=alt.Y("Etichetta:N", title="Commessa / Cliente", sort=alt.EncodingSortField(field="Inizio", order="ascending"),
+                axis=alt.Axis(labelExpr="split(datum.label, '|')", labelLimit=220)),
+        color=alt.Color("Stato:N", scale=alt.Scale(domain=list(COLORI_STATO_COMMESSA.keys()), range=list(COLORI_STATO_COMMESSA.values()))),
+        tooltip=["Commessa:N", "Cliente:N", "Stato:N", "Inizio:T", "Fine:T"] + list(tooltip_extra)
+    ).properties(height=42 * len(dati) + 80)
+
 def render_pianificazione_per_reparto(commessa, key_prefix, reparti_modificabili):
     """Sezione 'Pianificazione per reparto' di una commessa: per ogni reparto con fasi
     su di essa, la data di inizio lavori del reparto e le scadenze per macro-fase.
@@ -5439,15 +5467,7 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False, reparti
         if gantt_teorico_tutte.empty:
             st.info("Nessuna commessa ha ancora sia una data di inizio lavori sia delle fasi: imposta questi due dati sulla singola commessa per vederla comparire qui.")
         else:
-            gantt_chart_tutte = gantt_teorico_tutte.copy()
-            gantt_chart_tutte["Fine (esclusa)"] = pd.to_datetime(gantt_chart_tutte["Fine"]) + pd.Timedelta(days=1)
-            chart_tutte = alt.Chart(gantt_chart_tutte).mark_bar().encode(
-                x=alt.X("Inizio:T", title="Data"), x2="Fine (esclusa):T",
-                y=alt.Y("Commessa:N", sort=alt.EncodingSortField(field="Inizio", order="ascending")),
-                color=alt.Color("Stato:N", scale=alt.Scale(domain=list(COLORI_STATO_COMMESSA.keys()), range=list(COLORI_STATO_COMMESSA.values()))),
-                tooltip=["Commessa:N", "Stato:N", "Inizio:T", "Fine:T", "N. fasi:Q"]
-            ).properties(height=32 * len(gantt_chart_tutte) + 80)
-            st.altair_chart(chart_tutte, use_container_width=True)
+            st.altair_chart(_grafico_gantt_tutte_commesse(gantt_teorico_tutte, ["Numero fasi:Q"]), use_container_width=True)
             st.dataframe(gantt_teorico_tutte, use_container_width=True)
 
         st.markdown("---")
@@ -5457,15 +5477,7 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False, reparti
         if gantt_effettivo_tutte.empty:
             st.info("Nessuna commessa ha ancora fasi lavorate.")
         else:
-            gantt_chart_eff_tutte = gantt_effettivo_tutte.copy()
-            gantt_chart_eff_tutte["Fine (esclusa)"] = pd.to_datetime(gantt_chart_eff_tutte["Fine"]) + pd.Timedelta(days=1)
-            chart_eff_tutte = alt.Chart(gantt_chart_eff_tutte).mark_bar().encode(
-                x=alt.X("Inizio:T", title="Data"), x2="Fine (esclusa):T",
-                y=alt.Y("Commessa:N", sort=alt.EncodingSortField(field="Inizio", order="ascending")),
-                color=alt.Color("Stato:N", scale=alt.Scale(domain=list(COLORI_STATO_COMMESSA.keys()), range=list(COLORI_STATO_COMMESSA.values()))),
-                tooltip=["Commessa:N", "Stato:N", "Inizio:T", "Fine:T", "In corso:N", "N. fasi lavorate:Q"]
-            ).properties(height=32 * len(gantt_chart_eff_tutte) + 80)
-            st.altair_chart(chart_eff_tutte, use_container_width=True)
+            st.altair_chart(_grafico_gantt_tutte_commesse(gantt_effettivo_tutte, ["In corso:N", "Fasi lavorate:Q"]), use_container_width=True)
             st.dataframe(gantt_effettivo_tutte, use_container_width=True)
         return
 
