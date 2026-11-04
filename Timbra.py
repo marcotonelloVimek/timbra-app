@@ -528,16 +528,9 @@ def init_db():
                         fase TEXT NOT NULL,
                         UNIQUE(area, fase)
                     )''')
-        # Elenchi di partenza delle attività di reparto: una volta sola per reparto
-        # (la tabella-marcatore evita che le voci tolte dall'utente ricompaiano a
-        # ogni riavvio).
+        # Marcatore degli elenchi di partenza già caricati (vedi
+        # _precarica_attivita_reparto): evita che le voci tolte dall'utente ricompaiano.
         c.execute('''CREATE TABLE IF NOT EXISTS attivita_reparto_precompilate (area TEXT PRIMARY KEY)''')
-        for area_pre, attivita_pre in ATTIVITA_REPARTO_PREDEFINITE.items():
-            c.execute("SELECT 1 FROM attivita_reparto_precompilate WHERE area=?", (area_pre,))
-            if c.fetchone() is None:
-                for voce in attivita_pre:
-                    c.execute("INSERT OR IGNORE INTO fasi_area (area, fase) VALUES (?, ?)", (area_pre, voce))
-                c.execute("INSERT INTO attivita_reparto_precompilate (area) VALUES (?)", (area_pre,))
         conn.commit()
 
         # Tabella Commesse - creabili solo dall'admin
@@ -1603,9 +1596,31 @@ def rimuovi_fase_area(area, fase):
 # Elenco per reparto nella tabella fasi_area. Il confronto del reparto non distingue
 # maiuscole/minuscole né spazi (vedi _stesso_reparto).
 
+@st.cache_resource
+def _precarica_attivita_reparto(versione_elenchi):
+    """Carica gli elenchi di partenza (ATTIVITA_REPARTO_PREDEFINITE) dei reparti che non
+    sono ancora stati precaricati: UNA volta sola per reparto, perché il marcatore
+    (tabella attivita_reparto_precompilate) evita che le voci tolte dall'utente
+    ricompaiano. Non sta in init_db: init_db è in cache e, se il suo codice non cambia,
+    non rigira dopo un aggiornamento, per cui un reparto aggiunto agli elenchi di
+    partenza non verrebbe mai caricato. Qui la cache è legata alla 'versione' degli
+    elenchi, quindi si riesegue ogni volta che gli elenchi di partenza cambiano."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS attivita_reparto_precompilate (area TEXT PRIMARY KEY)")
+        for area_pre, attivita_pre in ATTIVITA_REPARTO_PREDEFINITE.items():
+            c.execute("SELECT 1 FROM attivita_reparto_precompilate WHERE area=?", (area_pre,))
+            if c.fetchone() is None:
+                for voce in attivita_pre:
+                    c.execute("INSERT OR IGNORE INTO fasi_area (area, fase) VALUES (?, ?)", (area_pre, voce))
+                c.execute("INSERT INTO attivita_reparto_precompilate (area) VALUES (?)", (area_pre,))
+        conn.commit()
+    return True
+
 def get_attivita_reparto(area):
     """Attività fisse del reparto (ordinate, senza duplicati); lista vuota se il
     reparto non ne ha: in quel caso i suoi utenti usano 'Varie'."""
+    _precarica_attivita_reparto(repr(sorted((a, tuple(v)) for a, v in ATTIVITA_REPARTO_PREDEFINITE.items())))
     if not (area or "").strip():
         return []
     with db_connect() as conn:
