@@ -383,6 +383,11 @@ ATTIVITA_REPARTO_PREDEFINITE = {
         "Paghe, presenze e ferie", "Banche, pagamenti e solleciti",
         "Pratiche e documenti (dogana, estero, assicurazioni)", "Segreteria e centralino", "Riunioni e formazione",
     ],
+    "Automazione": [
+        "Corsi e formazione", "Modifica librerie e blocchi standard", "Sviluppo standard PLC / HMI",
+        "Template e documentazione standard", "Supporto interno e consulenza", "Test e prove in laboratorio",
+        "Backup, archivio progetti e licenze software", "Riunioni",
+    ],
     "Magazzino": [
         "Ricevimento merci e controllo bolle", "Stoccaggio e riordino a scaffale", "Prelievi e preparazione ordini",
         "Spedizioni e carico automezzi", "Inventario", "Gestione ricambi",
@@ -399,6 +404,27 @@ ATTIVITA_REPARTO_PREDEFINITE = {
 # impianto consegnato). Le sue ore compaiono comunque nella pagina Costi, come
 # riga extra della commessa (vedi compute_costi_fasi_commessa).
 FASE_ASSISTENZA = "Assistenza"
+
+# Altre due fasi "virtuali" sullo stesso modello, richieste da Marco per Automazione:
+# "Ricambi su commessa" e "Manuali su commessa" (es. gestione ricambi di un impianto,
+# stesura del manuale operatore). Come l'Assistenza sono sempre timbrabili su OGNI
+# commessa, senza riga in fasi_commessa né ore stimate, e le loro ore compaiono nella
+# pagina Costi come riga extra della commessa.
+FASE_RICAMBI = "Ricambi"
+FASE_MANUALI = "Manuali"
+# Fasi virtuali: nome -> (etichetta nel selettore di timbratura, domanda sulla commessa,
+# reparti che la vedono; None = tutti i reparti).
+FASI_VIRTUALI_COMMESSA = {
+    FASE_ASSISTENZA: ("🛠️ Assistenza su commessa", "🏗️ Commessa su cui fai assistenza", None),
+    FASE_RICAMBI: ("🔩 Ricambi su commessa", "🏗️ Commessa per cui gestisci i ricambi", ("Automazione",)),
+    FASE_MANUALI: ("📘 Manuali su commessa", "🏗️ Commessa di cui scrivi il manuale", ("Automazione",)),
+}
+
+def fasi_virtuali_per_reparto(area):
+    """Nomi delle fasi virtuali (Assistenza, Ricambi, Manuali) timbrabili da un
+    dipendente di questo reparto, nell'ordine di FASI_VIRTUALI_COMMESSA."""
+    return [nome for nome, (_etichetta, _domanda, reparti) in FASI_VIRTUALI_COMMESSA.items()
+            if reparti is None or any(_stesso_reparto(area, r) for r in reparti)]
 
 @st.cache_resource
 def init_db():
@@ -1599,7 +1625,7 @@ def aggiungi_attivita_reparto(area, attivita):
         return False, "Seleziona un reparto."
     if not attivita:
         return False, "Il nome dell'attività è obbligatorio."
-    if attivita.casefold() in (ATTIVITA_VARIE.casefold(), FASE_ASSISTENZA.casefold(), ATTIVITA_REPARTO.casefold()):
+    if attivita.casefold() in {n.casefold() for n in (ATTIVITA_VARIE, ATTIVITA_REPARTO, *FASI_VIRTUALI_COMMESSA)}:
         return False, f"'{attivita}' è un nome riservato: scegline un altro."
     if attivita.casefold() in [a.casefold() for a in get_attivita_reparto(area)]:
         return False, f"L'attività '{attivita}' esiste già per il reparto {area}."
@@ -3450,14 +3476,16 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
     # (prima erano due caselle) perché le scelte si escludono a vicenda.
     attivita_reparto = get_attivita_reparto(user_info.get("area"))
     TIPO_COMMESSA, TIPO_REPARTO = "🏗️ Commessa", "🗂️ Attività di reparto"
-    TIPO_ASSISTENZA, TIPO_VARIE = "🛠️ Assistenza su commessa", "🔧 Varie"
-    opzioni_tipo = [TIPO_COMMESSA] + ([TIPO_REPARTO] if attivita_reparto else []) + [TIPO_ASSISTENZA, TIPO_VARIE]
+    TIPO_VARIE = "🔧 Varie"
+    fasi_virtuali = fasi_virtuali_per_reparto(user_info.get("area"))
+    etichetta_virtuale = {FASI_VIRTUALI_COMMESSA[f][0]: f for f in fasi_virtuali}   # etichetta -> fase
+    opzioni_tipo = [TIPO_COMMESSA] + ([TIPO_REPARTO] if attivita_reparto else []) + list(etichetta_virtuale) + [TIPO_VARIE]
     chiave_tipo = f"{key_prefix}_tipo_attivita_timbra"
     if st.session_state.get(chiave_tipo) not in opzioni_tipo:
         st.session_state.pop(chiave_tipo, None)  # scelta non più disponibile (es. elenco del reparto svuotato)
     tipo_lavoro = st.radio("Su cosa lavori?", opzioni_tipo, horizontal=True, key=chiave_tipo)
     e_varie = tipo_lavoro == TIPO_VARIE
-    e_assistenza = tipo_lavoro == TIPO_ASSISTENZA
+    fase_virtuale = etichetta_virtuale.get(tipo_lavoro)   # Assistenza / Ricambi / Manuali, oppure None
     e_reparto = tipo_lavoro == TIPO_REPARTO
     dettaglio_fase = ""
     if e_varie:
@@ -3468,19 +3496,21 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
         commessa_scelta = ATTIVITA_REPARTO
         fase_scelta = st.selectbox("Attività", attivita_reparto, key=f"{key_prefix}_attivita_reparto_timbra")
         dettaglio_fase = st.text_input("Note (facoltative)", key=f"{key_prefix}_attivita_reparto_dettaglio_timbra")
-    elif e_assistenza:
+    elif fase_virtuale:
         # Qualsiasi commessa esistente, a prescindere da stato, reparto e
-        # assegnazione delle sue fasi: la fase è sempre FASE_ASSISTENZA.
-        commesse_assistenza = get_commesse_names()
-        if not commesse_assistenza:
-            st.warning("Nessuna commessa esistente su cui timbrare l'assistenza.")
+        # assegnazione delle sue fasi: la fase è sempre quella virtuale scelta
+        # (FASE_ASSISTENZA, FASE_RICAMBI o FASE_MANUALI).
+        commesse_virtuale = get_commesse_names()
+        slug = fase_virtuale.casefold()
+        if not commesse_virtuale:
+            st.warning(f"Nessuna commessa esistente su cui timbrare '{fase_virtuale}'.")
             commessa_scelta, fase_scelta = None, None
         else:
             commessa_scelta = selettore_commessa_con_filtro_cliente(
-                commesse_assistenza, "🏗️ Commessa su cui fai assistenza", f"{key_prefix}_assistenza_timbra")
+                commesse_virtuale, FASI_VIRTUALI_COMMESSA[fase_virtuale][1], f"{key_prefix}_{slug}_timbra")
             mostra_info_commessa(commessa_scelta)
-            fase_scelta = FASE_ASSISTENZA if commessa_scelta else None
-            dettaglio_fase = st.text_input("Cosa stai facendo? (facoltativo)", key=f"{key_prefix}_assistenza_dettaglio_timbra")
+            fase_scelta = fase_virtuale if commessa_scelta else None
+            dettaglio_fase = st.text_input("Cosa stai facendo? (facoltativo)", key=f"{key_prefix}_{slug}_dettaglio_timbra")
     else:
         # Solo le commesse 'Da iniziare'/'In corso' che hanno, nel suo reparto,
         # almeno una fase assegnata a lui o non ancora assegnata a nessuno:
@@ -4892,16 +4922,21 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase
     # costi. Diventano una riga extra (nessuna ora stimata, quindi costo
     # ipotetico 0) per ogni (commessa, reparto). Se invece l'admin ha creato una
     # vera fase chiamata "Assistenza" per quel reparto, le ore vanno su quella.
+    # Lo stesso vale per le altre fasi virtuali (Ricambi, Manuali): vedi FASI_VIRTUALI_COMMESSA.
     if not aggregato.empty:
-        assistenza = aggregato[aggregato["Fase"] == FASE_ASSISTENZA]
-        assistenza = assistenza[[(c, f, a) not in chiavi_fasi_pianificate
-                                  for c, f, a in zip(assistenza["Commessa"], assistenza["Fase"], assistenza["Area"])]]
-        if not assistenza.empty:
-            with db_connect() as conn:
-                anni = dict(conn.execute("SELECT nome, anno_produzione FROM commesse").fetchall())
-            extra = assistenza.copy()
+        anni = None
+        for fase_virtuale_nome in FASI_VIRTUALI_COMMESSA:
+            virtuale = aggregato[aggregato["Fase"] == fase_virtuale_nome]
+            virtuale = virtuale[[(c, f, a) not in chiavi_fasi_pianificate
+                                  for c, f, a in zip(virtuale["Commessa"], virtuale["Fase"], virtuale["Area"])]]
+            if virtuale.empty:
+                continue
+            if anni is None:
+                with db_connect() as conn:
+                    anni = dict(conn.execute("SELECT nome, anno_produzione FROM commesse").fetchall())
+            extra = virtuale.copy()
             extra["Anno_produzione"] = extra["Commessa"].map(anni)
-            extra["Macro-fase"] = FASE_ASSISTENZA
+            extra["Macro-fase"] = fase_virtuale_nome
             extra["Stato"] = "-"
             extra["Ore_stimate"] = 0.0
             extra["Costo_ipotetico"] = 0.0
@@ -4977,9 +5012,9 @@ def render_gestione_costi(df, key_prefix):
     with col_area_fasi:
         area_filtro_fasi = st.selectbox("Area", options=get_area_names(), key=f"{key_prefix}_costi_fasi_area_filtro")
     with col_macro_fasi:
-        macro_fase_filtro_fasi = st.selectbox("Macro-fase", options=["Tutte le macro-fasi"] + MACRO_FASI_DISPONIBILI + [FASE_ASSISTENZA], key=f"{key_prefix}_costi_fasi_macro_filtro")
+        macro_fase_filtro_fasi = st.selectbox("Macro-fase", options=["Tutte le macro-fasi"] + MACRO_FASI_DISPONIBILI + list(FASI_VIRTUALI_COMMESSA), key=f"{key_prefix}_costi_fasi_macro_filtro")
     with col_fase_fasi:
-        fase_filtro_fasi = st.selectbox("Fase", options=["Tutte le fasi"] + sorted(set(get_fase_names_disponibili()) | {FASE_ASSISTENZA}), key=f"{key_prefix}_costi_fasi_fase_filtro")
+        fase_filtro_fasi = st.selectbox("Fase", options=["Tutte le fasi"] + sorted(set(get_fase_names_disponibili()) | set(FASI_VIRTUALI_COMMESSA)), key=f"{key_prefix}_costi_fasi_fase_filtro")
     with col_anno_fasi:
         anno_filtro_fasi = st.selectbox("Anno di produzione", options=["Tutti gli anni"] + get_anni_produzione_disponibili(), key=f"{key_prefix}_costi_fasi_anno_filtro")
     fasi_costi = compute_costi_fasi_commessa(
