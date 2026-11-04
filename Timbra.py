@@ -3,6 +3,7 @@ import datetime
 import pandas as pd
 import os
 import calendar
+import math
 import altair as alt
 import sqlite3
 import pytz
@@ -237,6 +238,42 @@ DEFAULT_FERIE_GIORNI = 20
 DEFAULT_PERMESSO_ORE = 16.0
 DEFAULT_COSTO_ORARIO = 25.0  # €/h di partenza per il costo del personale per livello (da personalizzare)
 ORE_ORDINARIE_GIORNALIERE = 8.0  # Soglia oltre la quale le ore lavorate in un giorno sono straordinario
+# Arrotondamento alla mezz'ora richiesto dall'ufficio paghe: "vicino" = alla mezz'ora
+# più vicina (0.25 e 0.75 salgono: 0.25 -> 0.5), "difetto" = sempre per difetto,
+# "eccesso" = sempre per eccesso. Basta cambiare questo valore per cambiare la regola
+# ovunque (cartellino, totali, riepilogo HR, PDF).
+ARROTONDAMENTO_MEZZ_ORA = "vicino"
+
+def arrotonda_mezz_ora(ore):
+    """Ore decimali arrotondate alla mezz'ora (vedi ARROTONDAMENTO_MEZZ_ORA):
+    0.64 -> 0.5, 1.39 -> 1.5, 7.86 -> 8.0. Lavora sui mezz'ore interi per evitare
+    gli errori dei decimali."""
+    try:
+        ore = float(ore)
+    except (TypeError, ValueError):
+        return 0.0
+    if ore != ore or ore <= 0:  # NaN o non positivo
+        return 0.0
+    mezz_ore = ore * 2
+    if ARROTONDAMENTO_MEZZ_ORA == "difetto":
+        n = math.floor(mezz_ore + 1e-9)
+    elif ARROTONDAMENTO_MEZZ_ORA == "eccesso":
+        n = math.ceil(mezz_ore - 1e-9)
+    else:
+        n = math.floor(mezz_ore + 0.5 + 1e-9)
+    return n / 2
+
+def formato_ore_portale(ore_decimali):
+    """Ore nel formato del portale paghe: ORE,MINUTI (sessagesimale) e non ore
+    decimali. 8.5 ore (8 ore e mezza) -> '8,30'; 9.0 -> '9,00'; 0.5 -> '0,30'. Il
+    portale legge la parte dopo la virgola come minuti: scrivere 8,5 verrebbe
+    letto come 8 ore e 50 minuti."""
+    try:
+        minuti = int(round(float(ore_decimali) * 60))
+    except (TypeError, ValueError):
+        minuti = 0
+    minuti = max(minuti, 0)
+    return f"{minuti // 60},{minuti % 60:02d}"
 
 # Orario di fine giornata "tipo" di fallback, usato per chi non ha ancora impostato il
 # proprio in "Area Personale": se un dipendente dimentica di timbrare l'Uscita (o di
@@ -328,6 +365,30 @@ MACRO_FASI_DISPONIBILI = [
 # ore-per-commessa già esistenti (Riepilogo personale, report PDF), dato che
 # quelli si basano sulle timbrature reali, non sull'anagrafica delle commesse.
 ATTIVITA_VARIE = "Varie"
+
+# "Attività di reparto": attività fisse di un reparto che non appartengono a nessuna
+# commessa (es. fatturazione in Amministrazione, ricevimento merci in Magazzino),
+# richieste da Marco perché non tutti i reparti lavorano per commessa. Come 'Varie'
+# non esistono in commesse/fasi_commessa: la timbratura ha Commessa = ATTIVITA_REPARTO
+# e Fase = nome dell'attività scelta da un elenco per reparto (tabella fasi_area,
+# gestita da admin e responsabile). Non entrano nei costi/produttività delle commesse.
+ATTIVITA_REPARTO = "Attività di reparto"
+
+# Elenchi di partenza, caricati UNA volta sola al primo avvio (vedi init_db) e poi
+# modificabili liberamente: gli altri reparti partono senza attività fisse e i loro
+# utenti continuano a usare 'Varie' finché il responsabile non ne aggiunge.
+ATTIVITA_REPARTO_PREDEFINITE = {
+    "Amministrazione": [
+        "Fatturazione e contabilità", "Ordini clienti e conferme d'ordine", "Acquisti e ordini ai fornitori",
+        "Paghe, presenze e ferie", "Banche, pagamenti e solleciti",
+        "Pratiche e documenti (dogana, estero, assicurazioni)", "Segreteria e centralino", "Riunioni e formazione",
+    ],
+    "Magazzino": [
+        "Ricevimento merci e controllo bolle", "Stoccaggio e riordino a scaffale", "Prelievi e preparazione ordini",
+        "Spedizioni e carico automezzi", "Inventario", "Gestione ricambi",
+        "Materiale di consumo, utensili e DPI", "Manutenzione carrelli e pulizia",
+    ],
+}
 
 # Fase "Assistenza", richiesta da Marco: "se devo fare un'assistenza non posso
 # timbrare come assistenza nelle commesse. Vorrei poter timbrare la fase
@@ -441,6 +502,17 @@ def init_db():
                         fase TEXT NOT NULL,
                         UNIQUE(area, fase)
                     )''')
+        # Elenchi di partenza delle attività di reparto: una volta sola per reparto
+        # (la tabella-marcatore evita che le voci tolte dall'utente ricompaiano a
+        # ogni riavvio).
+        c.execute('''CREATE TABLE IF NOT EXISTS attivita_reparto_precompilate (area TEXT PRIMARY KEY)''')
+        for area_pre, attivita_pre in ATTIVITA_REPARTO_PREDEFINITE.items():
+            c.execute("SELECT 1 FROM attivita_reparto_precompilate WHERE area=?", (area_pre,))
+            if c.fetchone() is None:
+                for voce in attivita_pre:
+                    c.execute("INSERT OR IGNORE INTO fasi_area (area, fase) VALUES (?, ?)", (area_pre, voce))
+                c.execute("INSERT INTO attivita_reparto_precompilate (area) VALUES (?)", (area_pre,))
+        conn.commit()
 
         # Tabella Commesse - creabili solo dall'admin
         c.execute('''CREATE TABLE IF NOT EXISTS commesse (
@@ -1090,7 +1162,7 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
         story.append(Spacer(1, 0.2*inch))
 
         if not cartellino_df.empty:
-            intestazione = ["Giorno", "Ingresso", "Uscita", "Inizio\nPausa", "Fine\nPausa", "Dove", "Ore\nord.", "Ore\nstraord."]
+            intestazione = ["Giorno", "Ingresso", "Uscita", "Inizio\nPausa", "Fine\nPausa", "Dove", "Ore\nord.", "Ore\nstraord.", "Ore\narrot.", "Ore per\nportale"]
             table_data = [intestazione]
             for _, row in cartellino_df.iterrows():
                 table_data.append([
@@ -1102,8 +1174,10 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
                     str(row.get("Dove", "-"))[:20],
                     str(row.get("Ore ordinarie", 0)),
                     str(row.get("Ore straordinarie", 0)),
+                    str(row.get("Ore Arrotondate", 0)),
+                    str(row.get("Ore Per Portale", "0,00")),
                 ])
-            col_widths = [1.1*inch, 0.85*inch, 0.85*inch, 0.85*inch, 0.85*inch, 2.0*inch, 0.75*inch, 0.85*inch]
+            col_widths = [1.0*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 1.7*inch, 0.65*inch, 0.75*inch, 0.7*inch, 0.8*inch]
             table = Table(table_data, colWidths=col_widths, repeatRows=1)
             stile_tabella = [
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(VIMEK_NAVY)),
@@ -1123,12 +1197,18 @@ def generate_pdf_cartellino_mensile(nome_dipendente, anno, mese, cartellino_df, 
         if not cartellino_df.empty and cartellino_df["Inizio Pausa"].astype(str).str.contains("(auto)", regex=False).any():
             story.append(Paragraph("(auto) = pausa pranzo non timbrata: dedotta in automatico secondo l'orario di pausa abituale del dipendente.", info_style))
             story.append(Spacer(1, 0.1*inch))
+        story.append(Paragraph("Ore arrot. = ore straordinarie arrotondate alla mezz'ora. Ore per portale = ore totali del giorno (ordinarie + straordinarie arrotondate) nel formato del portale paghe, ore,minuti: 8,30 = 8 ore e 30 minuti.", info_style))
+        story.append(Spacer(1, 0.1*inch))
         story.append(Paragraph("<b>Totali del mese</b>", styles['Heading2']))
         story.append(Paragraph(
             f"Giorni lavorati: {totali['giorni_lavorati']} &nbsp;|&nbsp; "
             f"Ore ordinarie: {totali['ore_ordinarie']:.2f}h &nbsp;|&nbsp; "
             f"Ore straordinarie: {totali['ore_straordinarie']:.2f}h &nbsp;|&nbsp; "
             f"Ore su commesse: {totali['ore_su_commesse']:.2f}h", info_style))
+        story.append(Paragraph(
+            f"Straordinari arrotondati: {totali['ore_straordinarie_arrotondate']:.2f}h &nbsp;|&nbsp; "
+            f"Ore totali arrotondate: {totali['ore_totali_arrotondate']:.2f}h &nbsp;|&nbsp; "
+            f"<b>Ore per portale: {totali['ore_per_portale']}</b>", info_style))
         story.append(Spacer(1, 0.15*inch))
 
         story.append(Paragraph("<b>Saldo ferie e permessi (maturati fino a questo mese)</b>", styles['Heading2']))
@@ -1493,31 +1573,97 @@ def rimuovi_fase_area(area, fase):
         conn.commit()
     return True
 
+# --- ATTIVITÀ DI REPARTO (non legate a una commessa) ---
+# Elenco per reparto nella tabella fasi_area. Il confronto del reparto non distingue
+# maiuscole/minuscole né spazi (vedi _stesso_reparto).
 
-def render_gestione_fasi_area(default_area=None):
-    st.subheader("🧩 Gestione fasi per area")
-    aree = [area for area in get_area_names() if area != "Tutte le aree"]
-    if not aree:
-        st.info("Nessuna area disponibile da configurare.")
-        return
-    selected_area = st.selectbox("Area", options=aree, index=0 if default_area not in aree else aree.index(default_area), key="fase_area_select")
-    fasi_esistenti = get_fasi_area(area=selected_area, posizione="")
-    new_phase = st.text_input("Nuova fase", key=f"new_phase_{selected_area}")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Aggiungi fase", key=f"add_phase_{selected_area}"):
-            if aggiungi_fase_area(selected_area, new_phase):
-                st.success(f"Fase aggiunta per {selected_area}.")
+def get_attivita_reparto(area):
+    """Attività fisse del reparto (ordinate, senza duplicati); lista vuota se il
+    reparto non ne ha: in quel caso i suoi utenti usano 'Varie'."""
+    if not (area or "").strip():
+        return []
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT area, fase FROM fasi_area")
+        voci = {}
+        for area_db, fase in c.fetchall():
+            if _stesso_reparto(area_db, area) and (fase or "").strip():
+                voci.setdefault(fase.strip().casefold(), fase.strip())
+    return sorted(voci.values(), key=str.casefold)
+
+def aggiungi_attivita_reparto(area, attivita):
+    """Aggiunge un'attività all'elenco del reparto. Restituisce (ok, messaggio_errore)."""
+    area = (area or "").strip()
+    attivita = (attivita or "").strip()
+    if not area:
+        return False, "Seleziona un reparto."
+    if not attivita:
+        return False, "Il nome dell'attività è obbligatorio."
+    if attivita.casefold() in (ATTIVITA_VARIE.casefold(), FASE_ASSISTENZA.casefold(), ATTIVITA_REPARTO.casefold()):
+        return False, f"'{attivita}' è un nome riservato: scegline un altro."
+    if attivita.casefold() in [a.casefold() for a in get_attivita_reparto(area)]:
+        return False, f"L'attività '{attivita}' esiste già per il reparto {area}."
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO fasi_area (area, fase) VALUES (?, ?)", (area, attivita))
+        conn.commit()
+    return True, ""
+
+def rimuovi_attivita_reparto(area, attivita):
+    """Toglie un'attività dall'elenco del reparto (le timbrature già fatte restano e
+    compaiono ancora nelle statistiche). Restituisce (ok, messaggio_errore)."""
+    if not (area or "").strip() or not (attivita or "").strip():
+        return False, "Reparto e attività sono obbligatori."
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, area, fase FROM fasi_area")
+        ids = [id_ for id_, area_db, fase in c.fetchall()
+               if _stesso_reparto(area_db, area) and (fase or "").strip().casefold() == attivita.strip().casefold()]
+        for id_ in ids:
+            c.execute("DELETE FROM fasi_area WHERE id=?", (id_,))
+        conn.commit()
+    return (True, "") if ids else (False, "Attività non trovata.")
+
+def render_gestione_attivita_reparto(key_prefix, scope_area=None):
+    """Elenco delle attività fisse di un reparto, con aggiunta e rimozione. Con
+    scope_area (responsabile) il reparto è fisso; senza (admin) si sceglie."""
+    st.markdown("**📋 Elenco attività del reparto**")
+    if scope_area:
+        area_sel = scope_area
+        st.caption(f"Stai gestendo le attività del reparto **{area_sel}**.")
+    else:
+        aree = [a for a in get_area_names() if a != "Tutte le aree"]
+        if not aree:
+            st.info("Nessun reparto disponibile: crea prima un utente con un'area.")
+            return None
+        area_sel = st.selectbox("Reparto", aree, key=f"{key_prefix}_att_area_gestione")
+    attivita = get_attivita_reparto(area_sel)
+    st.caption("Sono le attività che gli utenti del reparto possono timbrare quando non lavorano su una commessa. Senza attività fisse usano 'Varie'.")
+    if attivita:
+        st.dataframe(pd.DataFrame({"Attività": attivita}), use_container_width=True)
+    else:
+        st.info("Nessuna attività fissa per questo reparto: i suoi utenti timbrano 'Varie'.")
+    col_add, col_del = st.columns(2)
+    with col_add:
+        nuova = st.text_input("Nuova attività", key=f"{key_prefix}_att_nuova_{_chiave_reparto(area_sel)}")
+        if st.button("➕ Aggiungi attività", key=f"{key_prefix}_att_btn_add_{_chiave_reparto(area_sel)}"):
+            ok, errore = aggiungi_attivita_reparto(area_sel, nuova)
+            if ok:
+                st.success(f"Attività '{nuova.strip()}' aggiunta.")
                 st.rerun()
-    with col2:
-        if fasi_esistenti:
-            phase_to_remove = st.selectbox("Fase da rimuovere", options=fasi_esistenti, key=f"phase_remove_{selected_area}")
-            if st.button("Rimuovi fase", key=f"remove_phase_{selected_area}"):
-                if rimuovi_fase_area(selected_area, phase_to_remove):
-                    st.success(f"Fase rimossa da {selected_area}.")
+            else:
+                st.error(errore)
+    with col_del:
+        if attivita:
+            da_togliere = st.selectbox("Attività da rimuovere", attivita, key=f"{key_prefix}_att_sel_del_{_chiave_reparto(area_sel)}")
+            if st.button("🗑️ Rimuovi attività", key=f"{key_prefix}_att_btn_del_{_chiave_reparto(area_sel)}"):
+                ok, errore = rimuovi_attivita_reparto(area_sel, da_togliere)
+                if ok:
+                    st.success(f"Attività '{da_togliere}' rimossa (le timbrature già fatte restano).")
                     st.rerun()
-        else:
-            st.info("Nessuna fase configurata per questa area.")
+                else:
+                    st.error(errore)
+    return area_sel
 
 # --- FUNZIONI COMMESSE E FASI PER COMMESSA ---
 # Le commesse le crea solo l'admin. Le fasi al loro interno sono sempre legate a
@@ -1622,6 +1768,8 @@ def crea_commessa(nome, descrizione, creata_da, cliente="", tipologia_impianto="
     nome = (nome or "").strip()
     if not nome:
         return False, "Il nome della commessa è obbligatorio."
+    if nome.casefold() in (ATTIVITA_VARIE.casefold(), ATTIVITA_REPARTO.casefold()):
+        return False, f"'{nome}' è un nome riservato alle attività non legate a una commessa: scegline un altro."
     if priorita not in PRIORITA_COMMESSA_DISPONIBILI:
         priorita = "Media"
     with db_connect() as conn:
@@ -3286,7 +3434,8 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
     """Blocco '🧩 Fase Lavorativa' della pagina Timbrature, condiviso tra la vista
     del responsabile (quando timbra per sé stesso) e quella dell'utente
     semplice - erano due copie identiche. Oltre alle commesse/fasi assegnate al
-    dipendente nel suo reparto, mostra sempre anche l'opzione 'Varie', per chi
+    dipendente nel suo reparto, offre le attività fisse del reparto (vedi
+    ATTIVITA_REPARTO, se il reparto ne ha) e sempre anche l'opzione 'Varie', per chi
     deve timbrare un'attività che non riguarda nessuna commessa (vedi
     ATTIVITA_VARIE): in quel caso Commessa e Fase diventano entrambe 'Varie' e
     si può aggiungere una breve descrizione libera facoltativa (salvata in
@@ -3296,14 +3445,29 @@ def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, d
     if fase_aperta:
         st.info(f"Fase attualmente aperta: **{fase_aperta[0]} → {fase_aperta[1]}**")
 
-    e_varie = st.checkbox("🔧 Varie (attività non legata a una commessa specifica)", key=f"{key_prefix}_varie_timbra")
-    e_assistenza = st.checkbox("🛠️ Assistenza (su una qualsiasi commessa, anche già completata)",
-                               key=f"{key_prefix}_assistenza_timbra", disabled=e_varie)
-    e_assistenza = e_assistenza and not e_varie
+    # Tipo di lavoro: commessa, attività fissa del proprio reparto (solo se il reparto
+    # ne ha), assistenza su una qualsiasi commessa, oppure 'Varie'. Un selettore unico
+    # (prima erano due caselle) perché le scelte si escludono a vicenda.
+    attivita_reparto = get_attivita_reparto(user_info.get("area"))
+    TIPO_COMMESSA, TIPO_REPARTO = "🏗️ Commessa", "🗂️ Attività di reparto"
+    TIPO_ASSISTENZA, TIPO_VARIE = "🛠️ Assistenza su commessa", "🔧 Varie"
+    opzioni_tipo = [TIPO_COMMESSA] + ([TIPO_REPARTO] if attivita_reparto else []) + [TIPO_ASSISTENZA, TIPO_VARIE]
+    chiave_tipo = f"{key_prefix}_tipo_attivita_timbra"
+    if st.session_state.get(chiave_tipo) not in opzioni_tipo:
+        st.session_state.pop(chiave_tipo, None)  # scelta non più disponibile (es. elenco del reparto svuotato)
+    tipo_lavoro = st.radio("Su cosa lavori?", opzioni_tipo, horizontal=True, key=chiave_tipo)
+    e_varie = tipo_lavoro == TIPO_VARIE
+    e_assistenza = tipo_lavoro == TIPO_ASSISTENZA
+    e_reparto = tipo_lavoro == TIPO_REPARTO
     dettaglio_fase = ""
     if e_varie:
         commessa_scelta, fase_scelta = ATTIVITA_VARIE, ATTIVITA_VARIE
+        st.caption("Per attività non legate a una commessa e non presenti nell'elenco del tuo reparto.")
         dettaglio_fase = st.text_input("Cosa stai facendo? (facoltativo)", key=f"{key_prefix}_varie_dettaglio_timbra")
+    elif e_reparto:
+        commessa_scelta = ATTIVITA_REPARTO
+        fase_scelta = st.selectbox("Attività", attivita_reparto, key=f"{key_prefix}_attivita_reparto_timbra")
+        dettaglio_fase = st.text_input("Note (facoltative)", key=f"{key_prefix}_attivita_reparto_dettaglio_timbra")
     elif e_assistenza:
         # Qualsiasi commessa esistente, a prescindere da stato, reparto e
         # assegnazione delle sue fasi: la fase è sempre FASE_ASSISTENZA.
@@ -4992,6 +5156,135 @@ def render_statistiche_assistenza(df, key_prefix):
     st.markdown("**Dettaglio interventi**")
     st.dataframe(sessioni, use_container_width=True)
 
+def compute_ore_attivita_non_commessa(df, tipo, start_date=None, end_date=None, area_filter=None, dipendente_filter=None):
+    """Una riga per ogni sessione (Inizio fase -> Fine fase, al netto della pausa
+    pranzo e con la stessa chiusura automatica di una Fine fase dimenticata usata nei
+    costi) timbrata su un'attività NON legata a una commessa: tipo = ATTIVITA_REPARTO
+    (attività fisse del reparto) oppure ATTIVITA_VARIE. Colonne: [Data, Dipendente,
+    Area, Attività, Ore, Costo, Dettaglio]. Per 'Varie' l'Attività è la descrizione
+    libera scritta alla timbratura ('(senza descrizione)' se vuota); per le attività
+    di reparto è il nome dell'attività. Il periodo filtra per giorno di INIZIO."""
+    colonne = ["Data", "Dipendente", "Area", "Attività", "Ore", "Costo", "Dettaglio"]
+    dfn = normalize_datetime(df) if df is not None else pd.DataFrame()
+    if dfn.empty:
+        return pd.DataFrame(columns=colonne)
+    indice_pause = IndicePauseFasi(dfn)
+    dfn = dfn[dfn["Azione"].isin(["Inizio fase", "Fine fase"]) & (dfn["Commessa"] == tipo)]
+    if dfn.empty:
+        return pd.DataFrame(columns=colonne)
+    mappa_area = get_users_area_map()
+    mappa_orario_fine = get_users_orario_fine_map()
+    mappa_livelli = get_users_livello_map()
+    mappa_costi_livello = get_livelli_costo_orario_map()
+    ora_attuale = get_current_datetime()
+    righe = []
+    for (dip, fase), gruppo in dfn.groupby(["Dipendente", "Fase"]):
+        area = mappa_area.get(dip, "Unknown")
+        costo_orario = _costo_orario_dipendente(dip, mappa_livelli, mappa_costi_livello)
+        for inizio, ore, dettaglio in _sessioni_fase_con_fallback_dettaglio(
+                gruppo.sort_values("Timestamp"), dip, mappa_orario_fine, ora_attuale, indice_pause):
+            if tipo == ATTIVITA_VARIE:
+                attivita = dettaglio.strip() or "(senza descrizione)"
+            else:
+                attivita = str(fase)
+            righe.append({"Data": inizio.date(), "Dipendente": dip, "Area": area, "Attività": attivita,
+                          "Ore": round(ore, 2), "Costo": round(ore * costo_orario, 2), "Dettaglio": dettaglio})
+    if not righe:
+        return pd.DataFrame(columns=colonne)
+    risultato = pd.DataFrame(righe)
+    if start_date is not None:
+        risultato = risultato[risultato["Data"] >= start_date]
+    if end_date is not None:
+        risultato = risultato[risultato["Data"] <= end_date]
+    if area_filter and area_filter != "Tutte le aree":
+        risultato = risultato[risultato["Area"].map(lambda a: _stesso_reparto(a, area_filter))]
+    if dipendente_filter and dipendente_filter != "Tutti i dipendenti":
+        risultato = risultato[risultato["Dipendente"] == dipendente_filter]
+    return risultato.sort_values(["Data", "Dipendente"], ascending=[False, True]).reset_index(drop=True)[colonne]
+
+def riepiloga_ore_attivita(sessioni):
+    """Riepiloghi della tabella di compute_ore_attivita_non_commessa: dict con
+    'per_attivita' (Area, Attività, Sessioni, Dipendenti, Ore, Costo) e
+    'per_dipendente' (Dipendente, Area, Sessioni, Attività, Ore, Costo), per ore
+    decrescenti. Le descrizioni 'Varie' che differiscono solo per maiuscole o spazi
+    sono la stessa attività."""
+    col_att = ["Area", "Attività", "Sessioni", "Dipendenti", "Ore", "Costo"]
+    col_dip = ["Dipendente", "Area", "Sessioni", "Attività", "Ore", "Costo"]
+    if sessioni is None or sessioni.empty:
+        return {"per_attivita": pd.DataFrame(columns=col_att), "per_dipendente": pd.DataFrame(columns=col_dip)}
+    s = sessioni.copy()
+    s["_chiave"] = s["Attività"].str.strip().str.casefold()
+    nome_per_chiave = s.groupby("_chiave")["Attività"].agg(lambda x: x.iloc[0])
+    s["Attività"] = s["_chiave"].map(nome_per_chiave)
+    per_attivita = s.groupby(["Area", "Attività"], as_index=False).agg(
+        Sessioni=("Ore", "size"), Dipendenti=("Dipendente", "nunique"), Ore=("Ore", "sum"), Costo=("Costo", "sum"))
+    per_dipendente = s.groupby(["Dipendente", "Area"], as_index=False).agg(
+        Sessioni=("Ore", "size"), Attività=("Attività", "nunique"), Ore=("Ore", "sum"), Costo=("Costo", "sum"))
+    for t in (per_attivita, per_dipendente):
+        t["Ore"] = t["Ore"].round(2); t["Costo"] = t["Costo"].round(2)
+    return {"per_attivita": per_attivita.sort_values("Ore", ascending=False).reset_index(drop=True)[col_att],
+            "per_dipendente": per_dipendente.sort_values("Ore", ascending=False).reset_index(drop=True)[col_dip]}
+
+def _mostra_statistiche_non_commessa(sessioni, titolo_vuoto, etichetta_attivita):
+    if sessioni.empty:
+        st.info(titolo_vuoto)
+        return
+    riepilogo = riepiloga_ore_attivita(sessioni)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Ore", f"{sessioni['Ore'].sum():.2f} h")
+    m2.metric(etichetta_attivita, f"{sessioni['Attività'].str.strip().str.casefold().nunique()}")
+    m3.metric("Costo del personale", f"{sessioni['Costo'].sum():.2f} €")
+    st.markdown(f"**Per {etichetta_attivita.lower()}**")
+    st.dataframe(riepilogo["per_attivita"], use_container_width=True)
+    st.markdown("**Per dipendente**")
+    st.dataframe(riepilogo["per_dipendente"], use_container_width=True)
+    st.markdown("**Dettaglio sessioni**")
+    st.dataframe(sessioni, use_container_width=True)
+
+def render_attivita_reparto(df, key_prefix, scope_area=None, attore=""):
+    """Pagina 'Attività di reparto': (1) l'elenco delle attività fisse di un reparto,
+    per i reparti che non lavorano (solo) per commessa, e (2) le ore timbrate su quelle
+    attività e su 'Varie' (con la descrizione scritta da chi timbra: serve a capire
+    cosa aggiungere agli elenchi). Admin: tutti i reparti; responsabile: solo il
+    proprio (scope_area)."""
+    st.subheader("🗂️ Attività di reparto")
+    area_gestita = render_gestione_attivita_reparto(key_prefix, scope_area=scope_area)
+
+    st.markdown("---")
+    st.markdown("### 📊 Ore timbrate")
+    oggi = datetime.date.today()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        periodo = st.date_input("Periodo", value=(oggi.replace(day=1), oggi), key=f"{key_prefix}_att_periodo")
+    if scope_area:
+        area_f = scope_area
+        dipendenti = get_users_in_area(scope_area)
+        with col2:
+            st.caption(f"Reparto: **{scope_area}**")
+    else:
+        with col2:
+            area_f = st.selectbox("Reparto", get_area_names(), key=f"{key_prefix}_att_area_stat")
+        dipendenti = get_users_in_area(area_f or "Tutte le aree")
+    with col3:
+        dip_f = st.selectbox("Dipendente", ["Tutti i dipendenti"] + list(dipendenti), key=f"{key_prefix}_att_dip_stat")
+    if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
+        inizio, fine = periodo
+    elif isinstance(periodo, (tuple, list)):
+        inizio = fine = periodo[0] if periodo else oggi
+    else:
+        inizio = fine = periodo if periodo else oggi
+
+    st.markdown("**🗂️ Attività di reparto**")
+    _mostra_statistiche_non_commessa(
+        compute_ore_attivita_non_commessa(df, ATTIVITA_REPARTO, inizio, fine, area_f, dip_f),
+        "Nessuna ora timbrata sulle attività di reparto nel periodo selezionato.", "Attività")
+    st.markdown("---")
+    st.markdown("**🔧 'Varie' per descrizione**")
+    st.caption("Cosa scrivono gli utenti quando timbrano 'Varie': le descrizioni che compaiono spesso sono buone candidate per diventare attività fisse del reparto.")
+    _mostra_statistiche_non_commessa(
+        compute_ore_attivita_non_commessa(df, ATTIVITA_VARIE, inizio, fine, area_f, dip_f),
+        "Nessuna ora timbrata su 'Varie' nel periodo selezionato.", "Descrizioni")
+
 def render_pianificazione_per_reparto(commessa, key_prefix, reparti_modificabili):
     """Sezione 'Pianificazione per reparto' di una commessa: per ogni reparto con fasi
     su di essa, la data di inizio lavori del reparto e le scadenze per macro-fase.
@@ -5604,6 +5897,10 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
             elif data_corrente in giorni_permesso:
                 dove_txt = "Permesso"
 
+        # Straordinari arrotondati alla mezz'ora; "Ore Per Portale" = ore totali del
+        # giorno (ordinarie + straordinarie arrotondate) in formato ore,minuti.
+        ore_arrotondate = arrotonda_mezz_ora(ore_straordinarie)
+
         nome_giorno = GIORNI_SETTIMANA_IT[data_corrente.weekday()]
         righe.append({
             "Giorno": f"{data_corrente.strftime('%d/%m')} ({nome_giorno})",
@@ -5614,18 +5911,27 @@ def compute_cartellino_mensile(df, nome_dipendente, anno, mese, df_requests=None
             "Dove": dove_txt,
             "Ore ordinarie": ore_ordinarie,
             "Ore straordinarie": ore_straordinarie,
+            "Ore Arrotondate": ore_arrotondate,
+            "Ore Per Portale": formato_ore_portale(arrotonda_mezz_ora(ore_ordinarie) + ore_arrotondate),
         })
 
     return pd.DataFrame(righe)
 
 def compute_totali_cartellino(cartellino_df, df, nome_dipendente, anno, mese):
     """Totali di riepilogo del cartellino mensile: ore ordinarie/straordinarie lavorate
-    nel mese, ore effettivamente tracciate su fasi/commesse, e giorni lavorati."""
+    nel mese (più straordinari arrotondati alla mezz'ora, ore totali arrotondate e
+    ore totali nel formato del portale paghe), ore effettivamente tracciate su
+    fasi/commesse, e giorni lavorati."""
     if cartellino_df is None or cartellino_df.empty:
         ore_ordinarie_tot, ore_straordinarie_tot, giorni_lavorati = 0.0, 0.0, 0
+        ore_arrotondate_tot, ore_totali_arrotondate = 0.0, 0.0
     else:
         ore_ordinarie_tot = round(float(cartellino_df["Ore ordinarie"].sum()), 2)
         ore_straordinarie_tot = round(float(cartellino_df["Ore straordinarie"].sum()), 2)
+        # Si sommano i valori GIÀ arrotondati giorno per giorno (non si arrotonda il
+        # totale del mese): è quello che finisce in busta paga giorno per giorno.
+        ore_arrotondate_tot = float(cartellino_df["Ore Arrotondate"].sum())
+        ore_totali_arrotondate = float(sum(arrotonda_mezz_ora(o) for o in cartellino_df["Ore ordinarie"])) + ore_arrotondate_tot
         giorni_lavorati = int(((cartellino_df["Ore ordinarie"] + cartellino_df["Ore straordinarie"]) > 0).sum())
 
     inizio_mese = datetime.date(anno, mese, 1)
@@ -5636,6 +5942,9 @@ def compute_totali_cartellino(cartellino_df, df, nome_dipendente, anno, mese):
     return {
         "ore_ordinarie": ore_ordinarie_tot,
         "ore_straordinarie": ore_straordinarie_tot,
+        "ore_straordinarie_arrotondate": ore_arrotondate_tot,
+        "ore_totali_arrotondate": ore_totali_arrotondate,
+        "ore_per_portale": formato_ore_portale(ore_totali_arrotondate),
         "ore_su_commesse": ore_su_commesse,
         "giorni_lavorati": giorni_lavorati,
     }
@@ -6095,6 +6404,11 @@ def render_report_mensile(nome_dipendente, df, key_prefix, mese=None, anno=None)
     col_t2.metric("Ore ordinarie", f"{totali['ore_ordinarie']:.2f}h")
     col_t3.metric("Ore straordinarie", f"{totali['ore_straordinarie']:.2f}h")
     col_t4.metric("Ore su commesse", f"{totali['ore_su_commesse']:.2f}h")
+    col_a1, col_a2, col_a3 = st.columns(3)
+    col_a1.metric("Straordinari arrotondati (mezz'ora)", f"{totali['ore_straordinarie_arrotondate']:.2f}h")
+    col_a2.metric("Ore totali arrotondate", f"{totali['ore_totali_arrotondate']:.2f}h")
+    col_a3.metric("Ore Per Portale", totali["ore_per_portale"])
+    st.caption("Ore Per Portale = ore totali (ordinarie + straordinarie arrotondate alla mezz'ora) nel formato ore,minuti richiesto dal portale paghe: 8,30 = 8 ore e 30 minuti (non 8,5).")
 
     st.markdown("---")
     st.markdown("**Saldo ferie e permessi (maturati fino a questo mese)**")
@@ -6149,14 +6463,16 @@ def _giorni_con_timbrature_anomale(df, nome_dipendente, anno, mese):
 def compute_riepilogo_hr_mensile(df, anno, mese, dipendenti, df_requests=None, df_rettifiche=None):
     """Riepilogo del mese di ogni dipendente indicato, una riga ciascuno, con i dati
     che servono per le buste paga: giorni lavorati, ore ordinarie e straordinarie
-    (le stesse del cartellino mensile), giorni di ferie e ore di permesso approvati
+    (le stesse del cartellino mensile; 'Ore Arrotondate' = straordinari arrotondati alla
+    mezz'ora, 'Ore Per Portale' = ore totali arrotondate nel formato ore,minuti del
+    portale paghe), giorni di ferie e ore di permesso approvati
     nel mese (le ferie contano i giorni di calendario, come nel resto dell'app).
     Più due colonne di controllo: 'Giorni da verificare' (giorni con ingressi e
     uscite non corrispondenti, vedi _giorni_con_timbrature_anomale) e 'In sospeso'
     (rettifiche e richieste ferie/permessi del mese ancora 'In attesa': finché
     non sono approvate/rifiutate il cartellino potrebbe cambiare)."""
     colonne = ["Dipendente", "Area", "Giorni lavorati", "Ore ordinarie", "Ore straordinarie",
-               "Giorni ferie", "Ore permesso", "Giorni da verificare", "In sospeso"]
+               "Ore Arrotondate", "Ore Per Portale", "Giorni ferie", "Ore permesso", "Giorni da verificare", "In sospeso"]
     mappa_area = get_users_area_map()
     inizio_mese = datetime.date(anno, mese, 1)
     fine_mese = datetime.date(anno, mese, calendar.monthrange(anno, mese)[1])
@@ -6199,6 +6515,7 @@ def compute_riepilogo_hr_mensile(df, anno, mese, dipendenti, df_requests=None, d
             "Dipendente": nome, "Area": mappa_area.get(nome, ""),
             "Giorni lavorati": totali["giorni_lavorati"],
             "Ore ordinarie": totali["ore_ordinarie"], "Ore straordinarie": totali["ore_straordinarie"],
+            "Ore Arrotondate": totali["ore_straordinarie_arrotondate"], "Ore Per Portale": totali["ore_per_portale"],
             "Giorni ferie": giorni_ferie, "Ore permesso": round(ore_permesso, 2),
             "Giorni da verificare": len(_giorni_con_timbrature_anomale(df, nome, anno, mese)),
             "In sospeso": in_sospeso,
@@ -6615,7 +6932,7 @@ PAGINE_SENZA_AUTOREFRESH_AUTOMATICO = {
     "Programmazione nuova Trasferta", "Trasferte programmate", "🧳 Trasferte Service",
     "Richiesta ferie/permessi", "Richiesta rettifica",
     "💰 Costi commesse", "💰 Gestione Costi", "📅 Pianificazione",
-    "Cartellini dipendenti",
+    "Cartellini dipendenti", "🗂️ Attività di reparto",
 }
 
 def pagina_abilitata_per_autorefresh(pagina):
@@ -6669,7 +6986,7 @@ else:
 
         admin_page = render_menu_a_categorie([
             ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
-            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione"]),
+            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto"]),
             ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🛠️ Statistiche Assistenza", "🌱 Sostenibilità (Smart Working)"]),
             ("👥 Risorse Umane", ["Cartellini dipendenti"]),
             ("🧳 Trasferte e Team", ["Programmazione nuova Trasferta", "Trasferte programmate", "Report interventi ricevuti", "📅 Disponibilità Team"]),
@@ -6860,6 +7177,9 @@ else:
 
         elif admin_page == "🛠️ Statistiche Assistenza":
             render_statistiche_assistenza(df, key_prefix="admin_assistenza")
+
+        elif admin_page == "🗂️ Attività di reparto":
+            render_attivita_reparto(df, key_prefix="admin_attivita", scope_area=None, attore=st.session_state.username)
 
         elif admin_page == "Cartellini dipendenti":
             render_risorse_umane(df, key_prefix="admin_hr")
@@ -7200,7 +7520,7 @@ else:
 
             resp_page = render_menu_a_categorie([
                 ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature"]),
-                ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione"]),
+                ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione", "🗂️ Attività di reparto"]),
                 ("📅 Disponibilità", ["📅 Disponibilità Team"]),
             ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
             st.session_state["_ultima_pagina_vista"] = resp_page
@@ -7331,6 +7651,9 @@ else:
 
             elif resp_page == "📅 Disponibilità Team":
                 render_disponibilita_team(area_default=area_responsabile, forza_area=True, key_prefix="resp")
+
+            elif resp_page == "🗂️ Attività di reparto":
+                render_attivita_reparto(df, key_prefix="resp_attivita", scope_area=area_responsabile, attore=st.session_state.username)
 
             elif resp_page == "📅 Pianificazione":
                 render_pianificazione_commessa(df, key_prefix="resp_pianificazione", puo_modificare=False,
