@@ -551,12 +551,20 @@ def init_db():
 
         # Migrazione: aggiungi le colonne anagrafiche se il DB esisteva già prima di questa versione
         for colonna_commessa, tipo_colonna in [("cliente", "TEXT"), ("tipologia_impianto", "TEXT"), ("anno_produzione", "INTEGER"), ("paese", "TEXT"),
-                                                ("priorita", "TEXT"), ("stato", "TEXT"), ("data_inizio_lavori", "TEXT")]:
+                                                ("priorita", "TEXT"), ("stato", "TEXT"), ("data_inizio_lavori", "TEXT"),
+                                                # Impianto: dove si trova lo stabilimento (indirizzo, coordinate trovate da
+                                                # OpenStreetMap) e, calcolata una sola volta, la distanza in auto dalla sede.
+                                                ("nome_impianto", "TEXT"), ("indirizzo_impianto", "TEXT"), ("lat", "REAL"), ("lon", "REAL"),
+                                                ("dist_sede_km", "REAL"), ("dist_sede_ore", "REAL"), ("dist_sede_rif", "TEXT"),
+                                                ("dist_sede_percorso", "INTEGER")]:
             try:
                 c.execute(f"ALTER TABLE commesse ADD COLUMN {colonna_commessa} {tipo_colonna}")
                 conn.commit()
             except db_migration_error_classes():
                 pass  # Colonna già esistente
+
+        # Impostazioni generali chiave/valore (es. indirizzo e coordinate della sede aziendale).
+        c.execute('''CREATE TABLE IF NOT EXISTS impostazioni_generali (chiave TEXT PRIMARY KEY, valore TEXT)''')
 
         # Le commesse create prima dell'introduzione di priorità/stato non hanno questi
         # valori: le consideriamo "Media"/"In corso" di default (già avviate, non
@@ -1859,7 +1867,8 @@ def get_commesse_dettaglio():
             "anno_produzione AS 'Anno produzione', paese AS Paese, priorita AS Priorità, stato AS Stato, "
             "descrizione AS Descrizione FROM commesse ORDER BY nome", conn)
 
-def crea_commessa(nome, descrizione, creata_da, cliente="", tipologia_impianto="", anno_produzione=None, paese="", priorita="Media"):
+def crea_commessa(nome, descrizione, creata_da, cliente="", tipologia_impianto="", anno_produzione=None, paese="", priorita="Media",
+                  indirizzo_impianto="", nome_impianto=""):
     """Crea una nuova commessa (solo admin), con la sua anagrafica (cliente, tipologia
     impianto, anno di produzione, paese di installazione) e una priorità. Una
     commessa nasce sempre con stato 'Da iniziare': da questo momento lo stato si
@@ -1877,11 +1886,12 @@ def crea_commessa(nome, descrizione, creata_da, cliente="", tipologia_impianto="
         c = conn.cursor()
         try:
             c.execute("""INSERT INTO commesse (nome, descrizione, cliente, tipologia_impianto, anno_produzione, paese,
-                                                 priorita, stato, creata_da, data_creazione)
-                         VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                                 priorita, stato, creata_da, data_creazione, indirizzo_impianto, nome_impianto)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (nome, (descrizione or "").strip(), (cliente or "").strip(), (tipologia_impianto or "").strip(),
                        int(anno_produzione) if anno_produzione else None, (paese or "").strip(),
-                       priorita, "Da iniziare", creata_da, datetime.date.today().isoformat()))
+                       priorita, "Da iniziare", creata_da, datetime.date.today().isoformat(),
+                       (indirizzo_impianto or "").strip(), (nome_impianto or "").strip()))
             conn.commit()
             get_commesse_names.clear()
             get_commesse_dettaglio.clear()
@@ -2894,6 +2904,9 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
     (caso admin), consente anche di creare/eliminare commesse e di scegliere
     qualsiasi area."""
     if allow_create_commessa:
+        avviso_impianto = st.session_state.pop("_avviso_impianto", None)
+        if avviso_impianto:
+            (st.success if avviso_impianto[1] else st.warning)(avviso_impianto[0])
         st.subheader("🏗️ Crea nuova commessa")
         nuovo_nome = st.text_input("Nome commessa", key="nuova_commessa_nome")
         nuovo_cliente = st.text_input("Cliente", key="nuova_commessa_cliente")
@@ -2914,6 +2927,10 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
         with col_paese:
             nuovo_paese = st.text_input("Paese di installazione", key="nuova_commessa_paese")
 
+        nuovo_nome_impianto = st.text_input("Nome dell'impianto (opzionale)", key="nuova_commessa_nome_impianto",
+                                            placeholder="es. Linea surgelazione stabilimento 2")
+        nuovo_indirizzo_impianto = st.text_input("Indirizzo dello stabilimento (opzionale: via, città, Stato)", key="nuova_commessa_indirizzo_impianto",
+                                                 help="Serve per la mappa degli impianti e per compilare in automatico indirizzo e distanza quando si programma una trasferta.")
         nuova_priorita = st.selectbox("Priorità", options=PRIORITA_COMMESSA_DISPONIBILI,
                                        index=PRIORITA_COMMESSA_DISPONIBILI.index("Media"), key="nuova_commessa_priorita")
         nuova_descrizione = st.text_area("Descrizione (opzionale)", key="nuova_commessa_descrizione")
@@ -2928,11 +2945,17 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
             ok, errore = crea_commessa(
                 nuovo_nome, nuova_descrizione, attore,
                 cliente=nuovo_cliente, tipologia_impianto=nuova_tipologia, anno_produzione=nuovo_anno, paese=nuovo_paese,
-                priorita=nuova_priorita
+                priorita=nuova_priorita, indirizzo_impianto=nuovo_indirizzo_impianto, nome_impianto=nuovo_nome_impianto
             )
             if ok:
                 nome_creata = nuovo_nome.strip()
                 st.success(f"Commessa '{nome_creata}' creata.")
+                if (nuovo_indirizzo_impianto or "").strip():
+                    # Localizzazione "al meglio": se il servizio delle mappe non risponde la commessa resta creata
+                    # e l'impianto si localizza poi dalla pagina Mappa impianti.
+                    esito_ok, esito_msg = aggiorna_impianto_commessa(nome_creata, nuovo_indirizzo_impianto, nuovo_nome_impianto)
+                    # la pagina si ricarica subito dopo: l'esito si mostra al giro successivo
+                    st.session_state["_avviso_impianto"] = (f"Commessa '{nome_creata}': {esito_msg}", esito_ok and "non è stato localizzato" not in esito_msg and "non calcolata" not in esito_msg)
                 if applica_template_cc and ha_template_cc:
                     n_copiate = applica_template_a_commessa(nuova_tipologia, nome_creata, attore)
                     if n_copiate:
@@ -3759,6 +3782,9 @@ _PAUSA_NOMINATIM_SECONDI = 1.1
 class ErroreViaggio(Exception):
     """Errore comprensibile (da mostrare all'utente) nel calcolo del viaggio."""
 
+class ErroreNessunPercorso(ErroreViaggio):
+    """I due punti esistono ma non c'è un percorso in auto (es. servono traghetto o aereo)."""
+
 def _scarica_json(url):
     """GET di un indirizzo che risponde in JSON (sostituibile nei test)."""
     richiesta = urllib.request.Request(url, headers={"User-Agent": USER_AGENT_VIAGGI, "Accept": "application/json"})
@@ -3794,7 +3820,7 @@ def calcola_percorso_auto(lat1, lon1, lat2, lon2):
     dati = _chiedi_json(f"{URL_OSRM}/{lon1:.6f},{lat1:.6f};{lon2:.6f},{lat2:.6f}?overview=false")
     try:
         if dati.get("code") != "Ok":
-            raise ErroreViaggio("Nessun percorso in auto trovato tra i due punti (es. servono traghetto o aereo): inserisci le ore a mano.")
+            raise ErroreNessunPercorso("Nessun percorso in auto trovato tra i due punti (es. servono traghetto o aereo): inserisci le ore a mano.")
         percorso = dati["routes"][0]
         return float(percorso["distance"]) / 1000.0, float(percorso["duration"]) / 3600.0
     except (KeyError, ValueError, TypeError, IndexError):
@@ -3845,6 +3871,382 @@ def url_google_maps(partenza, destinazione):
     né costi, serve a controllare il percorso e a vedere il traffico previsto)."""
     return ("https://www.google.com/maps/dir/?api=1&travelmode=driving"
             f"&origin={urllib.parse.quote_plus(partenza or '')}&destination={urllib.parse.quote_plus(destinazione or '')}")
+
+# --- IMPIANTI: indirizzo dello stabilimento, mappa e distanza dalla sede ---
+# Ogni commessa può avere l'indirizzo dello stabilimento dove si trova l'impianto. Da lì
+# si ricavano le coordinate (OpenStreetMap) per la mappa e, UNA SOLA VOLTA, la distanza e il
+# tempo in auto dalla sede aziendale: restano salvati sulla commessa e si ricalcolano solo
+# se cambiano l'indirizzo dell'impianto o quello della sede, così programmando un intervento
+# non serve rifare ogni volta il calcolo.
+# Suggerimento del mezzo: soglie ORIENTATIVE sul tempo di viaggio in auto (solo andata),
+# da adattare alle abitudini dell'azienda. Non conosce orari di treni e voli né i prezzi.
+SOGLIA_VIAGGIO_AUTO_ORE = 6.0     # fino a qui conviene l'auto
+SOGLIA_VIAGGIO_AEREO_ORE = 10.0   # oltre qui conviene l'aereo; nel mezzo auto o treno
+CHIAVE_SEDE_INDIRIZZO, CHIAVE_SEDE_LAT, CHIAVE_SEDE_LON = "sede_indirizzo", "sede_lat", "sede_lon"
+
+def get_impostazione(chiave, default=""):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT valore FROM impostazioni_generali WHERE chiave = ?", (chiave,))
+        riga = c.fetchone()
+    return riga[0] if riga and riga[0] is not None else default
+
+def set_impostazione(chiave, valore):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO impostazioni_generali (chiave, valore) VALUES (?, ?)", (chiave, str(valore)))
+        conn.commit()
+
+def get_sede_aziendale():
+    """{'indirizzo', 'lat', 'lon'} della sede aziendale (punto di partenza dei viaggi);
+    indirizzo vuoto e coordinate None se non è ancora stata impostata."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT chiave, valore FROM impostazioni_generali WHERE chiave IN (?,?,?)",
+                  (CHIAVE_SEDE_INDIRIZZO, CHIAVE_SEDE_LAT, CHIAVE_SEDE_LON))
+        valori = dict(c.fetchall())
+    try:
+        lat, lon = float(valori.get(CHIAVE_SEDE_LAT)), float(valori.get(CHIAVE_SEDE_LON))
+    except (TypeError, ValueError):
+        lat = lon = None
+    return {"indirizzo": (valori.get(CHIAVE_SEDE_INDIRIZZO) or "").strip(), "lat": lat, "lon": lon}
+
+def imposta_sede_aziendale(indirizzo):
+    """Salva l'indirizzo della sede (trovandone le coordinate) e azzera le distanze già
+    calcolate delle commesse, che si rifaranno da sole la prossima volta che servono.
+    Restituisce (ok, messaggio)."""
+    indirizzo = (indirizzo or "").strip()
+    if not indirizzo:
+        return False, "Scrivi l'indirizzo della sede."
+    try:
+        punto = geocodifica_indirizzo(indirizzo)
+    except ErroreViaggio as e:
+        return False, str(e)
+    if punto is None:
+        return False, f"Indirizzo non trovato: '{indirizzo}'. Prova con via, città e Stato."
+    set_impostazione(CHIAVE_SEDE_INDIRIZZO, indirizzo)
+    set_impostazione(CHIAVE_SEDE_LAT, punto[0])
+    set_impostazione(CHIAVE_SEDE_LON, punto[1])
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE commesse SET dist_sede_km=NULL, dist_sede_ore=NULL, dist_sede_rif=NULL, dist_sede_percorso=NULL")
+        conn.commit()
+    get_commesse_dettaglio.clear()
+    return True, "Sede salvata. Le distanze degli impianti si ricalcolano da sole quando servono."
+
+def distanza_in_linea_d_aria_km(lat1, lon1, lat2, lon2):
+    """Distanza in linea retta (formula di haversine), in km."""
+    r = 6371.0088
+    f1, f2 = math.radians(lat1), math.radians(lat2)
+    df, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(df / 2) ** 2 + math.cos(f1) * math.cos(f2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+def suggerisci_mezzo(ore_andata, percorso_auto=True):
+    """(mezzo suggerito, motivo) in base al tempo di viaggio in auto dell'andata. Se non
+    esiste un percorso in auto (mare in mezzo) suggerisce l'aereo."""
+    if not percorso_auto or ore_andata is None:
+        return "Aereo", "Non c'è un percorso in auto: serve l'aereo (e un'auto a noleggio per muoversi sul posto)."
+    ore = float(ore_andata)
+    if ore <= SOGLIA_VIAGGIO_AUTO_ORE:
+        return "Auto", f"{formatta_durata(ore)} in auto all'andata: conviene l'auto."
+    if ore <= SOGLIA_VIAGGIO_AEREO_ORE:
+        return "Auto o Treno", f"{formatta_durata(ore)} in auto all'andata: valuta auto (con più giorni) o treno."
+    return "Aereo", f"{formatta_durata(ore)} in auto all'andata: conviene l'aereo, con auto a noleggio sul posto."
+
+def get_dati_impianto(commessa):
+    """Dati dell'impianto di una commessa (nome, tipo, cliente, indirizzo, coordinate e
+    distanza dalla sede già calcolata) oppure None se la commessa non esiste."""
+    if not commessa:
+        return None
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT nome, nome_impianto, tipologia_impianto, cliente, indirizzo_impianto, paese, lat, lon,
+                            dist_sede_km, dist_sede_ore, dist_sede_rif, dist_sede_percorso FROM commesse WHERE nome = ?""", (commessa,))
+        r = c.fetchone()
+    if not r:
+        return None
+    return {"commessa": r[0], "nome_impianto": (r[1] or "").strip(), "tipologia": (r[2] or "").strip(), "cliente": (r[3] or "").strip(),
+            "indirizzo": (r[4] or "").strip(), "paese": (r[5] or "").strip(), "lat": r[6], "lon": r[7],
+            "km": r[8], "ore": r[9], "rif": r[10], "percorso": r[11]}
+
+def localizza_commessa(commessa):
+    """Trova le coordinate dell'indirizzo dell'impianto e le salva sulla commessa (azzerando
+    la distanza dalla sede, da ricalcolare). Solleva ErroreViaggio se l'indirizzo non si
+    trova o il servizio non risponde; restituisce (lat, lon)."""
+    dati = get_dati_impianto(commessa)
+    if not dati or not dati["indirizzo"]:
+        raise ErroreViaggio("Questa commessa non ha l'indirizzo dell'impianto.")
+    testo = dati["indirizzo"] if not dati["paese"] or dati["paese"].casefold() in dati["indirizzo"].casefold() else f"{dati['indirizzo']}, {dati['paese']}"
+    punto = geocodifica_indirizzo(testo)
+    if punto is None:
+        raise ErroreViaggio(f"Indirizzo non trovato: '{testo}'. Prova con via, città e Stato.")
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""UPDATE commesse SET lat=?, lon=?, dist_sede_km=NULL, dist_sede_ore=NULL, dist_sede_rif=NULL, dist_sede_percorso=NULL
+                     WHERE nome=?""", (punto[0], punto[1], commessa))
+        conn.commit()
+    get_commesse_dettaglio.clear()
+    return punto[0], punto[1]
+
+def calcola_distanza_sede_commessa(commessa):
+    """Calcola (una volta) e salva sulla commessa la distanza e il tempo in auto dalla sede
+    aziendale all'impianto. Se non c'è un percorso in auto lo registra (percorso = 0).
+    Solleva ErroreViaggio se mancano sede o coordinate o il servizio non risponde."""
+    sede = get_sede_aziendale()
+    if sede["lat"] is None:
+        raise ErroreViaggio("La sede aziendale non è ancora impostata.")
+    dati = get_dati_impianto(commessa)
+    if not dati or dati["lat"] is None:
+        raise ErroreViaggio("L'impianto non ha ancora una posizione.")
+    try:
+        km, ore = calcola_percorso_auto(sede["lat"], sede["lon"], dati["lat"], dati["lon"])
+        percorso = 1
+    except ErroreNessunPercorso:
+        km = ore = None
+        percorso = 0
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE commesse SET dist_sede_km=?, dist_sede_ore=?, dist_sede_rif=?, dist_sede_percorso=? WHERE nome=?",
+                  (round(km, 1) if km is not None else None, round(ore, 2) if ore is not None else None, sede["indirizzo"], percorso, commessa))
+        conn.commit()
+    return get_dati_impianto(commessa)
+
+def distanza_sede_valida(dati, sede=None):
+    """True se la distanza salvata sulla commessa è stata calcolata per la sede attuale."""
+    sede = sede or get_sede_aziendale()
+    return bool(dati) and dati["percorso"] is not None and bool(sede["indirizzo"]) and dati["rif"] == sede["indirizzo"]
+
+def assicura_distanza_sede(commessa):
+    """Dati dell'impianto con la distanza dalla sede: usa quella già salvata e la calcola
+    solo se manca (o se la sede è cambiata). Se non si può calcolare restituisce i dati
+    così come sono (senza distanza), senza errori."""
+    dati = get_dati_impianto(commessa)
+    if not dati or dati["lat"] is None or distanza_sede_valida(dati):
+        return dati
+    try:
+        return calcola_distanza_sede_commessa(commessa)
+    except ErroreViaggio:
+        return dati
+
+def aggiorna_impianto_commessa(commessa, indirizzo, nome_impianto="", calcola_distanza=True):
+    """Salva nome e indirizzo dell'impianto di una commessa e li localizza (coordinate e
+    distanza dalla sede). Il testo si salva sempre, anche se il servizio delle mappe non
+    risponde. Restituisce (ok, messaggio)."""
+    if not commessa:
+        return False, "Seleziona una commessa."
+    indirizzo = (indirizzo or "").strip()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""UPDATE commesse SET nome_impianto=?, indirizzo_impianto=?, lat=NULL, lon=NULL,
+                            dist_sede_km=NULL, dist_sede_ore=NULL, dist_sede_rif=NULL, dist_sede_percorso=NULL WHERE nome=?""",
+                  ((nome_impianto or "").strip(), indirizzo, commessa))
+        trovata = c.rowcount
+        conn.commit()
+    get_commesse_dettaglio.clear()
+    if not trovata:
+        return False, "Commessa non trovata."
+    if not indirizzo:
+        return True, "Salvato (senza indirizzo: l'impianto non comparirà sulla mappa)."
+    try:
+        localizza_commessa(commessa)
+    except ErroreViaggio as e:
+        return True, f"Salvato, ma l'impianto non è stato localizzato: {e}"
+    if not calcola_distanza:
+        return True, "Impianto salvato e localizzato."
+    try:
+        dati = calcola_distanza_sede_commessa(commessa)
+    except ErroreViaggio as e:
+        return True, f"Impianto salvato e localizzato. Distanza dalla sede non calcolata: {e}"
+    if dati["percorso"] == 0:
+        return True, "Impianto salvato e localizzato. Dalla sede non c'è un percorso in auto: servirà l'aereo."
+    return True, f"Impianto salvato e localizzato: {dati['km']:.0f} km, {formatta_durata(dati['ore'])} in auto dalla sede."
+
+def get_impianti_mappa(oggi=None):
+    """Una riga per commessa (con indirizzo) con i dati dell'impianto e, se ci sono, gli
+    operatori in trasferta oggi su quella commessa o con trasferta programmata. Poche query in blocco."""
+    oggi = oggi or datetime.date.today()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT nome, nome_impianto, tipologia_impianto, cliente, indirizzo_impianto, paese, lat, lon,
+                            dist_sede_km, dist_sede_ore, dist_sede_rif, dist_sede_percorso, stato FROM commesse
+                     WHERE COALESCE(indirizzo_impianto,'') <> '' ORDER BY nome""")
+        commesse = c.fetchall()
+        c.execute("""SELECT commessa, dipendente, data_inizio, data_fine FROM trasferte
+                     WHERE data_fine >= ? AND COALESCE(commessa,'') <> '' ORDER BY data_inizio, id""", (oggi.isoformat(),))
+        trasferte = {}
+        for commessa, dip, di, df_ in c.fetchall():
+            trasferte.setdefault(commessa, []).append((dip, str(di)[:10], str(df_)[:10]))
+    righe = []
+    for (nome, nome_imp, tipo, cliente, indirizzo, paese, lat, lon, km, ore, rif, percorso, stato) in commesse:
+        tr = trasferte.get(nome, [])
+        in_corso = [t_ for t_ in tr if t_[1] <= oggi.isoformat()]
+        if in_corso:
+            situazione = "In trasferta ora"
+        elif tr:
+            situazione = "Trasferta programmata"
+        else:
+            situazione = "Nessuna trasferta"
+        righe.append({
+            "commessa": nome, "nome_impianto": (nome_imp or "").strip(), "tipologia": (tipo or "").strip(), "cliente": (cliente or "").strip(),
+            "indirizzo": (indirizzo or "").strip(), "paese": (paese or "").strip(), "lat": lat, "lon": lon,
+            "km": km, "ore": ore, "percorso": percorso, "rif": rif, "stato_commessa": stato or "", "situazione": situazione,
+            "operatori": ", ".join(sorted({t_[0] for t_ in (in_corso or tr)})),
+            "periodo": (f"{(in_corso or tr)[0][1]} → {(in_corso or tr)[0][2]}" if tr else ""),
+        })
+    return pd.DataFrame(righe, columns=["commessa", "nome_impianto", "tipologia", "cliente", "indirizzo", "paese", "lat", "lon", "km", "ore",
+                                         "percorso", "rif", "stato_commessa", "situazione", "operatori", "periodo"])
+
+COLORI_MAPPA_IMPIANTI = {"In trasferta ora": [220, 38, 38, 220], "Trasferta programmata": [217, 119, 6, 220], "Nessuna trasferta": [37, 99, 235, 200]}
+
+def disegna_mappa_impianti(impianti):
+    """Mappa con un puntino per impianto; passandoci sopra compaiono numero commessa, nome e
+    tipo dell'impianto, cliente, indirizzo (e chi è in trasferta). Usa pydeck (incluso con
+    Streamlit); se non disponibile ripiega sulla mappa semplice, senza le descrizioni."""
+    punti = impianti[impianti["lat"].notna() & impianti["lon"].notna()].copy()
+    if punti.empty:
+        return False
+    punti["colore"] = punti["situazione"].map(lambda x: COLORI_MAPPA_IMPIANTI.get(x, COLORI_MAPPA_IMPIANTI["Nessuna trasferta"]))
+    punti["titolo"] = punti.apply(lambda r: f"Commessa {r['commessa']}", axis=1)
+    punti["impianto"] = punti.apply(lambda r: r["nome_impianto"] or r["cliente"] or "-", axis=1)
+    punti["tipo"] = punti["tipologia"].replace("", "-")
+    punti["trasferta_txt"] = punti.apply(lambda r: (f"{r['situazione']}: {r['operatori']}" if r["operatori"] else r["situazione"]), axis=1)
+    try:
+        import pydeck as pdk
+        dati = punti[["lat", "lon", "colore", "titolo", "impianto", "tipo", "cliente", "indirizzo", "trasferta_txt"]].copy()
+        strato = pdk.Layer("ScatterplotLayer", data=dati, get_position=["lon", "lat"], get_fill_color="colore",
+                           get_line_color=[255, 255, 255, 255], line_width_min_pixels=1, stroked=True,
+                           get_radius=4000, radius_min_pixels=7, radius_max_pixels=16, pickable=True)
+        lat_c, lon_c = float(dati["lat"].mean()), float(dati["lon"].mean())
+        if len(dati) == 1:
+            zoom = 9
+        else:
+            ampiezza = max(float(dati["lat"].max() - dati["lat"].min()), float(dati["lon"].max() - dati["lon"].min()), 0.01)
+            zoom = max(1.0, min(10.0, math.log2(360.0 / ampiezza) - 0.5))
+        tooltip = {"html": "<b>{titolo}</b><br/>{impianto}<br/>Tipo: {tipo}<br/>Cliente: {cliente}<br/>{indirizzo}<br/><i>{trasferta_txt}</i>",
+                   "style": {"backgroundColor": "#0f2a4a", "color": "white", "fontSize": "13px"}}
+        mappa = pdk.Deck(layers=[strato], initial_view_state=pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, pitch=0), tooltip=tooltip)
+        st.pydeck_chart(mappa, use_container_width=True)
+    except Exception:
+        st.map(punti[["lat", "lon"]])
+        st.caption("Mappa semplice (senza descrizioni al passaggio del mouse): il componente delle mappe avanzate non è disponibile.")
+    return True
+
+def render_mappa_impianti(key_prefix, puo_impostare_sede=False):
+    """Pagina 'Mappa impianti': dove si trovano gli impianti (uno per commessa con
+    indirizzo), con colori per chi è in trasferta; elenco con distanza e mezzo suggerito;
+    inserimento/correzione dell'indirizzo di un impianto; impostazione della sede."""
+    st.subheader("🗺️ Mappa impianti")
+    sede = get_sede_aziendale()
+    impianti = get_impianti_mappa()
+    if impianti.empty:
+        st.info("Nessun impianto ha ancora un indirizzo. Scrivilo qui sotto (o alla creazione della commessa) e comparirà sulla mappa.")
+    else:
+        col_f1, col_f2, col_f3 = st.columns(3)
+        clienti = sorted({x for x in impianti["cliente"] if x})
+        tipi = sorted({x for x in impianti["tipologia"] if x})
+        with col_f1:
+            f_cliente = st.selectbox("Cliente", ["Tutti"] + clienti, key=f"{key_prefix}_mappa_cliente")
+        with col_f2:
+            f_tipo = st.selectbox("Tipo di impianto", ["Tutti"] + tipi, key=f"{key_prefix}_mappa_tipo")
+        with col_f3:
+            f_sit = st.selectbox("Situazione", ["Tutti"] + list(COLORI_MAPPA_IMPIANTI.keys()), key=f"{key_prefix}_mappa_situazione")
+        vista = impianti
+        if f_cliente != "Tutti":
+            vista = vista[vista["cliente"] == f_cliente]
+        if f_tipo != "Tutti":
+            vista = vista[vista["tipologia"] == f_tipo]
+        if f_sit != "Tutti":
+            vista = vista[vista["situazione"] == f_sit]
+        localizzati = vista[vista["lat"].notna()]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Impianti sulla mappa", len(localizzati))
+        c2.metric("In trasferta ora", int((vista["situazione"] == "In trasferta ora").sum()))
+        c3.metric("Senza posizione", int(vista["lat"].isna().sum()))
+        if not disegna_mappa_impianti(vista):
+            st.warning("Nessun impianto di questa selezione ha ancora una posizione: usa 'Localizza' qui sotto.")
+        else:
+            st.caption("🔴 trasferta in corso · 🟠 trasferta programmata · 🔵 nessuna trasferta — passa il mouse su un puntino per i dettagli.")
+        righe = []
+        for _, r in vista.iterrows():
+            if r["percorso"] == 1 and r["km"] is not None and pd.notna(r["km"]):
+                mezzo = suggerisci_mezzo(r["ore"], True)[0]
+                dist = f"{r['km']:.0f} km · {formatta_durata(r['ore'])}"
+            elif r["percorso"] == 0:
+                mezzo, dist = suggerisci_mezzo(None, False)[0], "nessun percorso in auto"
+            else:
+                mezzo, dist = "", "da calcolare"
+            righe.append({"Commessa": r["commessa"], "Impianto": r["nome_impianto"], "Tipo": r["tipologia"], "Cliente": r["cliente"],
+                          "Indirizzo": r["indirizzo"], "Dalla sede (auto)": dist, "Mezzo suggerito": mezzo,
+                          "Trasferte": (f"{r['situazione']}: {r['operatori']} ({r['periodo']})" if r["operatori"] else r["situazione"]),
+                          "Posizione": "✅" if pd.notna(r["lat"]) else "❌ da localizzare"})
+        if righe:
+            with st.expander(f"📋 Elenco impianti ({len(righe)})", expanded=False):
+                st.dataframe(pd.DataFrame(righe), use_container_width=True, hide_index=True)
+                st.caption("Il mezzo suggerito si basa solo sul tempo di viaggio in auto (soglie "
+                           f"{SOGLIA_VIAGGIO_AUTO_ORE:.0f} h e {SOGLIA_VIAGGIO_AEREO_ORE:.0f} h): non conosce orari di treni e voli né prezzi.")
+
+    mancanti = impianti[impianti["lat"].isna()] if not impianti.empty else impianti
+    senza_distanza = impianti[impianti["lat"].notna() & impianti["percorso"].isna()] if not impianti.empty else impianti
+    if not mancanti.empty or (not senza_distanza.empty and sede["lat"] is not None):
+        st.markdown("**Completa le posizioni**")
+        if not mancanti.empty:
+            st.caption(f"{len(mancanti)} impianti hanno l'indirizzo ma non ancora la posizione sulla mappa.")
+        if st.button("📍 Localizza e calcola le distanze mancanti", key=f"{key_prefix}_mappa_localizza_tutti"):
+            barra = st.progress(0.0)
+            esiti = []
+            da_localizzare = set(mancanti["commessa"])
+            da_fare = list(mancanti["commessa"]) + list(senza_distanza["commessa"])
+            for i, nome in enumerate(da_fare):
+                try:
+                    if nome in da_localizzare:
+                        localizza_commessa(nome)
+                        time.sleep(_PAUSA_NOMINATIM_SECONDI or 0)
+                    if get_sede_aziendale()["lat"] is not None:
+                        calcola_distanza_sede_commessa(nome)
+                except ErroreViaggio as e:
+                    esiti.append(f"{nome}: {e}")
+                barra.progress((i + 1) / len(da_fare))
+            if esiti:
+                st.warning("Non completati:\n\n" + "\n\n".join(esiti))
+            else:
+                st.success("Fatto.")
+                st.rerun()
+
+    st.markdown("---")
+    st.markdown("**Indirizzo dell'impianto di una commessa**")
+    st.caption("Serve per la mappa e per compilare in automatico indirizzo e distanza quando si programma una trasferta.")
+    commessa_imp = selettore_commessa_filtrato(f"{key_prefix}_mappa_imp", key_commessa=f"{key_prefix}_mappa_imp_commessa", etichetta="Commessa")
+    if commessa_imp:
+        dati = get_dati_impianto(commessa_imp) or {}
+        nome_imp_in = st.text_input("Nome dell'impianto", value=dati.get("nome_impianto", ""), key=f"{key_prefix}_mappa_imp_nome_{commessa_imp}",
+                                    placeholder="es. Linea surgelazione stabilimento 2")
+        indirizzo_in = st.text_input("Indirizzo dello stabilimento (via, città, Stato)", value=dati.get("indirizzo", ""),
+                                     key=f"{key_prefix}_mappa_imp_indirizzo_{commessa_imp}")
+        if dati.get("lat") is not None:
+            st.caption(f"📍 Posizione trovata: {dati['lat']:.4f}, {dati['lon']:.4f}"
+                       + (f" · {dati['km']:.0f} km, {formatta_durata(dati['ore'])} in auto dalla sede" if distanza_sede_valida(dati) and dati.get('percorso') == 1 else ""))
+        if st.button("💾 Salva e localizza", key=f"{key_prefix}_mappa_imp_salva"):
+            ok, msg = aggiorna_impianto_commessa(commessa_imp, indirizzo_in, nome_imp_in)
+            if not ok:
+                st.error(msg)
+            elif "non è stato localizzato" in msg or "non calcolata" in msg or "senza indirizzo" in msg:
+                st.warning(msg)
+            else:
+                st.success(msg)
+
+    st.markdown("---")
+    st.markdown("**Sede aziendale (punto di partenza dei viaggi)**")
+    if sede["indirizzo"]:
+        st.caption(f"Sede attuale: {sede['indirizzo']}" + ("" if sede["lat"] is not None else " (posizione non trovata)"))
+    else:
+        st.warning("La sede aziendale non è impostata: senza non si possono calcolare le distanze degli impianti." +
+                   ("" if puo_impostare_sede else " Chiedi all'amministratore di impostarla."))
+    if puo_impostare_sede:
+        nuova_sede = st.text_input("Indirizzo della sede", value=sede["indirizzo"], key=f"{key_prefix}_mappa_sede")
+        if st.button("💾 Salva sede", key=f"{key_prefix}_mappa_sede_salva"):
+            ok, msg = imposta_sede_aziendale(nuova_sede)
+            (st.success if ok else st.error)(msg)
 
 def valida_viaggio(viaggio):
     """Controllo dei dati di viaggio prima del salvataggio. Restituisce (ok, errore)."""
@@ -3938,20 +4340,24 @@ def get_trasferte_senza_ore_viaggio(dipendente):
                                 AND EXISTS (SELECT 1 FROM report_interventi r WHERE r.trasferta_id = t.id)
                               ORDER BY t.data_inizio DESC, t.id DESC""", conn, params=(dipendente,))
 
-def render_stima_viaggio(key_prefix, iniziale=None, destinazione_trasferta="", data_default=None):
+def render_stima_viaggio(key_prefix, iniziale=None, destinazione_trasferta="", data_default=None, impianto=None):
     """Blocco 'Viaggio previsto' del modulo trasferta: punto di partenza, destinazione,
     giorno e ora di partenza, andata e ritorno; calcola km, ore, arrivo e giorni, mostra
     la mappa e un link a Google Maps, e lascia correggere a mano le ore totali (per
     treno, aereo o stime diverse). Restituisce il dizionario da salvare con la trasferta
-    (vedi crea_trasferta/aggiorna_trasferta) oppure None se non c'è nessun viaggio previsto."""
+    (vedi crea_trasferta/aggiorna_trasferta) oppure None se non c'è nessun viaggio previsto.
+    'impianto' (facoltativo, da get_dati_impianto) è l'impianto della commessa scelta: se la
+    destinazione è proprio l'indirizzo dell'impianto e si parte dalla sede aziendale, la
+    distanza già salvata sulla commessa viene usata senza ricalcolarla."""
     iniziale = iniziale or {}
+    sede = get_sede_aziendale()
     st.markdown("**🧭 Viaggio previsto (stima teorica)**")
     st.caption("Percorso in auto da OpenStreetMap, senza traffico né orari: per treno, aereo o un tempo diverso correggi le ore a mano. "
                "Le ore effettive le indica l'operatore nel report della trasferta.")
     k = f"{key_prefix}_viaggio"
     col_a, col_b = st.columns(2)
     with col_a:
-        partenza = st.text_input("📍 Punto di partenza", value=iniziale.get("partenza", ""), key=f"{k}_partenza",
+        partenza = st.text_input("📍 Punto di partenza", value=iniziale.get("partenza", "") or sede["indirizzo"], key=f"{k}_partenza",
                                  placeholder="es. Via ..., Borgoricco, Italia")
     with col_b:
         destinazione_scritta = st.text_input("🏁 Destinazione", value=iniziale.get("destinazione", ""), key=f"{k}_destinazione",
@@ -3968,13 +4374,39 @@ def render_stima_viaggio(key_prefix, iniziale=None, destinazione_trasferta="", d
     partenza_dt = datetime.datetime.combine(giorno_partenza, ora_partenza) if giorno_partenza and ora_partenza else None
 
     chiave_stima, chiave_ver = f"{k}_stima", f"{k}_ver"
+    # Partenza = sede e destinazione = indirizzo dell'impianto della commessa: distanza già nota.
+    dati_noti = None
+    if (impianto and impianto.get("lat") is not None and sede["lat"] is not None and not (destinazione_scritta or "").strip()
+            and partenza.strip().casefold() == sede["indirizzo"].casefold()):
+        dati_noti = assicura_distanza_sede(impianto["commessa"])
+        if not (dati_noti and distanza_sede_valida(dati_noti, sede)):
+            dati_noti = None
+    if dati_noti and dati_noti["percorso"] == 1:
+        st.caption(f"📌 Distanza dalla sede già calcolata per questo impianto: **{dati_noti['km']:.0f} km**, "
+                   f"**{formatta_durata(dati_noti['ore'])}** in auto all'andata (nessun nuovo calcolo necessario).")
+    elif dati_noti and dati_noti["percorso"] == 0:
+        st.caption("📌 Dalla sede a questo impianto non c'è un percorso in auto.")
     if st.button("🧭 Calcola tempo di viaggio", key=f"{k}_calcola"):
         try:
-            st.session_state[chiave_stima] = stima_viaggio(partenza, destinazione, partenza_dt, andata_ritorno)
+            if dati_noti and dati_noti["percorso"] == 1:
+                ore_a = float(dati_noti["ore"])
+                st.session_state[chiave_stima] = {
+                    "km": float(dati_noti["km"]), "ore_andata": ore_a, "ore_totali": round(ore_a * (2 if andata_ritorno else 1), 2),
+                    "andata_ritorno": bool(andata_ritorno),
+                    "arrivo": (partenza_dt + datetime.timedelta(hours=ore_a)) if partenza_dt else None,
+                    "giorni": giorni_di_viaggio(partenza_dt, ore_a),
+                    "da": (sede["lat"], sede["lon"]), "a": (dati_noti["lat"], dati_noti["lon"]),
+                }
+            elif dati_noti and dati_noti["percorso"] == 0:
+                raise ErroreNessunPercorso("Nessun percorso in auto trovato tra la sede e l'impianto (servono traghetto o aereo): inserisci le ore a mano.")
+            else:
+                st.session_state[chiave_stima] = stima_viaggio(partenza, destinazione, partenza_dt, andata_ritorno)
             st.session_state[chiave_ver] = st.session_state.get(chiave_ver, 0) + 1
         except ErroreViaggio as e:
             st.session_state.pop(chiave_stima, None)
             st.error(str(e))
+            if isinstance(e, ErroreNessunPercorso):
+                st.info(f"💡 Mezzo suggerito: **{suggerisci_mezzo(None, False)[0]}** — {suggerisci_mezzo(None, False)[1]}")
     stima = st.session_state.get(chiave_stima)
     if stima:
         col1, col2, col3, col4 = st.columns(4)
@@ -3984,6 +4416,8 @@ def render_stima_viaggio(key_prefix, iniziale=None, destinazione_trasferta="", d
         col4.metric("Giorni di viaggio", stima["giorni"])
         if stima["arrivo"]:
             st.caption(f"Arrivo previsto all'andata: {stima['arrivo'].strftime('%d/%m/%Y %H:%M')}")
+        mezzo_sugg, motivo_sugg = suggerisci_mezzo(stima["ore_andata"], True)
+        st.info(f"💡 Mezzo suggerito: **{mezzo_sugg}** — {motivo_sugg}")
         try:
             st.map(pd.DataFrame({"lat": [stima["da"][0], stima["a"][0]], "lon": [stima["da"][1], stima["a"][1]]}))
         except Exception:
@@ -4116,7 +4550,7 @@ def get_trasferte_dipendente(dipendente):
         df = pd.read_sql("""SELECT id AS ID, data_inizio AS Dal, data_fine AS Al, cliente AS Cliente, stato AS Stato,
                                     indirizzo AS Indirizzo, viaggio_ore_teoriche AS 'Ore viaggio previste',
                                     viaggio_ore_effettive AS 'Ore viaggio effettive'
-                             FROM trasferte WHERE dipendente = ? ORDER BY data_inizio DESC, id DESC""",
+                             FROM trasferte WHERE LOWER(TRIM(dipendente)) = LOWER(TRIM(?)) ORDER BY data_inizio DESC, id DESC""",
                           conn, params=(dipendente,))
     for col in ("Ore viaggio previste", "Ore viaggio effettive"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -4334,7 +4768,7 @@ def get_report_interventi_dettaglio(dipendente=None, area=None):
                FROM report_interventi r LEFT JOIN trasferte t ON r.trasferta_id = t.id"""
     condizioni, parametri = [], []
     if dipendente:
-        condizioni.append("r.dipendente = ?")
+        condizioni.append("LOWER(TRIM(r.dipendente)) = LOWER(TRIM(?))")      # tollera maiuscole/spazi diversi nel nome
         parametri.append(dipendente)
     if area and area != "Tutte le aree":
         mappa_aree = get_users_area_map()
@@ -4350,6 +4784,124 @@ def get_report_interventi_dettaglio(dipendente=None, area=None):
     with db_connect() as conn:
         df = pd.read_sql(query, conn, params=tuple(parametri))
     return df
+
+def get_report_interventi_completi(ids):
+    """Dati completi dei report con gli id indicati (testo intero, dettagli della trasferta
+    collegata, ore di viaggio), nello stesso ordine di 'ids'. Senza foto: quelle si caricano a
+    parte (get_foto_report) solo quando servono. Una sola query."""
+    ids = [int(i) for i in ids]
+    if not ids:
+        return []
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute(f"""SELECT r.id, r.dipendente, r.cliente_luogo, r.descrizione, r.ore_lavoro, r.commessa, r.fase, r.data_intervento,
+                             r.data_creazione, r.ore_viaggio, t.data_inizio, t.data_fine, t.commessa, t.cliente, t.stato, t.indirizzo,
+                             t.albergo, t.mezzi, t.viaggio_ore_teoriche, t.viaggio_ore_effettive
+                      FROM report_interventi r LEFT JOIN trasferte t ON r.trasferta_id = t.id
+                      WHERE r.id IN ({','.join('?' for _ in ids)})""", tuple(ids))
+        righe = {r[0]: r for r in c.fetchall()}
+    chiavi = ["id", "dipendente", "cliente_luogo", "descrizione", "ore_lavoro", "commessa", "fase", "giorno", "data_report", "ore_viaggio_report",
+              "trasferta_dal", "trasferta_al", "trasferta_commessa", "cliente", "stato", "indirizzo", "albergo", "mezzi",
+              "viaggio_previsto", "viaggio_effettivo"]
+    return [dict(zip(chiavi, righe[i])) for i in ids if i in righe]
+
+def _riepilogo_report(r):
+    """Coppie (etichetta, valore) leggibili con i dati principali di un report completo."""
+    def v(x):
+        return "" if x is None or (isinstance(x, float) and x != x) else str(x).strip()
+    luogo = v(r.get("cliente_luogo"))
+    trasferta = f"dal {v(r['trasferta_dal'])} al {v(r['trasferta_al'])}" if v(r.get("trasferta_dal")) else ""
+    commessa = v(r.get("commessa")) or v(r.get("trasferta_commessa"))
+    righe = [
+        ("Dipendente", v(r.get("dipendente"))),
+        ("Giorno dell'intervento", v(r.get("giorno")) or v(r.get("data_report"))),
+        ("Cliente / luogo", luogo or v(r.get("cliente"))),
+        ("Commessa", commessa + (f" - fase {v(r.get('fase'))}" if v(r.get("fase")) else "")),
+        ("Trasferta", trasferta),
+        ("Stato / indirizzo", ", ".join(x for x in (v(r.get("indirizzo")), v(r.get("stato"))) if x)),
+        ("Albergo", v(r.get("albergo"))),
+        ("Mezzi", v(r.get("mezzi")).replace(",", ", ")),
+        ("Ore di lavoro", f"{float(r['ore_lavoro']):.2f} h" if r.get("ore_lavoro") else ""),
+        ("Ore di viaggio effettive", formatta_durata(r["viaggio_effettivo"]) if r.get("viaggio_effettivo") else ""),
+        ("Ore di viaggio previste", formatta_durata(r["viaggio_previsto"]) if r.get("viaggio_previsto") else ""),
+        ("Report inviato il", v(r.get("data_report"))),
+    ]
+    return [(e, val) for e, val in righe if val]
+
+def generate_pdf_report_interventi(report_completi, sottotitolo="", con_foto=True):
+    """PDF dei report intervento indicati (uno per pagina, con tutti i dati, la descrizione
+    per intero e le foto allegate). Restituisce i byte del PDF oppure None se ReportLab
+    non è disponibile."""
+    if not PDF_AVAILABLE:
+        return None
+    from xml.sax.saxutils import escape as _esc
+    from reportlab.platypus import KeepTogether
+
+    def testo(t):
+        pulito = _esc(str(t or "")).encode("cp1252", "replace").decode("cp1252")     # i font base del PDF non hanno tutti i simboli
+        return pulito.replace("\r", "").replace("\n", "<br/>")
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=0.6 * inch, bottomMargin=0.7 * inch,
+                            leftMargin=0.7 * inch, rightMargin=0.7 * inch, title="Report interventi")
+    stili = getSampleStyleSheet()
+    titolo_st = ParagraphStyle("TitoloRep", parent=stili["Heading1"], fontSize=20, textColor=colors.HexColor(VIMEK_NAVY), spaceAfter=4)
+    h2 = ParagraphStyle("H2Rep", parent=stili["Heading2"], fontSize=14, textColor=colors.HexColor(VIMEK_NAVY), spaceBefore=6, spaceAfter=6)
+    h3 = ParagraphStyle("H3Rep", parent=stili["Heading3"], keepWithNext=1, fontSize=11, textColor=colors.HexColor(VIMEK_NAVY), spaceBefore=10, spaceAfter=4)
+    corpo = ParagraphStyle("CorpoRep", parent=stili["Normal"], fontSize=10, leading=14)
+    piccolo = ParagraphStyle("PiccoloRep", parent=stili["Normal"], fontSize=8, textColor=colors.grey)
+    story = []
+    logo = _logo_reportlab_image()
+    intestazione = Paragraph("REPORT INTERVENTI", titolo_st)
+    if logo is not None:
+        t_int = Table([[logo, intestazione]], colWidths=[0.85 * inch, None])
+        t_int.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE')]))
+        story.append(t_int)
+    else:
+        story.append(intestazione)
+    story.append(Paragraph(testo(sottotitolo or f"{len(report_completi)} report"), piccolo))
+    story.append(Paragraph(f"Generato il {datetime.date.today().strftime('%d/%m/%Y')}", piccolo))
+    story.append(Spacer(1, 0.15 * inch))
+
+    for i, r in enumerate(report_completi):
+        if i > 0:
+            story.append(PageBreak())
+        story.append(Paragraph(f"Report intervento n. {r['id']}", h2))
+        dati = [[Paragraph(f"<b>{testo(e)}</b>", corpo), Paragraph(testo(val), corpo)] for e, val in _riepilogo_report(r)]
+        if dati:
+            tab = Table(dati, colWidths=[1.9 * inch, 4.9 * inch])
+            tab.setStyle(TableStyle([
+                ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor("#c7d2e0")),
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#eef2f7")),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ]))
+            story.append(tab)
+        story.append(Paragraph("Descrizione del lavoro svolto", h3))
+        story.append(Paragraph(testo(r.get("descrizione")) or "-", corpo))
+        foto = r.get("foto") or []
+        if con_foto and foto:
+            story.append(Paragraph(f"Foto allegate ({len(foto)})", h3))
+            from reportlab.lib.utils import ImageReader
+            for nome_file, dati_foto in foto:
+                try:
+                    larghezza_px, altezza_px = ImageReader(BytesIO(dati_foto)).getSize()
+                    larghezza_max, altezza_max = 6.4 * inch, 4.6 * inch
+                    fattore = min(larghezza_max / larghezza_px, altezza_max / altezza_px)
+                    immagine = Image(BytesIO(dati_foto), width=larghezza_px * fattore, height=altezza_px * fattore)
+                    story.append(KeepTogether([immagine, Paragraph(testo(nome_file), piccolo), Spacer(1, 0.1 * inch)]))
+                except Exception:
+                    story.append(Paragraph(f"(foto '{testo(nome_file)}' non leggibile)", piccolo))
+
+    def piede(canvas, documento):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(0.7 * inch, 0.4 * inch, "Vimek - Report interventi")
+        canvas.drawRightString(A4[0] - 0.7 * inch, 0.4 * inch, f"Pagina {documento.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=piede, onLaterPages=piede)
+    return buffer.getvalue()
 
 def get_foto_report(report_id):
     """Elenco (nome_file, dati_foto) delle foto allegate a un report intervento."""
@@ -4422,6 +4974,13 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     cliente_derivato_trasf = get_cliente_commessa(commessa_scelta_trasf)
     st.text_input("Cliente (ricavato dalla commessa)", value=cliente_derivato_trasf or "(nessun cliente impostato per questa commessa)",
                   disabled=True, key=f"{key_prefix}_trasf_cliente_display")
+    impianto_trasf = get_dati_impianto(commessa_scelta_trasf)
+    indirizzo_impianto_default = (impianto_trasf or {}).get("indirizzo", "")
+    if impianto_trasf and indirizzo_impianto_default:
+        descrizione_impianto = " · ".join(x for x in (impianto_trasf["nome_impianto"], impianto_trasf["tipologia"]) if x)
+        st.caption(f"🏭 Impianto{': ' + descrizione_impianto if descrizione_impianto else ''} — indirizzo compilato dalla commessa, modificabile.")
+    elif commessa_scelta_trasf:
+        st.caption("🏭 Questa commessa non ha ancora l'indirizzo dell'impianto: aggiungilo in 'Mappa impianti' per compilarlo da solo e avere la distanza automatica.")
 
     col_data1, col_data2 = st.columns(2)
     with col_data1:
@@ -4432,9 +4991,9 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     st.markdown("**Luogo di lavoro e alloggio**")
     col_luogo1, col_luogo2 = st.columns(2)
     with col_luogo1:
-        stato_trasf = st.text_input("Stato", value=get_paese_commessa(commessa_scelta_trasf) or "", key=f"{key_prefix}_trasf_stato")
+        stato_trasf = st.text_input("Stato", value=get_paese_commessa(commessa_scelta_trasf) or "", key=f"{key_prefix}_trasf_stato_{commessa_scelta_trasf}")
     with col_luogo2:
-        indirizzo_trasf = st.text_input("Indirizzo", key=f"{key_prefix}_trasf_indirizzo")
+        indirizzo_trasf = st.text_input("Indirizzo", value=indirizzo_impianto_default, key=f"{key_prefix}_trasf_indirizzo_{commessa_scelta_trasf}")
     albergo_trasf = st.text_input("Albergo (nome e/o indirizzo)", key=f"{key_prefix}_trasf_albergo")
 
     st.markdown("**Mezzi di trasporto**")
@@ -4458,8 +5017,10 @@ def render_nuova_trasferta(attore_nome, key_prefix):
         dettaglio_noleggio_trasf = st.text_input("Note auto a noleggio (agenzia, prenotazione, ecc. - opzionale)", key=f"{key_prefix}_trasf_noleggio")
 
     st.markdown("---")
+    indirizzo_e_quello_dell_impianto = bool(indirizzo_impianto_default) and (indirizzo_trasf or "").strip().casefold() == indirizzo_impianto_default.casefold()
     viaggio_trasf = render_stima_viaggio(f"{key_prefix}_trasf", destinazione_trasferta=", ".join(x for x in (indirizzo_trasf, stato_trasf) if (x or "").strip()),
-                                         data_default=data_inizio_trasf)
+                                         data_default=data_inizio_trasf,
+                                         impianto=impianto_trasf if indirizzo_e_quello_dell_impianto else None)
     st.markdown("---")
 
     note_trasf = st.text_area("Note (opzionale)", key=f"{key_prefix}_trasf_note")
@@ -4593,12 +5154,20 @@ def render_trasferte_programmate(key_prefix):
 # Dove sono e cosa stanno facendo, ora, i dipendenti dell'area Service. Si ricava SOLO da
 # ciò che l'app già registra (timbrature, modalità di lavoro scelta, fase aperta,
 # trasferte programmate, ferie/permessi approvati): non c'è nessuna posizione GPS.
-PAGINA_SITUAZIONE_SERVICE = "📍 Situazione Service"
+PAGINA_SITUAZIONE_SERVICE = "📍 Situazione dipendenti"
 # Sotto-menu delle trasferte (uguali per amministratore, responsabile e utenti Service).
 PAGINA_NUOVA_TRASFERTA = "Programmazione nuova Trasferta"
 PAGINA_TRASFERTE_PROGRAMMATE = "Trasferte programmate"
 PAGINA_STATISTICHE_ASSISTENZA = "🛠️ Statistiche Assistenza"
+PAGINA_REPORT_RICEVUTI = "Report interventi ricevuti"            # tutti i report inviati dai dipendenti
+PAGINA_REPORT_INTERVENTO = "📷 Compila Report Intervento"        # il report che compila il dipendente per la propria trasferta
 PAGINE_TRASFERTE = [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_STATISTICHE_ASSISTENZA]
+# Menu unico "Trasferte e Team" per chi gestisce le trasferte (area Service): le stesse
+# voci dell'amministratore, più il report intervento da compilare per le proprie trasferte.
+PAGINA_MAPPA_IMPIANTI = "🗺️ Mappa impianti"
+PAGINA_DISPONIBILITA_TEAM = "📅 Disponibilità Team"
+PAGINE_TRASFERTE_SERVICE = PAGINE_TRASFERTE + [PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM,
+                                               PAGINA_SITUAZIONE_SERVICE, PAGINA_REPORT_INTERVENTO]
 
 def calcola_situazione_operatore(righe, adesso):
     """Stato di un dipendente a partire dalle sue timbrature recenti. 'righe' sono tuple
@@ -4645,18 +5214,25 @@ def calcola_situazione_operatore(righe, adesso):
             risultato["commessa"] = commessa
     return risultato
 
-def get_situazione_service(adesso=None):
-    """Tabella (una riga per dipendente dell'area Service) con stato, dove si trova,
-    attività in corso, cliente, ultima timbratura, trasferta di oggi ed eventuale
+def get_situazione_service(adesso=None, area=None):
+    """Tabella (una riga per dipendente di TUTTE le aree, oppure solo di 'area' se indicata:
+    chi programma le trasferte deve vedere tutta l'azienda) con reparto, stato, dove si
+    trova, attività in corso, cliente, ultima timbratura, trasferta di oggi ed eventuale
     ferie/permesso. Sempre letta dal database (nessuna cache): è la vista 'in tempo
     reale'. Poche query in blocco, non una per dipendente."""
     adesso = adesso or get_current_datetime()
     oggi = adesso.date()
-    colonne = ["Dipendente", "Stato", "Dove", "Attività in corso", "Cliente", "Ultima timbratura", "Trasferta di oggi", "Assenza"]
+    colonne = ["Dipendente", "Reparto", "Stato", "Dove", "Attività in corso", "Cliente", "Ultima timbratura", "Trasferta di oggi", "Assenza"]
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("SELECT nome FROM utenti WHERE LOWER(TRIM(COALESCE(area,''))) = 'service' AND LOWER(COALESCE(role,'')) IN ('user','responsabile') ORDER BY nome")
-        nomi = [r[0] for r in c.fetchall()]
+        if area and area != "Tutte le aree":
+            c.execute("SELECT nome, area FROM utenti WHERE LOWER(TRIM(COALESCE(area,''))) = LOWER(TRIM(?)) AND LOWER(COALESCE(role,'')) IN ('user','responsabile') ORDER BY nome", (area,))
+        else:
+            c.execute("SELECT nome, area FROM utenti WHERE LOWER(COALESCE(role,'')) IN ('user','responsabile') ORDER BY nome")
+        reparti = {}
+        for nome_u, area_u in c.fetchall():
+            reparti[nome_u] = (area_u or "").strip()
+        nomi = list(reparti)
         if not nomi:
             return pd.DataFrame(columns=colonne)
         segnaposto = ",".join("?" for _ in nomi)
@@ -4682,7 +5258,7 @@ def get_situazione_service(adesso=None):
         ore_assenza = assenze.get((nome, oggi), 0.0)
         assenza = "Ferie" if ore_assenza >= 8 else (f"Permesso ({ore_assenza:g}h)" if ore_assenza > 0 else "")
         righe.append({
-            "Dipendente": nome, "Stato": sit["stato"], "Dove": sit["dove"], "Attività in corso": sit["attivita"],
+            "Dipendente": nome, "Reparto": reparti.get(nome, ""), "Stato": sit["stato"], "Dove": sit["dove"], "Attività in corso": sit["attivita"],
             "Cliente": clienti.get(sit["commessa"], ""), "Ultima timbratura": sit["ultima"],
             "Trasferta di oggi": " | ".join(trasferte.get(nome, [])), "Assenza": assenza,
         })
@@ -4694,14 +5270,15 @@ def render_situazione_service(key_prefix):
     """Pagina 'Situazione Service': chi è al lavoro, dove (sede, smart working, trasferta e
     dove), con quale attività e per quale cliente, in questo momento. Si aggiorna da sola
     ogni 60 secondi (come le altre pagine di sola visualizzazione) e col pulsante."""
-    st.subheader("📍 Situazione Service")
+    st.subheader("📍 Situazione dipendenti")
     adesso = get_current_datetime()
     col_ora, col_btn = st.columns([3, 1])
     col_ora.caption(f"Aggiornato alle {adesso.strftime('%H:%M:%S')} del {adesso.strftime('%d/%m/%Y')} · si aggiorna da solo ogni minuto")
     col_btn.button("🔄 Aggiorna ora", key=f"{key_prefix}_situazione_aggiorna")
-    tabella = get_situazione_service(adesso)
+    reparto_scelto = st.selectbox("Reparto", get_area_names(), key=f"{key_prefix}_situazione_reparto")
+    tabella = get_situazione_service(adesso, reparto_scelto)
     if tabella.empty:
-        st.info("Nessun dipendente nell'area Service.")
+        st.info("Nessun dipendente in questo reparto.")
         return
     conteggi = tabella["Stato"].str[:1].value_counts()
     in_trasferta = int(tabella["Dove"].astype(str).str.startswith("In trasferta").sum())
@@ -4715,42 +5292,109 @@ def render_situazione_service(key_prefix):
     st.caption("Si ricava dalle timbrature (modalità di lavoro e fase aperta), dalle trasferte programmate e da ferie/permessi approvati: non c'è la posizione GPS. "
                "'Non timbrato' = nessun ingresso oggi.")
 
+REPORT_PER_PAGINA = 10
+
+def _html_testo_a_capo(testo_):
+    from html import escape as _h
+    return _h(str(testo_ or "")).replace("\n", "<br>")
+
+def render_schede_report(report_df, key_prefix, titolo_pdf):
+    """Mostra i report a schede estese (non in tabella): dati della trasferta, descrizione per
+    intero, foto a richiesta e PDF del singolo report; in alto il PDF di tutti i report
+    della selezione. Le schede sono a pagine di REPORT_PER_PAGINA per non caricare troppe cose."""
+    n = len(report_df)
+    if n == 0:
+        return
+    pagine = max(1, math.ceil(n / REPORT_PER_PAGINA))
+    pagina = 1
+    if pagine > 1:
+        pagina = int(st.number_input(f"Pagina (da 1 a {pagine})", min_value=1, max_value=pagine, value=1, step=1, key=f"{key_prefix}_rep_pagina"))
+    st.caption(f"{n} report" + (f" · pagina {pagina} di {pagine}" if pagine > 1 else ""))
+
+    # PDF di tutta la selezione (non solo della pagina visibile)
+    con_foto_pdf = st.checkbox("Includi le foto nel PDF", value=True, key=f"{key_prefix}_rep_pdf_foto")
+    chiave_tutti = f"{key_prefix}_pdf_tutti"
+    if PDF_AVAILABLE:
+        if st.button(f"📄 Prepara il PDF di tutti i {n} report", key=f"{key_prefix}_rep_pdf_tutti_prepara"):
+            ids_tutti = report_df["ID"].tolist()
+            completi = get_report_interventi_completi(ids_tutti)
+            for r in completi:
+                r["foto"] = get_foto_report(r["id"]) if con_foto_pdf else []
+            st.session_state[chiave_tutti] = (generate_pdf_report_interventi(completi, titolo_pdf, con_foto_pdf), n)
+        if st.session_state.get(chiave_tutti):
+            dati_pdf, n_pdf = st.session_state[chiave_tutti]
+            st.download_button(f"⬇️ Scarica il PDF ({n_pdf} report)", data=dati_pdf, file_name=f"report_interventi_{datetime.date.today().isoformat()}.pdf",
+                               mime="application/pdf", key=f"{key_prefix}_rep_pdf_tutti_scarica")
+    else:
+        st.info("ℹ️ Per abilitare i PDF installa: pip install reportlab")
+
+    visibili = report_df.iloc[(pagina - 1) * REPORT_PER_PAGINA: pagina * REPORT_PER_PAGINA]
+    completi_visibili = {r["id"]: r for r in get_report_interventi_completi(visibili["ID"].tolist())}
+    for _, riga in visibili.iterrows():
+        rid = int(riga["ID"])
+        r = completi_visibili.get(rid)
+        if not r:
+            continue
+        titolo = f"Report n. {rid} · {r['dipendente']} · {r['commessa'] or r['trasferta_commessa'] or 'senza commessa'} · {r['giorno'] or r['data_report']}"
+        with st.container(border=True):
+            st.markdown(f"#### 📷 {titolo}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Giorno", str(r["giorno"] or r["data_report"] or "-"))
+            c2.metric("Ore di lavoro", f"{float(r['ore_lavoro']):.2f} h" if r["ore_lavoro"] else "-")
+            c3.metric("Viaggio effettivo", formatta_durata(r["viaggio_effettivo"]) if r["viaggio_effettivo"] else "-")
+            c4.metric("Foto", int(riga["N. foto"]))
+            dettagli = [f"{e}: {val}" for e, val in _riepilogo_report(r) if e in ("Cliente / luogo", "Commessa", "Trasferta", "Stato / indirizzo", "Albergo", "Mezzi", "Report inviato il")]
+            if dettagli:
+                st.caption(" · ".join(dettagli))
+            st.markdown("**Descrizione del lavoro svolto**")
+            st.markdown(f"<div style='white-space:normal'>{_html_testo_a_capo(r['descrizione'])}</div>", unsafe_allow_html=True)
+
+            if int(riga["N. foto"]) > 0 and st.checkbox(f"Mostra le {int(riga['N. foto'])} foto", key=f"{key_prefix}_rep_mostra_foto_{rid}"):
+                for nome_file, dati_foto in get_foto_report(rid):
+                    st.image(dati_foto, caption=nome_file, use_container_width=True)
+
+            if PDF_AVAILABLE:
+                chiave_pdf = f"{key_prefix}_pdf_{rid}"
+                if st.button("📄 Prepara PDF di questo report", key=f"{key_prefix}_rep_pdf_prepara_{rid}"):
+                    r_pdf = dict(r)
+                    r_pdf["foto"] = get_foto_report(rid) if con_foto_pdf else []
+                    st.session_state[chiave_pdf] = generate_pdf_report_interventi([r_pdf], titolo, con_foto_pdf)
+                if st.session_state.get(chiave_pdf):
+                    st.download_button("⬇️ Scarica il PDF", data=st.session_state[chiave_pdf], file_name=f"report_intervento_{rid}.pdf",
+                                       mime="application/pdf", key=f"{key_prefix}_rep_pdf_scarica_{rid}")
+
 def render_report_interventi_ricevuti(key_prefix):
-    """Sotto-pagina 'Report interventi ricevuti': elenco di tutti i report
-    intervento inviati dai dipendenti in trasferta, con la possibilità di vedere
-    le foto eventualmente allegate a ciascuno."""
+    """Sotto-pagina 'Report interventi ricevuti': tutti i report inviati dai dipendenti in
+    trasferta, a schede estese con descrizione completa e foto, filtrabili per dipendente,
+    commessa e periodo, salvabili in PDF (singolo report o tutti quelli selezionati)."""
     st.subheader("📷 Report interventi ricevuti")
     report_tutti = get_report_interventi_dettaglio()
     if report_tutti.empty:
         st.info("Nessun report intervento inviato finora.")
         return
-    st.dataframe(report_tutti, use_container_width=True)
-    opzioni_foto = [f"#{id_} - {dip} ({data_rep})" for id_, dip, data_rep in
-                     zip(report_tutti["ID"], report_tutti["Dipendente"], report_tutti["Data report"])]
-    mappa_report_id = dict(zip(opzioni_foto, report_tutti["ID"].tolist()))
-    report_da_vedere = st.selectbox("Vedi foto del report", ["(nessuno)"] + opzioni_foto, key=f"{key_prefix}_report_foto_select")
-    if report_da_vedere != "(nessuno)":
-        foto_report = get_foto_report(mappa_report_id[report_da_vedere])
-        if not foto_report:
-            st.info("Nessuna foto allegata a questo report.")
-        else:
-            for nome_file, dati_foto in foto_report:
-                st.image(dati_foto, caption=nome_file, use_container_width=True)
-
-
-def render_trasferte_programmate_service(key_prefix):
-    """'Trasferte programmate' per responsabile e utente semplice dell'area Service:
-    l'elenco delle trasferte e, sotto, i report intervento ricevuti (l'amministratore
-    li ha come pagina a parte). La programmazione di una nuova trasferta e le
-    Statistiche Assistenza sono sotto-menu separati, come per l'amministratore."""
-    render_trasferte_programmate(key_prefix)
-    st.markdown("---")
-    st.markdown("**Report interventi ricevuti**")
-    report_service = get_report_interventi_dettaglio()
-    if report_service.empty:
-        st.info("Nessun report intervento inviato finora.")
-    else:
-        st.dataframe(report_service, use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        dipendenti_con_report = sorted(report_tutti["Dipendente"].dropna().unique().tolist())
+        filtro_dip = st.selectbox("Dipendente", ["Tutti"] + dipendenti_con_report, key=f"{key_prefix}_report_filtro_dip")
+    with col2:
+        commesse_con_report = sorted({x for x in report_tutti["Commessa"].dropna().unique().tolist() if x})
+        filtro_comm = st.selectbox("Commessa", ["Tutte"] + commesse_con_report, key=f"{key_prefix}_report_filtro_comm")
+    if st.checkbox("Filtra per periodo (data del report)", key=f"{key_prefix}_report_filtro_periodo_on"):
+        oggi = datetime.date.today()
+        periodo = st.date_input("Periodo", value=(oggi.replace(day=1), oggi), key=f"{key_prefix}_report_filtro_periodo")
+        if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
+            da, a = periodo[0].isoformat(), periodo[1].isoformat()
+            report_tutti = report_tutti[(report_tutti["Data report"].astype(str) >= da) & (report_tutti["Data report"].astype(str) <= a)]
+    if filtro_dip != "Tutti":
+        report_tutti = report_tutti[report_tutti["Dipendente"] == filtro_dip]
+    if filtro_comm != "Tutte":
+        report_tutti = report_tutti[report_tutti["Commessa"] == filtro_comm]
+    report_tutti = report_tutti.reset_index(drop=True)
+    if report_tutti.empty:
+        st.info("Nessun report con questi filtri.")
+        return
+    filtri_txt = ", ".join(x for x in (f"dipendente {filtro_dip}" if filtro_dip != "Tutti" else "", f"commessa {filtro_comm}" if filtro_comm != "Tutte" else "") if x)
+    render_schede_report(report_tutti, key_prefix, "Report interventi" + (f" - {filtri_txt}" if filtri_txt else " - tutti"))
 
 
 def render_report_intervento(dipendente_nome, df, key_prefix):
@@ -4763,6 +5407,7 @@ def render_report_intervento(dipendente_nome, df, key_prefix):
     trasferte_dipendente = get_trasferte_dipendente(dipendente_nome)
     if trasferte_dipendente.empty:
         st.info("Non hai ancora trasferte programmate a cui associare un report. Contatta l'area Service.")
+        _render_report_inviati(dipendente_nome)      # i report già inviati si vedono comunque
         return
 
     opzioni_trasferta = [
@@ -4865,13 +5510,17 @@ def render_report_intervento(dipendente_nome, df, key_prefix):
             else:
                 st.error(errore_retro)
 
+    _render_report_inviati(dipendente_nome)
+
+def _render_report_inviati(dipendente_nome):
+    """Elenco dei report intervento già inviati da questo dipendente."""
     st.markdown("---")
     st.markdown("**I tuoi report inviati**")
     report_dip = get_report_interventi_dettaglio(dipendente=dipendente_nome)
     if report_dip.empty:
         st.info("Nessun report inviato finora.")
     else:
-        st.dataframe(report_dip.drop(columns=["Dipendente"]), use_container_width=True)
+        render_schede_report(report_dip, f"mieirep_{re.sub(r'[^0-9A-Za-z]', '_', dipendente_nome)}", f"Report interventi di {dipendente_nome}")
 
 def render_disponibilita_team(area_default=None, forza_area=False, key_prefix=""):
     """Vista 'chi è dove' per un giorno scelto: in sede, in trasferta o in ferie/
@@ -7709,7 +8358,7 @@ def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
 # quando la pagina si chiama allo stesso modo, es. "Gestione fasi commessa").
 PAGINE_SENZA_AUTOREFRESH_AUTOMATICO = {
     "Gestione Commesse", "Gestione fasi commessa", "Gestione Utenti DB",
-    "Profilo", "Timbrature", "📷 Report Intervento",
+    "Profilo", "Timbrature", PAGINA_REPORT_INTERVENTO, PAGINA_MAPPA_IMPIANTI,
     "Programmazione nuova Trasferta", "Trasferte programmate", "🧳 Trasferte Service",
     "Richiesta ferie/permessi", "Richiesta rettifica",
     "💰 Costi commesse", "💰 Gestione Costi", "📅 Pianificazione",
@@ -7777,7 +8426,7 @@ else:
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto"]),
             ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
             ("👥 Risorse Umane", ["Cartellini dipendenti"]),
-            ("🧳 Trasferte e Team", PAGINE_TRASFERTE + ["Report interventi ricevuti", "📅 Disponibilità Team", PAGINA_SITUAZIONE_SERVICE]),
+            ("🧳 Trasferte e Team", PAGINE_TRASFERTE + [PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_SITUAZIONE_SERVICE]),
             ("💰 Costi", ["💰 Costi commesse"]),
             ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
         ], key_prefix="admin_menu", titolo_categoria="Sezione amministratore")
@@ -8115,11 +8764,14 @@ else:
         if admin_page == "Trasferte programmate":
             render_trasferte_programmate(key_prefix="admin")
 
-        if admin_page == "Report interventi ricevuti":
+        if admin_page == PAGINA_REPORT_RICEVUTI:
             render_report_interventi_ricevuti(key_prefix="admin")
 
-        if admin_page == "📅 Disponibilità Team":
+        if admin_page == PAGINA_DISPONIBILITA_TEAM:
             render_disponibilita_team(key_prefix="admin")
+
+        if admin_page == PAGINA_MAPPA_IMPIANTI:
+            render_mappa_impianti(key_prefix="admin", puo_impostare_sede=True)
 
         if admin_page == PAGINA_SITUAZIONE_SERVICE:
             render_situazione_service(key_prefix="admin")
@@ -8159,19 +8811,18 @@ else:
         if modalita == "Mie funzioni personali":
             # *** REPLICA DELLA SEZIONE UTENTE PER IL RESPONSABILE ***
             dipendente_scelto = user_info["name"]
-            # Chi è nell'area Service trova qui, nella categoria "Service", anche
-            # le Statistiche Assistenza (oltre che in fondo a "Trasferte Service").
-            pagine_service_resp = ["📷 Report Intervento"]
-            if is_area_service(user_info["area"]):
-                pagine_service_resp.append("🛠️ Statistiche Assistenza")
-                pagine_service_resp.append(PAGINA_SITUAZIONE_SERVICE)
-            pagina_utente = render_menu_a_categorie([
+            # Chi è nell'area Service ha tutto ciò che riguarda le trasferte (anche il
+            # proprio report intervento) nel menu unico della modalità "Trasferte Service".
+            categorie_resp_personale = [
                 ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
                 ("👤 Profilo", ["Profilo"]),
                 ("🏭 Le mie Commesse", ["Le mie Commesse"]),
-                ("🧳 Service", pagine_service_resp),
                 ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
-            ], key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
+            ]
+            if not is_area_service(user_info["area"]):
+                categorie_resp_personale.insert(3, ("🧳 Service", [PAGINA_REPORT_INTERVENTO]))
+            pagina_utente = render_menu_a_categorie(
+                categorie_resp_personale, key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
             st.session_state["_ultima_pagina_vista"] = pagina_utente
             if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE):
                 df = carica_dati_db()
@@ -8275,14 +8926,8 @@ else:
             elif pagina_utente == "Le mie Commesse":
                 render_le_mie_commesse(dipendente_scelto, user_info["area"], key_prefix="resp")
 
-            elif pagina_utente == "📷 Report Intervento":
+            elif pagina_utente == PAGINA_REPORT_INTERVENTO:
                 render_report_intervento(dipendente_scelto, df, key_prefix="resp")
-
-            elif pagina_utente == "🛠️ Statistiche Assistenza":
-                render_statistiche_assistenza(df, key_prefix="resp_personale_assistenza")
-
-            elif pagina_utente == PAGINA_SITUAZIONE_SERVICE:
-                render_situazione_service(key_prefix="resp_personale")
 
             elif pagina_utente == "Richiesta ferie/permessi":
                 st.subheader("Richiesta ferie / permessi")
@@ -8465,7 +9110,7 @@ else:
 
         elif modalita == "🧳 Trasferte Service":
             trasferte_page = render_menu_a_categorie([
-                ("🧳 Trasferte", PAGINE_TRASFERTE),
+                ("🧳 Trasferte e Team", PAGINE_TRASFERTE_SERVICE),
             ], key_prefix="resp_trasferte_menu", titolo_categoria="Sezione Trasferte")
             st.session_state["_ultima_pagina_vista"] = trasferte_page
 
@@ -8473,11 +9118,27 @@ else:
                 render_nuova_trasferta(user_info["name"], key_prefix="resp_service")
 
             elif trasferte_page == PAGINA_TRASFERTE_PROGRAMMATE:
-                render_trasferte_programmate_service(key_prefix="resp_service")
+                render_trasferte_programmate(key_prefix="resp_service")
 
             elif trasferte_page == PAGINA_STATISTICHE_ASSISTENZA:
                 df = carica_dati_db()
                 render_statistiche_assistenza(df, key_prefix="resp_assistenza")
+
+            elif trasferte_page == PAGINA_REPORT_RICEVUTI:
+                render_report_interventi_ricevuti(key_prefix="resp_service")
+
+            elif trasferte_page == PAGINA_REPORT_INTERVENTO:
+                df = carica_dati_db()
+                render_report_intervento(user_info["name"], df, key_prefix="resp")
+
+            elif trasferte_page == PAGINA_MAPPA_IMPIANTI:
+                render_mappa_impianti(key_prefix="resp_service")
+
+            elif trasferte_page == PAGINA_DISPONIBILITA_TEAM:
+                render_disponibilita_team(key_prefix="resp_service")
+
+            elif trasferte_page == PAGINA_SITUAZIONE_SERVICE:
+                render_situazione_service(key_prefix="resp_personale")
 
         elif modalita == "👥 Risorse Umane":
             st.session_state["_ultima_pagina_vista"] = "Cartellini dipendenti"
@@ -8504,20 +9165,19 @@ else:
     else:
         # --- LATO UTENTE ---
         dipendente_scelto = user_info["name"]
-        pagine_service_utente = ["📷 Report Intervento"]
-        if is_area_service(user_info["area"]):
-            pagine_service_utente.append(PAGINA_SITUAZIONE_SERVICE)
         categorie_utente = [
             ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
             ("👤 Profilo", ["Profilo"]),
             ("🏭 Le mie Commesse", ["Le mie Commesse", "📅 Pianificazione"]),
-            ("🧳 Service", pagine_service_utente),
             ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
         ]
-        # Le trasferte (programmazione, elenco, statistiche) hanno una categoria a sé,
-        # solo per chi fa parte dell'area Service.
+        # Chi fa parte dell'area Service ha un unico menu "Trasferte e Team" (stesse voci
+        # dell'amministratore, più il proprio report intervento); gli altri utenti, che
+        # possono comunque andare in trasferta, hanno solo il report intervento.
         if is_area_service(user_info["area"]):
-            categorie_utente.insert(4, ("🧳 Trasferte", PAGINE_TRASFERTE))
+            categorie_utente.insert(3, ("🧳 Trasferte e Team", PAGINE_TRASFERTE_SERVICE))
+        else:
+            categorie_utente.insert(3, ("🧳 Service", [PAGINA_REPORT_INTERVENTO]))
         # La categoria Costi compare solo per chi fa parte dell'area Costi, come il
         # Service: per tutti gli altri utenti non c'è alcuna voce sui costi.
         if is_area_amministrazione(user_info["area"]):
@@ -8528,7 +9188,8 @@ else:
         pagina_utente = render_menu_a_categorie(
             categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
-        if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE):
+        if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI,
+                                    PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM):
             df = carica_dati_db()
 
         if pagina_utente == "Profilo":
@@ -8675,17 +9336,26 @@ else:
         elif pagina_utente == "📅 Pianificazione":
             render_pianificazione_commessa(df, key_prefix="user_pianificazione", puo_modificare=False)
 
-        elif pagina_utente == "📷 Report Intervento":
+        elif pagina_utente == PAGINA_REPORT_INTERVENTO:
             render_report_intervento(dipendente_scelto, df, key_prefix="user")
+
+        elif pagina_utente == PAGINA_REPORT_RICEVUTI:
+            render_report_interventi_ricevuti(key_prefix="user_service")
 
         elif pagina_utente == PAGINA_NUOVA_TRASFERTA:
             render_nuova_trasferta(user_info["name"], key_prefix="user_service")
 
         elif pagina_utente == PAGINA_TRASFERTE_PROGRAMMATE:
-            render_trasferte_programmate_service(key_prefix="user_service")
+            render_trasferte_programmate(key_prefix="user_service")
 
         elif pagina_utente == "🛠️ Statistiche Assistenza":
             render_statistiche_assistenza(df, key_prefix="user_assistenza")
+
+        elif pagina_utente == PAGINA_MAPPA_IMPIANTI:
+            render_mappa_impianti(key_prefix="user_service")
+
+        elif pagina_utente == PAGINA_DISPONIBILITA_TEAM:
+            render_disponibilita_team(key_prefix="user_service")
 
         elif pagina_utente == PAGINA_SITUAZIONE_SERVICE:
             render_situazione_service(key_prefix="user")
