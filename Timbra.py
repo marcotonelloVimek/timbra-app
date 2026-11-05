@@ -1359,6 +1359,14 @@ def _inject_stile_vimek():
         color: #fff;
     }}
 
+    /* Pulsante principale di un modulo (salvataggio): verde, ben distinto dagli altri */
+    .stButton>button[kind="primary"], .stFormSubmitButton>button[kind="primary"] {{
+        background-color: #1f9d55;
+    }}
+    .stButton>button[kind="primary"]:hover, .stFormSubmitButton>button[kind="primary"]:hover {{
+        background-color: #17803f;
+    }}
+
     /* Schede metriche in stile "card" */
     div[data-testid="stMetric"] {{
         background: #fff;
@@ -1366,6 +1374,55 @@ def _inject_stile_vimek():
         border-radius: 12px;
         padding: 14px 16px;
         box-shadow: 0 1px 3px rgba(20,30,45,.08);
+    }}
+
+    /* Menu di navigazione in alto (sezioni e pagine): pulsanti ben visibili, che vanno a
+       capo da soli su schermi stretti. Il contenitore ha la chiave "navmenu". */
+    div[class*="st-key-navmenu"] div[role="radiogroup"] {{
+        gap: 6px 8px;
+        flex-wrap: wrap;
+    }}
+    div[class*="st-key-navmenu"] div[role="radiogroup"] > label {{
+        background: #eef3f8;
+        border: 1px solid #d5dfea;
+        border-radius: 999px;
+        padding: 6px 14px;
+        margin: 0;
+        cursor: pointer;
+    }}
+    div[class*="st-key-navmenu"] div[role="radiogroup"] > label > div:first-child {{
+        display: none;              /* nasconde il pallino del radio: resta solo il "pulsante" */
+    }}
+    div[class*="st-key-navmenu"] div[role="radiogroup"] > label:has(input:checked) {{
+        background: {VIMEK_NAVY};
+        border-color: {VIMEK_NAVY};
+    }}
+    div[class*="st-key-navmenu"] div[role="radiogroup"] > label:has(input:checked) * {{
+        color: #fff !important;
+        font-weight: 600;
+    }}
+    div[class*="st-key-navmenu-sezioni"] div[role="radiogroup"] > label {{
+        padding: 9px 18px;
+        font-size: 1.05rem;
+    }}
+
+    /* Telefono: margini ridotti, pulsanti e campi comodi da toccare col dito */
+    @media (max-width: 640px) {{
+        div[data-testid="stMainBlockContainer"], .block-container {{
+            padding: 1rem .75rem 4rem .75rem !important;
+        }}
+        .stButton>button, .stDownloadButton>button, .stFormSubmitButton>button {{
+            min-height: 3rem;
+            font-size: 1.05rem;
+        }}
+        div[class*="st-key-navmenu"] div[role="radiogroup"] > label {{
+            padding: 10px 14px;
+            font-size: 1rem;
+        }}
+        h1 {{ font-size: 1.6rem !important; }}
+        h2, h3 {{ font-size: 1.25rem !important; }}
+        div[data-testid="stMetric"] {{ padding: 10px 12px; }}
+        .vimek-logo-header img {{ height: 34px; }}
     }}
 
     .vimek-logo-header {{
@@ -1758,8 +1815,7 @@ def render_gestione_attivita_reparto(key_prefix, scope_area=None):
         if st.button("➕ Aggiungi attività", key=f"{key_prefix}_att_btn_add_{_chiave_reparto(area_sel)}"):
             ok, errore = aggiungi_attivita_reparto(area_sel, nuova)
             if ok:
-                st.success(f"Attività '{nuova.strip()}' aggiunta.")
-                st.rerun()
+                notifica_e_ricarica(f"Attività '{nuova.strip()}' aggiunta.")
             else:
                 st.error(errore)
     with col_del:
@@ -1768,8 +1824,7 @@ def render_gestione_attivita_reparto(key_prefix, scope_area=None):
             if st.button("🗑️ Rimuovi attività", key=f"{key_prefix}_att_btn_del_{_chiave_reparto(area_sel)}"):
                 ok, errore = rimuovi_attivita_reparto(area_sel, da_togliere)
                 if ok:
-                    st.success(f"Attività '{da_togliere}' rimossa (le timbrature già fatte restano).")
-                    st.rerun()
+                    notifica_e_ricarica(f"Attività '{da_togliere}' rimossa (le timbrature già fatte restano).")
                 else:
                     st.error(errore)
     return area_sel
@@ -2216,8 +2271,7 @@ def render_gestione_template_fasi(scope_area=None, attore=""):
         if st.button("➕ Aggiungi al template", key=f"btn_add_template_{tipologia_sel}_{area_sel}"):
             ok, errore = aggiungi_template_fase(tipologia_sel, area_sel, nuova_fase_t, nuove_ore_t, attore)
             if ok:
-                st.success(f"Fase '{nuova_fase_t.strip()}' aggiunta al template.")
-                st.rerun()
+                notifica_e_ricarica(f"Fase '{nuova_fase_t.strip()}' aggiunta al template.")
             else:
                 st.error(errore)
 
@@ -2233,15 +2287,13 @@ def render_gestione_template_fasi(scope_area=None, attore=""):
                 if st.button("💾 Aggiorna ore", key=f"btn_update_template_{template_id_sel}"):
                     ok, errore = aggiorna_ore_template_fase(template_id_sel, nuove_ore_modifica_t)
                     if ok:
-                        st.success("Ore stimate aggiornate.")
-                        st.rerun()
+                        notifica_e_ricarica("Ore stimate aggiornate.")
                     else:
                         st.error(errore)
             with col_mod2:
                 if st.button("🗑️ Elimina dal template", key=f"btn_delete_template_{template_id_sel}"):
                     elimina_template_fase(template_id_sel)
-                    st.success("Fase eliminata dal template.")
-                    st.rerun()
+                    notifica_e_ricarica("Fase eliminata dal template.")
 
 @st.cache_data(ttl=30)
 def _fasi_di_tutte_le_commesse():
@@ -2949,7 +3001,7 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
             )
             if ok:
                 nome_creata = nuovo_nome.strip()
-                st.success(f"Commessa '{nome_creata}' creata.")
+                notifica(f"Commessa '{nome_creata}' creata.")
                 if (nuovo_indirizzo_impianto or "").strip():
                     # Localizzazione "al meglio": se il servizio delle mappe non risponde la commessa resta creata
                     # e l'impianto si localizza poi dalla pagina Mappa impianti.
@@ -2959,9 +3011,9 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
                 if applica_template_cc and ha_template_cc:
                     n_copiate = applica_template_a_commessa(nuova_tipologia, nome_creata, attore)
                     if n_copiate:
-                        st.success(f"Applicate {n_copiate} fasi dal template '{nuova_tipologia}'.")
+                        notifica(f"Applicate {n_copiate} fasi dal template '{nuova_tipologia}'.")
                     else:
-                        st.info("Nessuna fase copiata dal template (era vuoto).")
+                        notifica("Nessuna fase copiata dal template (era vuoto).", "info")
                 st.rerun()
             else:
                 st.error(errore)
@@ -2984,8 +3036,7 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
             if st.button("💾 Salva priorità", key=f"btn_priorita_commessa_{commessa_priorita_sel}"):
                 ok, errore = aggiorna_priorita_commessa(commessa_priorita_sel, nuova_priorita_commessa)
                 if ok:
-                    st.success(f"Priorità di '{commessa_priorita_sel}' aggiornata a {nuova_priorita_commessa}.")
-                    st.rerun()
+                    notifica_e_ricarica(f"Priorità di '{commessa_priorita_sel}' aggiornata a {nuova_priorita_commessa}.")
                 else:
                     st.error(errore)
         st.markdown("---")
@@ -3048,8 +3099,7 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
             operatore_da_salvare = "" if nuovo_operatore_fase == "(nessuno: visibile a tutto il reparto)" else nuovo_operatore_fase
             ok, errore = aggiungi_fase_commessa(commessa_sel, macro_fase_sel, nuova_fase, nuove_ore, attore, operatore_assegnato=operatore_da_salvare)
             if ok:
-                st.success(f"Sottofase '{nuova_fase.strip()}' aggiunta.")
-                st.rerun()
+                notifica_e_ricarica(f"Sottofase '{nuova_fase.strip()}' aggiunta.")
             else:
                 st.error(errore)
 
@@ -3070,21 +3120,18 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
                 if st.button("💾 Aggiorna ore", key=f"btn_update_fase_{fase_id_scelta}"):
                     ok, errore = aggiorna_ore_stimate_fase(fase_id_scelta, nuove_ore_modifica)
                     if ok:
-                        st.success("Ore stimate aggiornate.")
-                        st.rerun()
+                        notifica_e_ricarica("Ore stimate aggiornate.")
                     else:
                         st.error(errore)
             with col_mod2:
                 if st.button("👤 Aggiorna operatore", key=f"btn_update_operatore_fase_{fase_id_scelta}"):
                     operatore_da_salvare_mod = "" if operatore_modifica_fase == "(nessuno: visibile a tutto il reparto)" else operatore_modifica_fase
                     aggiorna_operatore_fase(fase_id_scelta, operatore_da_salvare_mod)
-                    st.success("Operatore assegnato aggiornato.")
-                    st.rerun()
+                    notifica_e_ricarica("Operatore assegnato aggiornato.")
             with col_mod3:
                 if st.button("🗑️ Elimina sottofase", key=f"btn_delete_fase_{fase_id_scelta}"):
                     elimina_fase_commessa(fase_id_scelta)
-                    st.success("Sottofase eliminata.")
-                    st.rerun()
+                    notifica_e_ricarica("Sottofase eliminata.")
             st.caption("Lo stato della sottofase (Da iniziare/In corso/In pausa/Completata) lo imposta l'operatore stesso da 'Le mie Commesse', non l'admin da qui.")
 
     if allow_create_commessa:
@@ -3094,8 +3141,7 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
         commessa_da_eliminare = st.selectbox("Commessa da eliminare", options=commesse, key="commessa_delete_select")
         if st.button("Elimina definitivamente la commessa"):
             elimina_commessa(commessa_da_eliminare)
-            st.success(f"Commessa '{commessa_da_eliminare}' eliminata.")
-            st.rerun()
+            notifica_e_ricarica(f"Commessa '{commessa_da_eliminare}' eliminata.")
 
 def render_mappatura_macro_fasi_reparti():
     """UI admin per collegare ogni macro-fase (Progettazione Meccanica, ...) a un
@@ -3198,13 +3244,13 @@ def registra_orario(nome_dipendente, tipo_azione, luogo_lavoro, dettaglio, comme
     _svuota_stato_timbratura()
 
     if fase_da_chiudere:
-        st.info(f"🧩 La fase '{fase_da_chiudere[1]}' su '{fase_da_chiudere[0]}' era ancora aperta: chiusa automaticamente con l'uscita.")
+        notifica(f"🧩 La fase '{fase_da_chiudere[1]}' su '{fase_da_chiudere[0]}' era ancora aperta: chiusa automaticamente con l'uscita.", "info")
     if tipo_azione in ["Inizio fase", "Fine fase"]:
-        st.success(f"🧩 {tipo_azione} registrato per {nome_dipendente} - Fase: {fase or '-'} - Commessa: {commessa or '-'} - alle {ora_str}!")
+        notifica(f"🧩 {tipo_azione} registrato per {nome_dipendente} - Fase: {fase or '-'} - Commessa: {commessa or '-'} - alle {ora_str}!")
     elif tipo_azione in ["Inizio Pausa", "Fine Pausa"]:
-        st.success(f"☕ {tipo_azione} registrato per {nome_dipendente} - alle {ora_str}!")
+        notifica(f"☕ {tipo_azione} registrato per {nome_dipendente} - alle {ora_str}!")
     else:
-        st.success(f"📌 {tipo_azione} registrato per {nome_dipendente} ({luogo_lavoro}) - Commessa: {commessa} - alle {ora_str}!")
+        notifica(f"📌 {tipo_azione} registrato per {nome_dipendente} ({luogo_lavoro}) - Commessa: {commessa} - alle {ora_str}!")
     st.rerun()
     return True
 
@@ -3274,7 +3320,7 @@ Sistema Timbrature
     """
     send_email(email_approvatore, oggetto, corpo)
     
-    st.success("Richiesta inviata correttamente. In attesa di approvazione.")
+    notifica("✅ Richiesta inviata correttamente. È in attesa di approvazione: la vedi nell'elenco qui sotto.")
 
 def aggiorna_stato_richiesta(request_id, stato):
     with db_connect() as conn:
@@ -3331,7 +3377,7 @@ def salva_richiesta_rettifica(dipendente, azione, data_prevista, ora_prevista, m
                      VALUES (?,?,?,?,?,?,?,?)""",
                   (rettifica_id, dipendente, azione, data_prevista.isoformat(), ora_prevista, motivo, "In attesa", oggi_str))
         conn.commit()
-    st.success("📝 Richiesta di rettifica inviata. Attendi l'approvazione dell'amministratore.")
+    notifica("📝 Richiesta di correzione inviata. Resta in attesa di approvazione: la vedi nell'elenco qui sotto.")
 
 def carica_rettifiche():
     """Carica tutte le richieste di rettifica."""
@@ -3385,7 +3431,7 @@ Amministrazione Timbrature
     """
     send_email(email_dipendente, oggetto, corpo)
     
-    st.success("✅ Rettifica approvata e timbratura registrata.")
+    notifica("✅ Correzione approvata e timbratura registrata.")
     return True
 
 def rifiuta_rettifica(rettifica_id):
@@ -3394,7 +3440,7 @@ def rifiuta_rettifica(rettifica_id):
         c = conn.cursor()
         c.execute("UPDATE rettifiche SET Stato = ? WHERE ID = ?", ("Rifiutato", rettifica_id))
         conn.commit()
-    st.success("❌ Rettifica rifiutata.")
+    notifica("❌ Correzione rifiutata.")
 
 # --- FUNZIONI TRASFERTE SERVICE E REPORT INTERVENTI ---
 # Chi programma le trasferte: l'amministratore, oppure chiunque abbia l'area
@@ -4332,8 +4378,7 @@ def render_mappa_impianti(key_prefix, puo_impostare_sede=False):
             if esiti:
                 st.warning("Non completati:\n\n" + "\n\n".join(esiti))
             else:
-                st.success("Fatto.")
-                st.rerun()
+                notifica_e_ricarica("Localizzazione e distanze completate.")
 
     st.markdown("---")
     st.markdown("**Indirizzo dell'impianto di una commessa**")
@@ -4674,6 +4719,15 @@ def get_trasferte_dettaglio():
         df[col] = pd.to_numeric(df[col], errors="coerce")      # colonna tutta vuota = oggetti None: la rende numerica
     df["Scostamento viaggio (h)"] = (df["Ore viaggio effettive"] - df["Ore viaggio previste"]).round(2)
     return df
+
+@st.cache_data(ttl=60)
+def ha_trasferte(dipendente):
+    """True se il dipendente ha almeno una trasferta programmata (anche passata): serve a
+    mostrare la voce 'Rapporto di intervento' solo a chi può averne bisogno. In cache 60 s."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM trasferte WHERE LOWER(TRIM(dipendente)) = LOWER(TRIM(?)) LIMIT 1", (dipendente,))
+        return c.fetchone() is not None
 
 def get_trasferte_dipendente(dipendente):
     """Trasferte di un singolo dipendente (per la tendina del report intervento),
@@ -5091,7 +5145,9 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     dell'albergo, e di uno o più mezzi di trasporto insieme (es. aereo per
     arrivare + auto a noleggio per muoversi sul posto). Accessibile
     all'amministratore e a chiunque faccia parte dell'area Service."""
-    st.subheader("🧳 Programmazione nuova Trasferta")
+    st.subheader("🧳 Programma una nuova trasferta")
+    st.caption("Compila i 4 passi qui sotto, poi premi il pulsante verde in fondo. Il passo 4 (viaggio) è facoltativo.")
+    st.markdown("##### 1️⃣ Chi parte e per quale commessa")
     operatori_disponibili = get_user_names()
     if not operatori_disponibili:
         st.warning("Nessun dipendente disponibile.")
@@ -5115,13 +5171,13 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     elif commessa_scelta_trasf:
         st.caption("🏭 Questa commessa non ha ancora l'indirizzo dell'impianto: aggiungilo in 'Mappa impianti' per compilarlo da solo e avere la distanza automatica.")
 
+    st.markdown("##### 2️⃣ Quando e dove")
     col_data1, col_data2 = st.columns(2)
     with col_data1:
         data_inizio_trasf = st.date_input("Data inizio trasferta", value=datetime.date.today(), key=f"{key_prefix}_trasf_inizio")
     with col_data2:
         data_fine_trasf = st.date_input("Data fine trasferta", value=datetime.date.today(), key=f"{key_prefix}_trasf_fine")
 
-    st.markdown("**Luogo di lavoro e alloggio**")
     col_luogo1, col_luogo2 = st.columns(2)
     with col_luogo1:
         stato_trasf = st.text_input("Stato", value=get_paese_commessa(commessa_scelta_trasf) or "", key=f"{key_prefix}_trasf_stato_{commessa_scelta_trasf}")
@@ -5129,7 +5185,7 @@ def render_nuova_trasferta(attore_nome, key_prefix):
         indirizzo_trasf = st.text_input("Indirizzo", value=indirizzo_impianto_default, key=f"{key_prefix}_trasf_indirizzo_{commessa_scelta_trasf}")
     albergo_trasf = st.text_input("Albergo (nome e/o indirizzo)", key=f"{key_prefix}_trasf_albergo")
 
-    st.markdown("**Mezzi di trasporto**")
+    st.markdown("##### 3️⃣ Come ci va")
     st.caption("Puoi selezionarne più di uno: es. Aereo per arrivare e Auto a noleggio per muoversi una volta lì.")
     mezzi_scelti_trasf = st.multiselect("Seleziona uno o più mezzi", MEZZI_TRASPORTO_DISPONIBILI, key=f"{key_prefix}_trasf_mezzi")
 
@@ -5149,16 +5205,24 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     if "Auto a noleggio" in mezzi_scelti_trasf:
         dettaglio_noleggio_trasf = st.text_input("Note auto a noleggio (agenzia, prenotazione, ecc. - opzionale)", key=f"{key_prefix}_trasf_noleggio")
 
-    st.markdown("---")
+    st.markdown("##### 4️⃣ Viaggio e ore pagate (facoltativo)")
     indirizzo_e_quello_dell_impianto = bool(indirizzo_impianto_default) and (indirizzo_trasf or "").strip().casefold() == indirizzo_impianto_default.casefold()
-    viaggio_trasf = render_stima_viaggio(f"{key_prefix}_trasf", destinazione_trasferta=", ".join(x for x in (indirizzo_trasf, stato_trasf) if (x or "").strip()),
-                                         data_default=data_inizio_trasf,
-                                         impianto=impianto_trasf if indirizzo_e_quello_dell_impianto else None)
-    st.markdown("---")
+    with st.expander("Calcola il tempo di viaggio e decidi se pagarlo", expanded=False):
+        viaggio_trasf = render_stima_viaggio(f"{key_prefix}_trasf", destinazione_trasferta=", ".join(x for x in (indirizzo_trasf, stato_trasf) if (x or "").strip()),
+                                             data_default=data_inizio_trasf,
+                                             impianto=impianto_trasf if indirizzo_e_quello_dell_impianto else None)
+    # Il riepilogo resta visibile anche con il riquadro chiuso: chi programma deve vedere subito
+    # se le ore di viaggio verranno pagate nel cartellino.
+    if viaggio_trasf:
+        st.caption(f"🧭 Viaggio previsto: **{formatta_durata(viaggio_trasf['ore_teoriche'])}** · "
+                   + ("💶 le ore di viaggio effettive saranno **pagate nel cartellino**" if viaggio_trasf.get("da_pagare")
+                      else "ore di viaggio **non** aggiunte al cartellino"))
+    else:
+        st.caption("🧭 Nessun viaggio indicato: apri il riquadro sopra per calcolarlo o per far pagare le ore di viaggio.")
 
     note_trasf = st.text_area("Note (opzionale)", key=f"{key_prefix}_trasf_note")
 
-    if st.button("💾 Programma trasferta", key=f"{key_prefix}_trasf_salva"):
+    if st.button("💾 Programma la trasferta", key=f"{key_prefix}_trasf_salva", type="primary"):
         ok, errore = crea_trasferta(operatore_scelto, data_inizio_trasf, data_fine_trasf, commessa_scelta_trasf,
                                      stato_trasf, indirizzo_trasf, albergo_trasf, mezzi_scelti_trasf,
                                      dettaglio_auto_trasf, auto_propria_trasf, dettaglio_treno_trasf,
@@ -5166,8 +5230,7 @@ def render_nuova_trasferta(attore_nome, key_prefix):
         if ok:
             for chiave_viaggio in (f"{key_prefix}_trasf_viaggio_stima", f"{key_prefix}_trasf_viaggio_ver"):
                 st.session_state.pop(chiave_viaggio, None)     # la prossima trasferta riparte senza la stima di questa
-            st.success(f"Trasferta programmata per {operatore_scelto}.")
-            st.rerun()
+            notifica_e_ricarica(f"Trasferta programmata per {operatore_scelto}.")
         else:
             st.error(errore)
 
@@ -5263,8 +5326,7 @@ def render_trasferte_programmate(key_prefix):
                                                  dettaglio_auto_mod, auto_propria_mod, dettaglio_treno_mod, dettaglio_aereo_mod,
                                                  dettaglio_noleggio_mod, note_mod, viaggio=viaggio_mod)
                 if ok:
-                    st.success("Trasferta aggiornata.")
-                    st.rerun()
+                    notifica_e_ricarica("Trasferta aggiornata.")
                 else:
                     st.error(errore)
 
@@ -5277,8 +5339,7 @@ def render_trasferte_programmate(key_prefix):
             if st.button("🗑️ Elimina trasferta selezionata", key=f"{key_prefix}_trasf_elimina_btn"):
                 ok, errore = elimina_trasferta(mappa_id_elimina[scelta_elimina])
                 if ok:
-                    st.success("Trasferta eliminata.")
-                    st.rerun()
+                    notifica_e_ricarica("Trasferta eliminata.")
                 else:
                     st.error(errore)
 
@@ -5425,6 +5486,94 @@ def render_situazione_service(key_prefix):
     st.dataframe(tabella, use_container_width=True, hide_index=True)
     st.caption("Si ricava dalle timbrature (modalità di lavoro e fase aperta), dalle trasferte programmate e da ferie/permessi approvati: non c'è la posizione GPS. "
                "'Non timbrato' = nessun ingresso oggi.")
+
+# --- "IL MIO REPARTO": I COLLEGHI DELLA PROPRIA AREA --------------------------------
+PAGINA_MIO_REPARTO = "👥 Il mio reparto"
+
+def carica_timbrature_reparto(nomi, da, a):
+    """Timbrature dei soli dipendenti indicati nel periodo [da, a] (date), con le stesse
+    colonne di carica_dati_db(): per i grafici del reparto non serve l'intero storico."""
+    if not nomi:
+        return pd.DataFrame(columns=EXPECTED_COLS)
+    segnaposto = ",".join("?" for _ in nomi)
+    with db_connect() as conn:
+        df = pd.read_sql(f"""SELECT Data, Dipendente, Ora, Azione, Luogo, Dettaglio_Trasferta, Commessa, Fase, Dettaglio_Fase, Ruolo
+                             FROM timbrature WHERE Dipendente IN ({segnaposto}) AND Data >= ? AND Data <= ? ORDER BY id""",
+                         conn, params=(*nomi, da.isoformat(), a.isoformat()))
+    if df.empty:
+        return pd.DataFrame(columns=EXPECTED_COLS)
+    return df.rename(columns={"Dettaglio_Trasferta": "Dettaglio Trasferta", "Dettaglio_Fase": "Dettaglio Fase"})
+
+def render_mio_reparto(area, nome_utente, key_prefix):
+    """Pagina 'Il mio reparto', per tutti i dipendenti: dove sono e su cosa stanno
+    lavorando, adesso, i colleghi della PROPRIA area (nessuna altra: amministratore e
+    area Service hanno invece la pagina con tutti i reparti), più il Gantt di cosa ha
+    fatto il reparto in una giornata e le ore della settimana per collega e commessa."""
+    st.subheader("👥 Il mio reparto")
+    area = (area or "").strip()
+    if not area or area.lower() == "all":
+        st.info("Al tuo utente non è assegnato un reparto: chiedi all'amministratore di impostarlo.")
+        return
+    adesso = get_current_datetime()
+    col_ora, col_btn = st.columns([3, 1])
+    col_ora.caption(f"Reparto **{area}** · aggiornato alle {adesso.strftime('%H:%M')} · si aggiorna da solo ogni minuto")
+    col_btn.button("🔄 Aggiorna", key=f"{key_prefix}_reparto_aggiorna")
+
+    tabella = get_situazione_service(adesso, area)
+    if tabella.empty:
+        st.info("Nessun collega in questo reparto.")
+        return
+    conteggi = tabella["Stato"].str[:1].value_counts()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Al lavoro", int(conteggi.get("🟢", 0)))
+    c2.metric("In pausa", int(conteggi.get("☕", 0)))
+    c3.metric("Altri", int(len(tabella) - conteggi.get("🟢", 0) - conteggi.get("☕", 0)))
+
+    # Una scheda per collega (si legge bene anche sul telefono, dove una tabella larga no)
+    for _, r in tabella.iterrows():
+        with st.container(border=True):
+            titolo = f"**{r['Dipendente']}**" + (" (tu)" if r["Dipendente"] == nome_utente else "")
+            st.markdown(f"{r['Stato']} &nbsp; {titolo}")
+            righe = []
+            if r["Assenza"]:
+                righe.append(f"🌴 {r['Assenza']} oggi")
+            if r["Dove"] and r["Dove"] != "-":
+                righe.append(f"📍 {r['Dove']}")
+            if r["Attività in corso"] and r["Attività in corso"] != "-":
+                righe.append(f"🛠️ {r['Attività in corso']}" + (f" (cliente: {r['Cliente']})" if r["Cliente"] else ""))
+            if r["Trasferta di oggi"]:
+                righe.append(f"🧳 Trasferta oggi: {r['Trasferta di oggi']}")
+            if r["Ultima timbratura"] and r["Ultima timbratura"] != "-":
+                righe.append(f"🕒 Ultima timbratura: {r['Ultima timbratura']}")
+            st.caption("  \n".join(righe) if righe else "Nessuna attività registrata.")
+
+    nomi = tabella["Dipendente"].tolist()
+    st.markdown("---")
+    st.markdown("### 📊 Gantt del reparto")
+    giorno = st.date_input("Giorno", value=adesso.date(), key=f"{key_prefix}_reparto_giorno")
+    df_giorno = carica_timbrature_reparto(nomi, giorno, giorno)
+    segmenti = [compute_commessa_gantt_segments(df_giorno, giorno, giorno, n) for n in nomi]
+    segmenti = [x for x in segmenti if not x.empty]
+    if not segmenti:
+        st.info("Nessuna fase lavorata dal reparto in questo giorno.")
+    else:
+        gantt = pd.concat(segmenti, ignore_index=True)
+        grafico = alt.Chart(gantt).mark_bar().encode(
+            x=alt.X("start:T", title="Ora"), x2="end:T", y=alt.Y("Dipendente:N", title=None),
+            color=alt.Color("Commessa:N"), tooltip=["Dipendente:N", "Commessa:N", "Fase:N", "start:T", "end:T", "Ore:Q"]
+        ).properties(height=50 * len(nomi) + 80)
+        st.altair_chart(grafico, use_container_width=True)
+        st.caption("Ogni barra è una fase timbrata (colore = commessa). Per le scadenze delle commesse del reparto vai su Commesse → Pianificazione.")
+
+    st.markdown("### ⏱️ Ore della settimana per collega e commessa")
+    lunedi = giorno - datetime.timedelta(days=giorno.weekday())
+    df_sett = carica_timbrature_reparto(nomi, lunedi, lunedi + datetime.timedelta(days=6))
+    ore = compute_hours_by_commessa(df_sett, lunedi, lunedi + datetime.timedelta(days=6)) if not df_sett.empty else pd.DataFrame()
+    if ore.empty:
+        st.info("Nessuna ora su commessa in questa settimana.")
+    else:
+        st.caption(f"Settimana dal {lunedi.strftime('%d/%m')} al {(lunedi + datetime.timedelta(days=6)).strftime('%d/%m')}")
+        st.dataframe(ore.pivot_table(index="Dipendente", columns="Commessa", values="Ore_lavorate", aggfunc="sum", fill_value=0), use_container_width=True)
 
 REPORT_PER_PAGINA = 10
 
@@ -5615,8 +5764,7 @@ def render_report_intervento(dipendente_nome, df, key_prefix):
                                               descrizione_rep, ore_calcolate_rep, commessa_rep, fase_rep, foto_caricate,
                                               data_intervento=giorno_intervento_rep, ore_viaggio=ore_viaggio_rep or None)
         if ok:
-            st.success("Report salvato.")
-            st.rerun()
+            notifica_e_ricarica("Report salvato.")
         else:
             st.error(errore)
 
@@ -5639,8 +5787,7 @@ def render_report_intervento(dipendente_nome, df, key_prefix):
         if st.button("💾 Registra ore di viaggio", key=f"{key_prefix}_rep_viaggio_retro_salva"):
             ok_retro, errore_retro = imposta_ore_viaggio_effettive(id_mancante, dipendente_nome, ore_retro)
             if ok_retro:
-                st.success("Ore di viaggio registrate.")
-                st.rerun()
+                notifica_e_ricarica("Ore di viaggio registrate.")
             else:
                 st.error(errore_retro)
 
@@ -6583,8 +6730,7 @@ def render_gestione_costi(df, key_prefix):
         if st.button("💾 Salva costi trasferta", key=f"{key_prefix}_btn_salva_costi_trasferta_{trasferta_id_scelta}"):
             ok, errore = aggiorna_costi_trasferta(trasferta_id_scelta, nuovo_costo_alloggio, nuovo_costo_trasporto)
             if ok:
-                st.success("Costi trasferta aggiornati.")
-                st.rerun()
+                notifica_e_ricarica("Costi trasferta aggiornati.")
             else:
                 st.error(errore)
         st.caption("Il costo del personale in trasferta è calcolato in automatico dalle ore effettivamente lavorate nel periodo della trasferta × il costo orario CCNL del dipendente (lo stesso usato in 'Grafici e Classifiche').")
@@ -6891,8 +7037,7 @@ def render_pianificazione_per_reparto(commessa, key_prefix, reparti_modificabili
                     if st.button("💾 Salva", key=f"{key_prefix}_rep_btn_inizio_{commessa}_{chiave}"):
                         ok, errore = imposta_data_inizio_reparto(commessa, nome, nuovo_inizio.isoformat() if nuovo_inizio else "")
                         if ok:
-                            st.success("Data di inizio del reparto aggiornata.")
-                            st.rerun()
+                            notifica_e_ricarica("Data di inizio del reparto aggiornata.")
                         else:
                             st.error(errore)
                 for macro_fase in sorted(info["macro"]):
@@ -6907,8 +7052,7 @@ def render_pianificazione_per_reparto(commessa, key_prefix, reparti_modificabili
                         if st.button("💾", key=f"{key_prefix}_rep_btn_scad_{commessa}_{chiave}_{macro_fase}"):
                             ok, errore = imposta_scadenza_macro_fase_reparto(commessa, nome, macro_fase, nuova_scad.isoformat() if nuova_scad else "")
                             if ok:
-                                st.success(f"Scadenza di '{macro_fase}' aggiornata.")
-                                st.rerun()
+                                notifica_e_ricarica(f"Scadenza di '{macro_fase}' aggiornata.")
                             else:
                                 st.error(errore)
             else:
@@ -6989,8 +7133,7 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False, reparti
         if st.button("💾 Salva data di inizio lavori", key=f"{key_prefix}_pianificazione_btn_salva_inizio_{commessa_scelta}"):
             ok, errore = aggiorna_data_inizio_lavori_commessa(commessa_scelta, nuova_data_inizio.isoformat())
             if ok:
-                st.success("Data di inizio lavori aggiornata.")
-                st.rerun()
+                notifica_e_ricarica("Data di inizio lavori aggiornata.")
             else:
                 st.error(errore)
     else:
@@ -7016,8 +7159,7 @@ def render_pianificazione_commessa(df, key_prefix, puo_modificare=False, reparti
                 if st.button("💾", key=f"{key_prefix}_btn_scadenza_{commessa_scelta}_{macro_fase}"):
                     ok, errore = imposta_scadenza_macro_fase(commessa_scelta, macro_fase, nuova_scadenza.isoformat() if nuova_scadenza else "")
                     if ok:
-                        st.success(f"Scadenza di '{macro_fase}' aggiornata.")
-                        st.rerun()
+                        notifica_e_ricarica(f"Scadenza di '{macro_fase}' aggiornata.")
                     else:
                         st.error(errore)
     elif scadenze_attuali:
@@ -8227,8 +8369,7 @@ def render_area_personale(username, key_prefix):
                                                           distanza_km_input, orario_fine_giornata_input,
                                                           pausa_inizio_input, pausa_fine_input)
             if ok:
-                st.success("Dati personali aggiornati.")
-                st.rerun()
+                notifica_e_ricarica("Dati personali aggiornati.")
             else:
                 st.error(errore)
 
@@ -8470,32 +8611,237 @@ def render_sostenibilita(df, key_prefix):
                 ok1, errore1 = aggiorna_parametri_sostenibilita(nuovo_costo_evitato, nuovo_co2_evitato)
                 ok2, errore2 = aggiorna_co2_kg_per_km_pendolarismo(nuovo_co2_km)
                 if ok1 and ok2:
-                    st.success("Coefficienti aggiornati.")
-                    st.rerun()
+                    notifica_e_ricarica("Coefficienti aggiornati.")
                 else:
                     st.error(errore1 or errore2)
 
 
+# Nome interno della pagina iniziale ("Oggi"): vedi render_home.
+PAGINA_HOME = "🏠 Oggi"
+
+# Pagine dell'amministratore che NON usano lo storico completo delle timbrature (la
+# lettura più pesante dell'app): per queste non viene caricato.
+PAGINE_ADMIN_SENZA_STORICO = {
+    PAGINA_HOME, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI,
+    PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI, PAGINA_MAPPA_IMPIANTI_VISTA, PAGINA_SITUAZIONE_SERVICE,
+    "Richieste ferie/permessi", "Rettifiche timbrature", "Gestione Commesse", "Gestione Utenti DB",
+}
+
+# Nomi mostrati nei menu. Il codice delle pagine continua a ragionare con i nomi interni
+# (le chiavi di questo dizionario); i menu mostrano questi testi, scritti in italiano
+# semplice e con il verbo di ciò che si può fare ("Chiedi ferie o permessi"), per chi non
+# ha dimestichezza con i programmi. Un nome interno senza voce qui sotto si vede così com'è.
+ETICHETTE_MENU = {
+    PAGINA_HOME: "🏠 Oggi",
+    # --- presenze
+    "Timbrature": "🕒 Timbra",
+    "Dati e Presenze": "📋 Presenze di tutti",
+    "Timbrature del team": "👥 Timbrature del team",
+    "Riepilogo personale": "📊 Il mio riepilogo",
+    "Report mensile": "📄 Il mio mese",
+    "Richiesta ferie/permessi": "🌴 Chiedi ferie o permessi",
+    "Richiesta rettifica": "✏️ Correggi una timbratura",
+    "Richieste ferie/permessi": "🌴 Ferie e permessi da approvare",
+    "Rettifiche timbrature": "✏️ Correzioni da approvare",
+    "Profilo": "👤 Il mio profilo",
+    # --- commesse
+    "Le mie Commesse": "🏭 Le mie commesse",
+    "Gestione Commesse": "🏭 Gestisci commesse",
+    "Gestione fasi commessa": "🧩 Fasi delle commesse",
+    "Resoconto Commesse": "📊 Resoconto commesse",
+    "📅 Pianificazione": "📅 Pianificazione",
+    "🗂️ Attività di reparto": "🗂️ Attività di reparto",
+    "Statistiche area": "📈 Statistiche del reparto",
+    # --- trasferte
+    PAGINA_NUOVA_TRASFERTA: "➕ Programma una trasferta",
+    PAGINA_TRASFERTE_PROGRAMMATE: "📋 Elenco trasferte",
+    PAGINA_STATISTICHE_ASSISTENZA: "🛠️ Statistiche assistenza",
+    PAGINA_REPORT_RICEVUTI: "📥 Rapporti ricevuti",
+    PAGINA_REPORT_INTERVENTO: "📷 Rapporto di intervento",
+    # --- mappe e disponibilità
+    PAGINA_MAPPA_IMPIANTI: "🗺️ Mappa impianti (modifica)",
+    PAGINA_MAPPA_IMPIANTI_VISTA: "🗺️ Mappa impianti",
+    PAGINA_DISPONIBILITA_TEAM: "📅 Chi è disponibile",
+    PAGINA_SITUAZIONE_SERVICE: "📍 Dove sono ora",
+    PAGINA_MIO_REPARTO: "👥 Il mio reparto",
+    # --- altro
+    "Grafici e Classifiche": "📈 Grafici e classifiche",
+    "🌱 Sostenibilità (Smart Working)": "🌱 Smart working",
+    "Cartellini dipendenti": "🧾 Cartellini dipendenti",
+    "💰 Costi commesse": "💰 Costi commesse",
+    "Gestione Utenti DB": "👤 Utenti e password",
+    # --- scelta di modalità del responsabile
+    "Mie funzioni personali": "👤 Io",
+    "Gestione Team": "👥 Il mio team",
+    "🧳 Trasferte Service": "🧳 Trasferte",
+    "💰 Gestione Costi": "💰 Costi e statistiche",
+    "👥 Risorse Umane": "🧾 Risorse umane",
+}
+
+def categorie_trasferte_service():
+    """Sezioni del menu per chi gestisce le trasferte (area Service), uguali per il
+    responsabile Service e per l'utente Service: programmare e consultare le trasferte,
+    vedere dove sono tutti, la mappa degli impianti e il proprio rapporto di intervento."""
+    return [
+        ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
+        ("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]),
+        ("🗺️ Impianti", [PAGINA_MAPPA_IMPIANTI]),
+        ("📷 Il mio rapporto", [PAGINA_REPORT_INTERVENTO]),
+    ]
+
+def etichetta_menu(nome):
+    """Testo mostrato nei menu per il nome interno di una pagina o sezione."""
+    return ETICHETTE_MENU.get(nome, nome)
+
+
+def vai_a_pagina(prefisso_menu, categoria, pagina=None, modalita=None):
+    """Porta l'utente su una sezione (e pagina) del menu con prefisso 'prefisso_menu'
+    (per i responsabili anche cambiando prima 'modalita', la scelta Funzioni personali /
+    Gestione Team ecc.). Va usata come on_click di un pulsante: i valori dei menu si
+    possono cambiare solo prima che i menu vengano disegnati, e le callback girano
+    proprio in quel momento."""
+    if modalita is not None:
+        st.session_state["resp_modalita"] = modalita
+    st.session_state[f"{prefisso_menu}_categoria"] = categoria
+    if pagina is not None:
+        st.session_state[f"{prefisso_menu}_pagina_{categoria}"] = pagina
+
+
 def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
-    """Menu di navigazione della sidebar organizzato per categorie invece di un unico
-    lungo elenco piatto: prima si sceglie la categoria (poche voci, facili da
-    scansionare), poi le pagine di quella categoria appaiono raggruppate in un
-    riquadro. 'categorie' è una lista di tuple (nome_categoria, [elenco pagine]).
-    Restituisce il nome della pagina scelta, esattamente come farebbe un unico
-    st.sidebar.radio con tutte le opzioni appiattite: il resto del codice che
-    confronta il valore restituito con le singole etichette non deve quindi
-    cambiare."""
+    """Menu di navigazione in alto, a due livelli e a "pulsanti": prima la sezione
+    (poche voci), poi la pagina di quella sezione. Sta nell'area principale e non nel
+    menu laterale perché sul telefono il menu laterale è nascosto e va aperto a mano,
+    mentre qui è sempre sotto gli occhi e va a capo da solo sugli schermi stretti.
+    'categorie' è una lista di tuple (nome_sezione, [pagine]). Restituisce il nome
+    interno della pagina scelta, come prima: il resto del codice che lo confronta con
+    le singole pagine non cambia (i testi mostrati vengono da ETICHETTE_MENU)."""
+    st.session_state["_menu_attivo"] = key_prefix
     mappa_pagine_per_categoria = dict(categorie)
     nomi_categorie = list(mappa_pagine_per_categoria.keys())
-    categoria_scelta = st.sidebar.radio(titolo_categoria, nomi_categorie, key=f"{key_prefix}_categoria")
-    pagine_categoria = mappa_pagine_per_categoria[categoria_scelta]
-    with st.sidebar.container(border=True):
+    try:
+        contenitore = st.container(key=f"navmenu-{key_prefix}")
+    except TypeError:                         # versioni di Streamlit senza chiave sui contenitori
+        contenitore = st.container()
+    with contenitore:
+        if len(nomi_categorie) > 1:
+            try:
+                contenitore_sezioni = st.container(key=f"navmenu-sezioni-{key_prefix}")
+            except TypeError:
+                contenitore_sezioni = st.container()
+            with contenitore_sezioni:
+                categoria_scelta = st.radio(titolo_categoria, nomi_categorie, key=f"{key_prefix}_categoria",
+                                            horizontal=True, label_visibility="collapsed", format_func=etichetta_menu)
+        else:
+            categoria_scelta = nomi_categorie[0]
+        pagine_categoria = mappa_pagine_per_categoria[categoria_scelta]
         if len(pagine_categoria) == 1:
-            # Una categoria con una sola pagina non ha bisogno di un'altra scelta:
-            # il riquadro serve solo a confermare dove ci si trova.
-            st.caption(f"📁 {pagine_categoria[0]}")
-            return pagine_categoria[0]
-        return st.radio(categoria_scelta, pagine_categoria, key=f"{key_prefix}_pagina_{categoria_scelta}")
+            return pagine_categoria[0]        # una sola pagina: niente seconda scelta
+        return st.radio(categoria_scelta, pagine_categoria, key=f"{key_prefix}_pagina_{categoria_scelta}",
+                        horizontal=True, label_visibility="collapsed", format_func=etichetta_menu)
+
+
+# --- PAGINA INIZIALE "OGGI" ----------------------------------------------------------
+def _conta_da_approvare(user_info):
+    """(richieste ferie/permessi in attesa, correzioni timbrature in attesa) che spettano
+    a questo utente: all'amministratore quelle a lui dirette, al responsabile quelle dei
+    dipendenti della sua area che aspettano proprio lui."""
+    richieste = carica_richieste()
+    if richieste.empty:
+        n_richieste = 0
+    elif user_info["role"] == "admin":
+        mask = richieste.get("Approvatore_Richiesto", "admin") == "admin"
+        n_richieste = int(((richieste["Stato"] == "In attesa") & mask).sum())
+    else:
+        n_richieste = int(((richieste["Stato"] == "In attesa") & (richieste["Approvatore_Richiesto"] == user_info["name"])).sum())
+    n_rettifiche = 0
+    if user_info["role"] == "admin":
+        rettifiche = carica_rettifiche()
+        n_rettifiche = int((rettifiche["Stato"] == "In attesa").sum()) if not rettifiche.empty else 0
+    return n_richieste, n_rettifiche
+
+def render_home(user_info, menu_prefix, azioni, mostra_stato_personale=True, mostra_panoramica=False, approvazioni=None):
+    """Pagina iniziale 'Oggi': in una schermata ciò che serve sapere e fare adesso.
+    - stato della propria timbratura (in servizio / fase aperta / pausa) e prossime trasferte;
+    - per chi approva: quante richieste aspettano una risposta (con il pulsante per andarci);
+    - per chi gestisce le trasferte: quanti sono al lavoro/in trasferta e quante trasferte iniziano;
+    - pulsanti grandi per le cose più frequenti ('azioni' = [(testo, sezione, pagina[, modalita])]).
+    Poche letture del database, nessuna sullo storico di tutte le timbrature."""
+    nome = user_info["name"]
+    oggi = get_current_datetime().date()
+    st.subheader("🏠 Oggi")
+    if mostra_stato_personale:
+        if is_clocked_in(nome):
+            fase = get_fase_aperta(nome)
+            testo = "🟢 **Sei in servizio.**"
+            if fase:
+                testo += f" Fase aperta: {fase[1]} ({fase[0]})."
+            if is_pausa_attiva(nome):
+                testo += " ☕ Sei in pausa pranzo."
+            st.success(testo)
+        else:
+            st.info("⚪ **Non sei in servizio.** Quando inizi a lavorare vai su Timbra e premi INGRESSO.")
+        trasferte = get_trasferte_dipendente(nome)
+        if not trasferte.empty:
+            future = trasferte[trasferte["Al"].astype(str) >= oggi.isoformat()].sort_values("Dal")
+            for _, t in future.head(3).iterrows():
+                in_corso = str(t["Dal"]) <= oggi.isoformat()
+                with st.container(border=True):
+                    st.markdown(("🧳 **Trasferta in corso**" if in_corso else "🧳 **Prossima trasferta**") + f" — {t['Cliente'] or 'cliente non indicato'}")
+                    st.caption(f"Dal {t['Dal']} al {t['Al']}" + (f" · {t['Indirizzo']}" if t.get("Indirizzo") else ""))
+        senza_ore = get_trasferte_senza_ore_viaggio(nome)
+        if not senza_ore.empty:
+            st.warning(f"Hai {len(senza_ore)} trasferta/e con rapporto consegnato ma senza le ore di viaggio effettive: completale da 'Rapporto di intervento'.")
+
+    if approvazioni is not None:
+        n_ric, n_ret = _conta_da_approvare(user_info)
+        if n_ric or n_ret:
+            st.markdown("**Da approvare**")
+            c1, c2 = st.columns(2)
+            c1.metric("Ferie/permessi in attesa", n_ric)
+            if user_info["role"] == "admin":
+                c2.metric("Correzioni timbrature in attesa", n_ret)
+        else:
+            st.success("✅ Non hai richieste da approvare.")
+
+    if mostra_panoramica:
+        tabella = get_situazione_service(get_current_datetime())
+        if not tabella.empty:
+            conteggi = tabella["Stato"].str[:1].value_counts()
+            in_trasferta = int(tabella["Dove"].astype(str).str.startswith("In trasferta").sum())
+            st.markdown("**Azienda in questo momento**")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Al lavoro", int(conteggi.get("🟢", 0)))
+            c2.metric("In trasferta", in_trasferta)
+            c3.metric("In ferie/permesso", int((tabella["Assenza"] != "").sum()))
+
+    st.markdown("**Cosa vuoi fare?**")
+    colonne = st.columns(2)
+    for i, azione in enumerate(azioni):
+        testo, sezione, pagina = azione[:3]
+        modalita = azione[3] if len(azione) > 3 else None
+        colonne[i % 2].button(testo, key=f"{menu_prefix}_home_azione_{i}", use_container_width=True,
+                              on_click=vai_a_pagina, args=(menu_prefix, sezione, pagina, modalita))
+
+
+# --- CONFERME CHE NON SPARISCONO ---------------------------------------------------
+# Dopo un salvataggio il programma si ricarica (st.rerun) per mostrare i dati nuovi, ma
+# un messaggio "Salvato!" scritto prima del ricaricamento spariva in un istante e chi
+# usava il programma non sapeva se l'operazione era riuscita. Il messaggio viene quindi
+# messo da parte e mostrato in cima alla pagina dopo il ricaricamento.
+def notifica(messaggio, tipo="success"):
+    """Mette da parte un messaggio da mostrare dopo il prossimo ricaricamento."""
+    st.session_state.setdefault("_notifiche", []).append((tipo, str(messaggio)))
+
+def notifica_e_ricarica(messaggio, tipo="success"):
+    """Conferma persistente + ricaricamento della pagina."""
+    notifica(messaggio, tipo)
+    st.rerun()
+
+def mostra_notifiche():
+    """Mostra (una volta sola) i messaggi messi da parte con notifica()."""
+    messaggi = st.session_state.pop("_notifiche", None) or []
+    for tipo, testo in messaggi:
+        {"success": st.success, "error": st.error, "warning": st.warning}.get(tipo, st.info)(testo)
 
 
 # Pagine su cui l'aggiornamento automatico ogni 60 secondi (st_autorefresh più sotto)
@@ -8555,8 +8901,13 @@ else:
     user_info = get_user_info()
     _render_logo_header(container=st.sidebar)
     st.sidebar.markdown("---")
-    st.sidebar.button("Logout", on_click=logout)
-    st.subheader(f"Benvenuto, {user_info['name']}!")
+    _ruolo_visibile = {"admin": "Amministratore", "responsabile": "Responsabile"}.get(user_info["role"], "Operatore")
+    st.sidebar.markdown(f"**{user_info['name']}**  \n{_ruolo_visibile}" + (f" · {user_info['area']}" if user_info.get("area") and user_info["area"] != "All" else ""))
+    st.sidebar.button("Esci", on_click=logout)
+    col_saluto, col_esci = st.columns([4, 1])
+    col_saluto.markdown(f"#### Ciao, {user_info['name']}!")
+    col_esci.button("Esci", on_click=logout, key="logout_principale", use_container_width=True)
+    mostra_notifiche()
 
     # Le timbrature di tutti NON si caricano più qui, a ogni clic e per ogni pagina: la
     # pagina "Timbrature" personale non le usa (le sue servono solo quelle di oggi, vedi
@@ -8568,22 +8919,33 @@ else:
     _STATO_TIMBRATURA_RUN_ATTIVO = True   # vedi _stato_timbratura_utente
 
     if user_info["role"] == "admin":
-        st.info("Sei connesso come amministratore. Puoi visualizzare i timbri di tutti gli utenti.")
-        st.markdown("---")
 
         admin_page = render_menu_a_categorie([
-            ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
-            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI_VISTA]),
-            ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
-            ("👥 Risorse Umane", ["Cartellini dipendenti"]),
-            ("🧳 Trasferte e Team", PAGINE_TRASFERTE + [PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_SITUAZIONE_SERVICE]),
-            ("💰 Costi", ["💰 Costi commesse"]),
-            ("⚙️ Amministrazione", ["Gestione Utenti DB"]),
-        ], key_prefix="admin_menu", titolo_categoria="Sezione amministratore")
+            ("🏠 Oggi", [PAGINA_HOME]),
+            ("🕒 Presenze", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Cartellini dipendenti"]),
+            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI]),
+            ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
+            ("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]),
+            ("📈 Statistiche e costi", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "💰 Costi commesse"]),
+            ("⚙️ Utenti", ["Gestione Utenti DB"]),
+        ], key_prefix="admin_menu", titolo_categoria="Sezione")
         st.session_state["_ultima_pagina_vista"] = admin_page
-        df = carica_dati_db()
+        # Lo storico completo delle timbrature serve solo alle pagine che lo usano: le altre
+        # (home, trasferte, mappe, chi è dove) non lo caricano affatto.
+        if admin_page not in PAGINE_ADMIN_SENZA_STORICO:
+            df = carica_dati_db()
 
-        if admin_page == "Dati e Presenze":
+        if admin_page == PAGINA_HOME:
+            render_home(user_info, "admin_menu", mostra_stato_personale=False, mostra_panoramica=True, approvazioni=True, azioni=[
+                ("✅ Ferie e permessi da approvare", "🕒 Presenze", "Richieste ferie/permessi"),
+                ("✏️ Correzioni da approvare", "🕒 Presenze", "Rettifiche timbrature"),
+                ("➕ Programma una trasferta", "🧳 Trasferte", PAGINA_NUOVA_TRASFERTA),
+                ("📍 Dove sono ora i dipendenti", "📍 Chi è dove", PAGINA_SITUAZIONE_SERVICE),
+                ("🏭 Gestisci commesse", "🏭 Commesse", "Gestione Commesse"),
+                ("🗺️ Mappa impianti", "🏭 Commesse", PAGINA_MAPPA_IMPIANTI),
+            ])
+
+        elif admin_page == "Dati e Presenze":
             st.subheader("📊 Pannello Amministrazione")
 
             user_names = get_user_names()
@@ -8650,10 +9012,10 @@ else:
                 col1, col2 = st.columns(2)
                 if col1.button("Approva"):
                     aggiorna_stato_richiesta(selected_id, "Approvato")
-                    st.success("Approvata!"); st.rerun()
+                    notifica_e_ricarica("Approvata!")
                 if col2.button("Rifiuta"):
                     aggiorna_stato_richiesta(selected_id, "Rifiutato")
-                    st.success("Rifiutata!"); st.rerun()
+                    notifica_e_ricarica("Richiesta rifiutata.")
             
             st.markdown("---")
             st.subheader("ℹ️ Richieste da Responsabili (Escalate all'Admin)")
@@ -8819,8 +9181,7 @@ else:
                                 conn.commit()
                             get_area_names.clear()
                             get_users_in_area.clear()
-                            st.success(f"Utente {new_name} aggiunto!")
-                            st.rerun()
+                            notifica_e_ricarica(f"Utente {new_name} aggiunto!")
                         except db_error_classes("IntegrityError"):
                             st.error("Errore: Questo username esiste già.")
 
@@ -8850,8 +9211,7 @@ else:
                         conn.commit()
                     get_area_names.clear()
                     get_users_in_area.clear()
-                    st.success("Utente aggiornato!")
-                    st.rerun()
+                    notifica_e_ricarica("Utente aggiornato!")
 
             elif user_action == "Elimina utente":
                 to_delete = st.selectbox("Utente da eliminare", [u for u in utenti_db["username"].tolist() if u != "admin"])
@@ -8862,8 +9222,7 @@ else:
                         conn.commit()
                     get_area_names.clear()
                     get_users_in_area.clear()
-                    st.success("Utente eliminato dal database!")
-                    st.rerun()
+                    notifica_e_ricarica("Utente eliminato dal database!")
 
             elif user_action == "Livelli CCNL (ferie/permessi)":
                 st.write("#### 🏭 Ferie e permessi annuali per livello CCNL")
@@ -8898,20 +9257,18 @@ else:
                     if st.button("💾 Salva livello", key="btn_salva_livello"):
                         ok, errore = aggiorna_livello_ferie_permessi(livello_sel, nuove_ferie_livello, nuovo_permesso_livello, nuovo_costo_livello)
                         if ok:
-                            st.success(f"Livello '{livello_sel}' salvato.")
-                            st.rerun()
+                            notifica_e_ricarica(f"Livello '{livello_sel}' salvato.")
                         else:
                             st.error(errore)
                 with col_liv_btn2:
                     if modalita_livello == "Esistente" and livelli_disponibili and st.button("🗑️ Elimina livello", key="btn_elimina_livello"):
                         elimina_livello_ferie_permessi(livello_sel)
-                        st.success(f"Livello '{livello_sel}' eliminato. Gli utenti con questo livello useranno i valori di default aziendali.")
-                        st.rerun()
+                        notifica_e_ricarica(f"Livello '{livello_sel}' eliminato. Gli utenti con questo livello useranno i valori di default aziendali.")
 
-        if admin_page == "Programmazione nuova Trasferta":
+        if admin_page == PAGINA_NUOVA_TRASFERTA:
             render_nuova_trasferta(user_info["name"], key_prefix="admin")
 
-        if admin_page == "Trasferte programmate":
+        if admin_page == PAGINA_TRASFERTE_PROGRAMMATE:
             render_trasferte_programmate(key_prefix="admin")
 
         if admin_page == PAGINA_REPORT_RICEVUTI:
@@ -8929,7 +9286,7 @@ else:
         if admin_page == PAGINA_SITUAZIONE_SERVICE:
             render_situazione_service(key_prefix="admin")
 
-        if not df.empty and admin_page == "Dati e Presenze":
+        if df is not None and not df.empty and admin_page == "Dati e Presenze":
             st.markdown("---")
             export_df = prepare_registro_for_export(df, selected_user=selected_user, start_date=start_date, end_date=end_date)
             if not export_df.empty:
@@ -8947,9 +9304,7 @@ else:
 
     elif user_info["role"] == "responsabile":
         # --- LATO RESPONSABILE CON DOPPIO ACCESSO ---
-        st.info("🔧 Sei connesso come Responsabile. Accedi a funzioni personali e di gestione team.")
-        st.markdown("---")
-        
+
         # Selettore principale: Mie funzioni vs Gestione Team (più Trasferte Service
         # se il responsabile fa parte dell'area Service)
         opzioni_modalita = ["Mie funzioni personali", "Gestione Team"]
@@ -8959,7 +9314,16 @@ else:
             opzioni_modalita.append("💰 Gestione Costi")
         if is_area_amministrazione(user_info["area"]):
             opzioni_modalita.append("👥 Risorse Umane")
-        modalita = st.sidebar.radio("📌 Modalità", opzioni_modalita)
+        if len(opzioni_modalita) > 1:
+            try:
+                _cont_modalita = st.container(key="navmenu-sezioni-modalita")
+            except TypeError:
+                _cont_modalita = st.container()
+            with _cont_modalita:
+                modalita = st.radio("Area di lavoro", opzioni_modalita, key="resp_modalita", horizontal=True,
+                                    label_visibility="collapsed", format_func=etichetta_menu)
+        else:
+            modalita = opzioni_modalita[0]
 
         if modalita == "Mie funzioni personali":
             # *** REPLICA DELLA SEZIONE UTENTE PER IL RESPONSABILE ***
@@ -8967,20 +9331,35 @@ else:
             # Chi è nell'area Service ha tutto ciò che riguarda le trasferte (anche il
             # proprio report intervento) nel menu unico della modalità "Trasferte Service".
             categorie_resp_personale = [
-                ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
-                ("👤 Profilo", ["Profilo"]),
-                ("🏭 Le mie Commesse", ["Le mie Commesse", PAGINA_MAPPA_IMPIANTI_VISTA]),
-                ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
+                ("🏠 Oggi", [PAGINA_HOME]),
+                ("🕒 Timbra e ore", ["Timbrature", "Riepilogo personale", "Report mensile"]),
+                ("🏭 Commesse", ["Le mie Commesse", PAGINA_MAPPA_IMPIANTI_VISTA]),
+                ("👥 Il mio reparto", [PAGINA_MIO_REPARTO]),
+                ("🌴 Ferie e correzioni", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
+                ("👤 Il mio profilo", ["Profilo"]),
             ]
             if not is_area_service(user_info["area"]):
-                categorie_resp_personale.insert(3, ("🧳 Service", [PAGINA_REPORT_INTERVENTO]))
+                categorie_resp_personale.insert(4, ("📷 Rapporto di intervento", [PAGINA_REPORT_INTERVENTO]))
             pagina_utente = render_menu_a_categorie(
                 categorie_resp_personale, key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
             st.session_state["_ultima_pagina_vista"] = pagina_utente
-            if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE, PAGINA_MAPPA_IMPIANTI_VISTA):
+            if pagina_utente not in ("Timbrature", PAGINA_HOME, PAGINA_MIO_REPARTO, PAGINA_SITUAZIONE_SERVICE, PAGINA_MAPPA_IMPIANTI_VISTA,
+                                     "Profilo", "Richiesta ferie/permessi", "Richiesta rettifica"):
                 df = carica_dati_db()
 
-            if pagina_utente == "Profilo":
+            if pagina_utente == PAGINA_HOME:
+                azioni_resp = [
+                    ("🕒 Timbra", "🕒 Timbra e ore", "Timbrature"),
+                    ("✅ Ferie e permessi da approvare", "🕒 Presenze team", "Richieste ferie/permessi", "Gestione Team"),
+                    ("👥 Il mio reparto", "👥 Il mio reparto", PAGINA_MIO_REPARTO),
+                    ("🌴 Chiedi ferie o permessi", "🌴 Ferie e correzioni", "Richiesta ferie/permessi"),
+                ]
+                render_home(user_info, "resp_personale_menu", azioni_resp, approvazioni=True)
+
+            elif pagina_utente == PAGINA_MIO_REPARTO:
+                render_mio_reparto(user_info["area"], user_info["name"], key_prefix="resp_reparto")
+
+            elif pagina_utente == "Profilo":
                 st.subheader("👤 Profilo personale")
                 st.write(f"**Nome:** {dipendente_scelto}")
                 st.write(f"**Area:** {user_info['area']}")
@@ -9126,11 +9505,13 @@ else:
 
             resp_page = render_menu_a_categorie([
                 ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature"]),
-                ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI_VISTA]),
-                ("📅 Disponibilità", ["📅 Disponibilità Team"]),
+                ("🏭 Commesse e statistiche", ["Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione", "🗂️ Attività di reparto",
+                                              "Statistiche area", PAGINA_MAPPA_IMPIANTI_VISTA]),
+                ("📍 Chi è dove", [PAGINA_MIO_REPARTO, PAGINA_DISPONIBILITA_TEAM]),
             ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
             st.session_state["_ultima_pagina_vista"] = resp_page
-            df = carica_dati_db()
+            if resp_page not in (PAGINA_MIO_REPARTO, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA, "Richieste ferie/permessi"):
+                df = carica_dati_db()
 
             if resp_page == "Timbrature del team":
                 st.subheader(f"📋 Timbrature - Area: {area_responsabile}")
@@ -9161,10 +9542,10 @@ else:
                     col1, col2 = st.columns(2)
                     if col1.button("✅ Approva"):
                         aggiorna_stato_richiesta(selected_id, "Approvato")
-                        st.success("Richiesta approvata!"); st.rerun()
+                        notifica_e_ricarica("Richiesta approvata!")
                     if col2.button("❌ Rifiuta"):
                         aggiorna_stato_richiesta(selected_id, "Rifiutato")
-                        st.success("Richiesta rifiutata!"); st.rerun()
+                        notifica_e_ricarica("Richiesta rifiutata.")
                 
                 st.markdown("---")
                 st.subheader("Saldo ferie e permessi - Team")
@@ -9254,8 +9635,11 @@ else:
                     else:
                         st.info("Il tuo reparto è sotto la media aziendale in questo periodo.")
 
-            elif resp_page == "📅 Disponibilità Team":
+            elif resp_page == PAGINA_DISPONIBILITA_TEAM:
                 render_disponibilita_team(area_default=area_responsabile, forza_area=True, key_prefix="resp")
+
+            elif resp_page == PAGINA_MIO_REPARTO:
+                render_mio_reparto(area_responsabile, user_info["name"], key_prefix="resp_team")
 
             elif resp_page == "🗂️ Attività di reparto":
                 render_attivita_reparto(df, key_prefix="resp_attivita", scope_area=area_responsabile, attore=st.session_state.username)
@@ -9268,9 +9652,8 @@ else:
                                                reparti_modificabili=[area_responsabile])
 
         elif modalita == "🧳 Trasferte Service":
-            trasferte_page = render_menu_a_categorie([
-                ("🧳 Trasferte e Team", PAGINE_TRASFERTE_SERVICE),
-            ], key_prefix="resp_trasferte_menu", titolo_categoria="Sezione Trasferte")
+            trasferte_page = render_menu_a_categorie(
+                categorie_trasferte_service(), key_prefix="resp_trasferte_menu", titolo_categoria="Sezione Trasferte")
             st.session_state["_ultima_pagina_vista"] = trasferte_page
 
             if trasferte_page == PAGINA_NUOVA_TRASFERTA:
@@ -9307,7 +9690,7 @@ else:
         elif modalita == "💰 Gestione Costi":
             costi_page = render_menu_a_categorie([
                 ("💰 Costi", ["💰 Costi commesse"]),
-                ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
+                ("📈 Statistiche", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
             ], key_prefix="resp_costi_menu", titolo_categoria="Sezione Costi")
             st.session_state["_ultima_pagina_vista"] = costi_page
             df = carica_dati_db()
@@ -9324,34 +9707,53 @@ else:
     else:
         # --- LATO UTENTE ---
         dipendente_scelto = user_info["name"]
+        # Sezioni (poche e con nomi semplici): si apre su "Timbra", la cosa che si fa più spesso.
+        # Il Service ha in più le trasferte di tutti e dove sono i dipendenti; chi non è
+        # Service vede "Rapporto di intervento" solo se ha almeno una trasferta.
+        sono_service = is_area_service(user_info["area"])
+        pagine_commesse = ["Le mie Commesse", "📅 Pianificazione"] + ([PAGINA_MAPPA_IMPIANTI] if sono_service else [PAGINA_MAPPA_IMPIANTI_VISTA])
         categorie_utente = [
-            ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
-            ("👤 Profilo", ["Profilo"]),
-            ("🏭 Le mie Commesse", ["Le mie Commesse", "📅 Pianificazione", PAGINA_MAPPA_IMPIANTI_VISTA]),
-            ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
+            ("🕒 Timbra", ["Timbrature"]),
+            ("🏠 Oggi", [PAGINA_HOME]),
         ]
-        # Chi fa parte dell'area Service ha un unico menu "Trasferte e Team" (stesse voci
-        # dell'amministratore, più il proprio report intervento); gli altri utenti, che
-        # possono comunque andare in trasferta, hanno solo il report intervento.
-        if is_area_service(user_info["area"]):
-            categorie_utente.insert(3, ("🧳 Trasferte e Team", PAGINE_TRASFERTE_SERVICE))
+        if sono_service:
+            categorie_utente.append(("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI,
+                                                      PAGINA_REPORT_INTERVENTO, PAGINA_STATISTICHE_ASSISTENZA]))
+            categorie_utente.append(("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]))
         else:
-            categorie_utente.insert(3, ("🧳 Service", [PAGINA_REPORT_INTERVENTO]))
-        # La categoria Costi compare solo per chi fa parte dell'area Costi, come il
-        # Service: per tutti gli altri utenti non c'è alcuna voce sui costi.
+            categorie_utente.append(("👥 Il mio reparto", [PAGINA_MIO_REPARTO]))
+        categorie_utente.append(("🏭 Commesse", pagine_commesse))
+        if not sono_service and ha_trasferte(user_info["name"]):
+            categorie_utente.append(("📷 Rapporto di intervento", [PAGINA_REPORT_INTERVENTO]))
+        categorie_utente.append(("👤 Io", ["Riepilogo personale", "Report mensile", "Richiesta ferie/permessi", "Richiesta rettifica", "Profilo"]))
+        # Risorse umane / Costi compaiono solo per chi fa parte di quelle aree.
         if is_area_amministrazione(user_info["area"]):
-            categorie_utente.append(("👥 Risorse Umane", ["Cartellini dipendenti"]))
+            categorie_utente.append(("🧾 Risorse umane", ["Cartellini dipendenti"]))
         if is_area_costi(user_info["area"]):
-            categorie_utente.append(("💰 Costi", ["💰 Costi commesse"]))
-            categorie_utente.append(("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]))
+            categorie_utente.append(("💰 Costi e statistiche", ["💰 Costi commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]))
         pagina_utente = render_menu_a_categorie(
             categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
-        if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI,
-                                    PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA):
+        if pagina_utente not in ("Timbrature", PAGINA_HOME, PAGINA_MIO_REPARTO, PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE,
+                                    PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA,
+                                    "Profilo", "Richiesta ferie/permessi", "Richiesta rettifica"):
             df = carica_dati_db()
 
-        if pagina_utente == "Profilo":
+        if pagina_utente == PAGINA_HOME:
+            azioni_utente = [("🕒 Timbra", "🕒 Timbra", "Timbrature")]
+            if sono_service:
+                azioni_utente += [("➕ Programma una trasferta", "🧳 Trasferte", PAGINA_NUOVA_TRASFERTA),
+                                  ("📍 Dove sono ora i dipendenti", "📍 Chi è dove", PAGINA_SITUAZIONE_SERVICE)]
+            else:
+                azioni_utente.append(("👥 Il mio reparto", "👥 Il mio reparto", PAGINA_MIO_REPARTO))
+            azioni_utente += [("🌴 Chiedi ferie o permessi", "👤 Io", "Richiesta ferie/permessi"),
+                              ("🏭 Le mie commesse", "🏭 Commesse", "Le mie Commesse")]
+            render_home(user_info, "user_menu", azioni_utente, mostra_panoramica=sono_service)
+
+        elif pagina_utente == PAGINA_MIO_REPARTO:
+            render_mio_reparto(user_info["area"], user_info["name"], key_prefix="user_reparto")
+
+        elif pagina_utente == "Profilo":
             st.subheader("👤 Profilo personale")
             st.write(f"**Nome:** {dipendente_scelto}")
             st.write(f"**Area:** {user_info['area']}")
