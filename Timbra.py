@@ -4035,6 +4035,11 @@ def suggerisci_mezzo(ore_andata, percorso_auto=True):
         return "Auto o Treno", f"{formatta_durata(ore)} in auto all'andata: valuta auto (con più giorni) o treno."
     return "Aereo", f"{formatta_durata(ore)} in auto all'andata: conviene l'aereo, con auto a noleggio sul posto."
 
+def nome_impianto_predefinito(tipologia, cliente):
+    """Nome proposto per un impianto quando non ne è stato scritto uno: tipo di impianto e
+    cliente presi dalla commessa (es. 'Forno - Panificio Rossi'). Vuoto se mancano entrambi."""
+    return " - ".join(x for x in ((tipologia or "").strip(), (cliente or "").strip()) if x)
+
 def get_dati_impianto(commessa):
     """Dati dell'impianto di una commessa (nome, tipo, cliente, indirizzo, coordinate e
     distanza dalla sede già calcolata) oppure None se la commessa non esiste."""
@@ -4043,13 +4048,15 @@ def get_dati_impianto(commessa):
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""SELECT nome, nome_impianto, tipologia_impianto, cliente, indirizzo_impianto, paese, lat, lon,
-                            dist_sede_km, dist_sede_ore, dist_sede_rif, dist_sede_percorso FROM commesse WHERE nome = ?""", (commessa,))
+                            dist_sede_km, dist_sede_ore, dist_sede_rif, dist_sede_percorso, anno_produzione, stato, descrizione
+                     FROM commesse WHERE nome = ?""", (commessa,))
         r = c.fetchone()
     if not r:
         return None
     return {"commessa": r[0], "nome_impianto": (r[1] or "").strip(), "tipologia": (r[2] or "").strip(), "cliente": (r[3] or "").strip(),
             "indirizzo": (r[4] or "").strip(), "paese": (r[5] or "").strip(), "lat": r[6], "lon": r[7],
-            "km": r[8], "ore": r[9], "rif": r[10], "percorso": r[11]}
+            "km": r[8], "ore": r[9], "rif": r[10], "percorso": r[11],
+            "anno": r[12], "stato": (r[13] or "").strip(), "descrizione": (r[14] or "").strip()}
 
 def localizza_commessa(commessa):
     """Trova le coordinate dell'indirizzo dell'impianto e le salva sulla commessa (azzerando
@@ -4199,7 +4206,7 @@ def disegna_mappa_impianti(impianti, semplice=False):
     else:
         punti["colore"] = punti["situazione"].map(lambda x: COLORI_MAPPA_IMPIANTI.get(x, COLORI_MAPPA_IMPIANTI["Nessuna trasferta"]))
     punti["titolo"] = punti.apply(lambda r: f"Commessa {r['commessa']}", axis=1)
-    punti["impianto"] = punti.apply(lambda r: r["nome_impianto"] or r["cliente"] or "-", axis=1)
+    punti["impianto"] = punti.apply(lambda r: r["nome_impianto"] or nome_impianto_predefinito(r["tipologia"], r["cliente"]) or "-", axis=1)
     punti["tipo"] = punti["tipologia"].replace("", "-")
     punti["trasferta_txt"] = punti.apply(lambda r: (f"{r['situazione']}: {r['operatori']}" if r["operatori"] else r["situazione"]), axis=1)
     html_tooltip = ("<b>{titolo}</b><br/>{impianto}<br/>Tipo: {tipo}<br/>Cliente: {cliente}" if semplice else
@@ -4291,7 +4298,7 @@ def render_mappa_impianti(key_prefix, puo_impostare_sede=False):
                 mezzo, dist = suggerisci_mezzo(None, False)[0], "nessun percorso in auto"
             else:
                 mezzo, dist = "", "da calcolare"
-            righe.append({"Commessa": r["commessa"], "Impianto": r["nome_impianto"], "Tipo": r["tipologia"], "Cliente": r["cliente"],
+            righe.append({"Commessa": r["commessa"], "Impianto": r["nome_impianto"] or nome_impianto_predefinito(r["tipologia"], r["cliente"]), "Tipo": r["tipologia"], "Cliente": r["cliente"],
                           "Indirizzo": r["indirizzo"], "Dalla sede (auto)": dist, "Mezzo suggerito": mezzo,
                           "Trasferte": (f"{r['situazione']}: {r['operatori']} ({r['periodo']})" if r["operatori"] else r["situazione"]),
                           "Posizione": "✅" if pd.notna(r["lat"]) else "❌ da localizzare"})
@@ -4334,10 +4341,21 @@ def render_mappa_impianti(key_prefix, puo_impostare_sede=False):
     commessa_imp = selettore_commessa_filtrato(f"{key_prefix}_mappa_imp", key_commessa=f"{key_prefix}_mappa_imp_commessa", etichetta="Commessa")
     if commessa_imp:
         dati = get_dati_impianto(commessa_imp) or {}
-        nome_imp_in = st.text_input("Nome dell'impianto", value=dati.get("nome_impianto", ""), key=f"{key_prefix}_mappa_imp_nome_{commessa_imp}",
-                                    placeholder="es. Linea surgelazione stabilimento 2")
-        indirizzo_in = st.text_input("Indirizzo dello stabilimento (via, città, Stato)", value=dati.get("indirizzo", ""),
-                                     key=f"{key_prefix}_mappa_imp_indirizzo_{commessa_imp}")
+        # Dati già presenti nella tabella delle commesse, mostrati qui per non doverli riscrivere
+        riga_commessa = " · ".join(x for x in (
+            f"Cliente: {dati['cliente']}" if dati.get("cliente") else "", f"Tipo: {dati['tipologia']}" if dati.get("tipologia") else "",
+            f"Anno: {dati['anno']}" if dati.get("anno") else "", f"Paese: {dati['paese']}" if dati.get("paese") else "",
+            f"Stato: {dati['stato']}" if dati.get("stato") else "") if x)
+        if riga_commessa:
+            st.info(f"📋 Dalla commessa {commessa_imp} — {riga_commessa}")
+        if dati.get("descrizione"):
+            st.caption(f"Descrizione commessa: {dati['descrizione']}")
+        nome_proposto = dati.get("nome_impianto") or nome_impianto_predefinito(dati.get("tipologia"), dati.get("cliente"))
+        nome_imp_in = st.text_input("Nome dell'impianto", value=nome_proposto, key=f"{key_prefix}_mappa_imp_nome_{commessa_imp}",
+                                    help="Se non l'hai ancora scritto è proposto dalla commessa (tipo di impianto e cliente): modificalo se serve.")
+        indirizzo_in = st.text_input(f"Indirizzo dello stabilimento (via, città, {dati.get('paese') or 'Stato'})", value=dati.get("indirizzo", ""),
+                                     key=f"{key_prefix}_mappa_imp_indirizzo_{commessa_imp}",
+                                     help="Il Paese della commessa si aggiunge da solo alla ricerca se non lo scrivi.")
         if dati.get("lat") is not None:
             st.caption(f"📍 Posizione trovata: {dati['lat']:.4f}, {dati['lon']:.4f}"
                        + (f" · {dati['km']:.0f} km, {formatta_durata(dati['ore'])} in auto dalla sede" if distanza_sede_valida(dati) and dati.get('percorso') == 1 else ""))
