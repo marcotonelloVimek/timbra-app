@@ -5522,6 +5522,22 @@ def _render_report_inviati(dipendente_nome):
     else:
         render_schede_report(report_dip, f"mieirep_{re.sub(r'[^0-9A-Za-z]', '_', dipendente_nome)}", f"Report interventi di {dipendente_nome}")
 
+# Colori della colonna Stato in "Disponibilità Team": verde = in sede, blu = in trasferta,
+# arancione = ferie, viola = permesso (valori di compute_disponibilita_giornaliera).
+COLORI_STATO_DISPONIBILITA = {"In sede": "#16a34a", "In trasferta": "#2563eb", "Ferie": "#d97706", "Permesso": "#7c3aed"}
+
+def evidenzia_stato_disponibilita(df):
+    """Styler che colora la casella 'Stato' della tabella Disponibilità Team in base al
+    suo valore, per vedere a colpo d'occhio chi è in sede, in trasferta, in ferie o in
+    permesso. Un valore non previsto resta senza colore; tabella vuota o senza colonna
+    Stato: restituita invariata."""
+    if df is None or df.empty or "Stato" not in df.columns:
+        return df
+    def colora(colonna):
+        return [f"background-color: {COLORI_STATO_DISPONIBILITA[v]}33; color: {COLORI_STATO_DISPONIBILITA[v]}; font-weight: 600"
+                if v in COLORI_STATO_DISPONIBILITA else "" for v in colonna]
+    return df.style.apply(colora, subset=["Stato"])
+
 def render_disponibilita_team(area_default=None, forza_area=False, key_prefix=""):
     """Vista 'chi è dove' per un giorno scelto: in sede, in trasferta o in ferie/
     permesso. È una vista di pianificazione basata sulle trasferte programmate e
@@ -5540,8 +5556,8 @@ def render_disponibilita_team(area_default=None, forza_area=False, key_prefix=""
     if disponibilita_df.empty:
         st.info("Nessun dipendente trovato per questo reparto.")
         return
-    st.dataframe(disponibilita_df, use_container_width=True)
-    st.caption("Basata sulle trasferte programmate e sulle richieste ferie/permessi già approvate: se un dipendente non risulta né in trasferta né in ferie/permesso viene mostrato come 'In sede', indipendentemente dalle timbrature effettive del giorno.")
+    st.dataframe(evidenzia_stato_disponibilita(disponibilita_df), use_container_width=True)
+    st.caption("🟢 In sede · 🔵 In trasferta · 🟠 Ferie · 🟣 Permesso. Basata sulle trasferte programmate e sulle richieste ferie/permessi già approvate: se un dipendente non risulta né in trasferta né in ferie/permesso viene mostrato come 'In sede', indipendentemente dalle timbrature effettive del giorno.")
 
 COLORI_STATO_FASE = {
     "Da iniziare": "#6b7280",
