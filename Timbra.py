@@ -3846,6 +3846,30 @@ def varianti_indirizzo(testo):
             risultato.append((t_.strip(), approssimata))
     return risultato
 
+def _attese_da_indirizzo(testo):
+    """(prime due cifre del CAP, sigla della provincia) scritte nell'indirizzo, oppure None
+    se non ci sono: servono a scartare un risultato che cade in un altro posto."""
+    t_ = str(testo or "")
+    cap = re.search(r"\b(\d{5})\b", t_)
+    provincia = re.search(r"(?<![A-Za-z])([A-Z]{2})\s*$", t_.strip())
+    return (cap.group(1)[:2] if cap else None), (provincia.group(1) if provincia and provincia.group(1) not in ("IT", "DE", "FR", "ES", "UK") else None)
+
+def _risultato_coerente(risultato, cap2, provincia):
+    """False se il risultato di Nominatim è in un'altra provincia o ha un CAP di un'altra
+    zona rispetto a quelli scritti nell'indirizzo (es. una 'Via Cristoforo Colombo' di Roma
+    per un indirizzo in provincia di Bergamo). Se il risultato non riporta questi dati non
+    si può controllare e si accetta."""
+    indirizzo = (risultato or {}).get("address") or {}
+    if provincia:
+        iso = str(indirizzo.get("ISO3166-2-lvl6") or "").upper()
+        if iso.startswith("IT-") and iso[3:] != provincia.upper():
+            return False
+    if cap2:
+        cap_trovato = re.search(r"\d{5}", str(indirizzo.get("postcode") or ""))
+        if cap_trovato and cap_trovato.group(0)[:2] != cap2:
+            return False
+    return True
+
 @st.cache_data(ttl=86400)
 def geocodifica_indirizzo(testo):
     """(latitudine, longitudine, nome trovato, approssimata, testo usato) di un indirizzo, oppure
@@ -3854,12 +3878,15 @@ def geocodifica_indirizzo(testo):
     numero civico o la via. Il risultato resta in cache un giorno (anche per rispettare i limiti
     di Nominatim); un errore di rete NON viene messo in cache."""
     varianti = varianti_indirizzo(testo)
+    cap2, provincia = _attese_da_indirizzo(testo)
     for numero, (variante, approssimata) in enumerate(varianti):
         if numero and _PAUSA_NOMINATIM_SECONDI:
             time.sleep(_PAUSA_NOMINATIM_SECONDI)      # Nominatim: massimo una richiesta al secondo
-        dati = _chiedi_json(f"{URL_NOMINATIM}?q={urllib.parse.quote(variante)}&format=jsonv2&limit=1")
+        dati = _chiedi_json(f"{URL_NOMINATIM}?q={urllib.parse.quote(variante)}&format=jsonv2&limit=1&addressdetails=1")
         if not dati:
             continue
+        if not _risultato_coerente(dati[0], cap2, provincia):
+            continue                                  # trovato altrove (altra provincia o CAP): non è il posto giusto
         try:
             return float(dati[0]["lat"]), float(dati[0]["lon"]), str(dati[0].get("display_name") or variante), approssimata, variante
         except (KeyError, ValueError, TypeError, IndexError):
@@ -4156,18 +4183,27 @@ def get_impianti_mappa(oggi=None):
 
 COLORI_MAPPA_IMPIANTI = {"In trasferta ora": [220, 38, 38, 220], "Trasferta programmata": [217, 119, 6, 220], "Nessuna trasferta": [37, 99, 235, 200]}
 
-def disegna_mappa_impianti(impianti):
+def disegna_mappa_impianti(impianti, semplice=False):
     """Mappa con un puntino per impianto; passandoci sopra compaiono numero commessa, nome e
     tipo dell'impianto, cliente, indirizzo (e chi è in trasferta). Usa pydeck (incluso con
-    Streamlit); se non disponibile ripiega sulla mappa semplice, senza le descrizioni."""
+    Streamlit); se non disponibile ripiega sulla mappa semplice, senza le descrizioni.
+    semplice=True è la versione illustrativa per tutti i dipendenti: un solo colore e nel
+    suggerimento niente indirizzo né trasferte (chi è dove)."""
     punti = impianti[impianti["lat"].notna() & impianti["lon"].notna()].copy()
     if punti.empty:
         return False
-    punti["colore"] = punti["situazione"].map(lambda x: COLORI_MAPPA_IMPIANTI.get(x, COLORI_MAPPA_IMPIANTI["Nessuna trasferta"]))
+    if semplice:
+        punti["colore"] = [COLORI_MAPPA_IMPIANTI["Nessuna trasferta"]] * len(punti)
+        punti["indirizzo"] = ""
+        punti["situazione"], punti["operatori"] = "", ""
+    else:
+        punti["colore"] = punti["situazione"].map(lambda x: COLORI_MAPPA_IMPIANTI.get(x, COLORI_MAPPA_IMPIANTI["Nessuna trasferta"]))
     punti["titolo"] = punti.apply(lambda r: f"Commessa {r['commessa']}", axis=1)
     punti["impianto"] = punti.apply(lambda r: r["nome_impianto"] or r["cliente"] or "-", axis=1)
     punti["tipo"] = punti["tipologia"].replace("", "-")
     punti["trasferta_txt"] = punti.apply(lambda r: (f"{r['situazione']}: {r['operatori']}" if r["operatori"] else r["situazione"]), axis=1)
+    html_tooltip = ("<b>{titolo}</b><br/>{impianto}<br/>Tipo: {tipo}<br/>Cliente: {cliente}" if semplice else
+                    "<b>{titolo}</b><br/>{impianto}<br/>Tipo: {tipo}<br/>Cliente: {cliente}<br/>{indirizzo}<br/><i>{trasferta_txt}</i>")
     try:
         import pydeck as pdk
         dati = punti[["lat", "lon", "colore", "titolo", "impianto", "tipo", "cliente", "indirizzo", "trasferta_txt"]].copy()
@@ -4180,7 +4216,7 @@ def disegna_mappa_impianti(impianti):
         else:
             ampiezza = max(float(dati["lat"].max() - dati["lat"].min()), float(dati["lon"].max() - dati["lon"].min()), 0.01)
             zoom = max(1.0, min(10.0, math.log2(360.0 / ampiezza) - 0.5))
-        tooltip = {"html": "<b>{titolo}</b><br/>{impianto}<br/>Tipo: {tipo}<br/>Cliente: {cliente}<br/>{indirizzo}<br/><i>{trasferta_txt}</i>",
+        tooltip = {"html": html_tooltip,
                    "style": {"backgroundColor": "#0f2a4a", "color": "white", "fontSize": "13px"}}
         mappa = pdk.Deck(layers=[strato], initial_view_state=pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, pitch=0), tooltip=tooltip)
         st.pydeck_chart(mappa, use_container_width=True)
@@ -4188,6 +4224,28 @@ def disegna_mappa_impianti(impianti):
         st.map(punti[["lat", "lon"]])
         st.caption("Mappa semplice (senza descrizioni al passaggio del mouse): il componente delle mappe avanzate non è disponibile.")
     return True
+
+def render_mappa_impianti_vista(key_prefix):
+    """Mappa illustrativa degli impianti per TUTTI i dipendenti (menu delle commesse): solo i
+    puntini con numero commessa, nome e tipo di impianto e cliente al passaggio del mouse.
+    Niente trasferte, operatori, distanze né indirizzi, e nessuna modifica."""
+    st.subheader("🗺️ Mappa impianti")
+    impianti = get_impianti_mappa()
+    impianti = impianti[impianti["lat"].notna()] if not impianti.empty else impianti
+    if impianti.empty:
+        st.info("Nessun impianto è ancora stato posizionato sulla mappa.")
+        return
+    col1, col2 = st.columns(2)
+    with col1:
+        f_cliente = st.selectbox("Cliente", ["Tutti"] + sorted({x for x in impianti["cliente"] if x}), key=f"{key_prefix}_vista_cliente")
+    with col2:
+        f_tipo = st.selectbox("Tipo di impianto", ["Tutti"] + sorted({x for x in impianti["tipologia"] if x}), key=f"{key_prefix}_vista_tipo")
+    if f_cliente != "Tutti":
+        impianti = impianti[impianti["cliente"] == f_cliente]
+    if f_tipo != "Tutti":
+        impianti = impianti[impianti["tipologia"] == f_tipo]
+    st.caption(f"{len(impianti)} impianti · passa il mouse su un puntino per vedere commessa, impianto, tipo e cliente.")
+    disegna_mappa_impianti(impianti, semplice=True)
 
 def render_mappa_impianti(key_prefix, puo_impostare_sede=False):
     """Pagina 'Mappa impianti': dove si trovano gli impianti (uno per commessa con
@@ -5222,6 +5280,7 @@ PAGINE_TRASFERTE = [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA
 # Menu unico "Trasferte e Team" per chi gestisce le trasferte (area Service): le stesse
 # voci dell'amministratore, più il report intervento da compilare per le proprie trasferte.
 PAGINA_MAPPA_IMPIANTI = "🗺️ Mappa impianti"
+PAGINA_MAPPA_IMPIANTI_VISTA = "🗺️ Mappa impianti (vista)"   # per tutti i dipendenti, nel menu delle commesse: solo illustrativa
 PAGINA_DISPONIBILITA_TEAM = "📅 Disponibilità Team"
 PAGINE_TRASFERTE_SERVICE = PAGINE_TRASFERTE + [PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM,
                                                PAGINA_SITUAZIONE_SERVICE, PAGINA_REPORT_INTERVENTO]
@@ -8496,7 +8555,7 @@ else:
 
         admin_page = render_menu_a_categorie([
             ("📊 Presenze e Richieste", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature"]),
-            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto"]),
+            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI_VISTA]),
             ("📈 Statistiche e Sostenibilità", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
             ("👥 Risorse Umane", ["Cartellini dipendenti"]),
             ("🧳 Trasferte e Team", PAGINE_TRASFERTE + [PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_SITUAZIONE_SERVICE]),
@@ -8846,6 +8905,9 @@ else:
         if admin_page == PAGINA_MAPPA_IMPIANTI:
             render_mappa_impianti(key_prefix="admin", puo_impostare_sede=True)
 
+        if admin_page == PAGINA_MAPPA_IMPIANTI_VISTA:
+            render_mappa_impianti_vista(key_prefix="admin")
+
         if admin_page == PAGINA_SITUAZIONE_SERVICE:
             render_situazione_service(key_prefix="admin")
 
@@ -8889,7 +8951,7 @@ else:
             categorie_resp_personale = [
                 ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
                 ("👤 Profilo", ["Profilo"]),
-                ("🏭 Le mie Commesse", ["Le mie Commesse"]),
+                ("🏭 Le mie Commesse", ["Le mie Commesse", PAGINA_MAPPA_IMPIANTI_VISTA]),
                 ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
             ]
             if not is_area_service(user_info["area"]):
@@ -8897,7 +8959,7 @@ else:
             pagina_utente = render_menu_a_categorie(
                 categorie_resp_personale, key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
             st.session_state["_ultima_pagina_vista"] = pagina_utente
-            if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE):
+            if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE, PAGINA_MAPPA_IMPIANTI_VISTA):
                 df = carica_dati_db()
 
             if pagina_utente == "Profilo":
@@ -8999,6 +9061,9 @@ else:
             elif pagina_utente == "Le mie Commesse":
                 render_le_mie_commesse(dipendente_scelto, user_info["area"], key_prefix="resp")
 
+            elif pagina_utente == PAGINA_MAPPA_IMPIANTI_VISTA:
+                render_mappa_impianti_vista(key_prefix="resp_personale")
+
             elif pagina_utente == PAGINA_REPORT_INTERVENTO:
                 render_report_intervento(dipendente_scelto, df, key_prefix="resp")
 
@@ -9043,7 +9108,7 @@ else:
 
             resp_page = render_menu_a_categorie([
                 ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature"]),
-                ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione", "🗂️ Attività di reparto"]),
+                ("📈 Commesse e Statistiche", ["Statistiche area", "Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI_VISTA]),
                 ("📅 Disponibilità", ["📅 Disponibilità Team"]),
             ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
             st.session_state["_ultima_pagina_vista"] = resp_page
@@ -9177,6 +9242,9 @@ else:
             elif resp_page == "🗂️ Attività di reparto":
                 render_attivita_reparto(df, key_prefix="resp_attivita", scope_area=area_responsabile, attore=st.session_state.username)
 
+            elif resp_page == PAGINA_MAPPA_IMPIANTI_VISTA:
+                render_mappa_impianti_vista(key_prefix="resp_team")
+
             elif resp_page == "📅 Pianificazione":
                 render_pianificazione_commessa(df, key_prefix="resp_pianificazione", puo_modificare=False,
                                                reparti_modificabili=[area_responsabile])
@@ -9241,7 +9309,7 @@ else:
         categorie_utente = [
             ("🕒 Le mie timbrature", ["Timbrature", "Riepilogo personale", "Report mensile"]),
             ("👤 Profilo", ["Profilo"]),
-            ("🏭 Le mie Commesse", ["Le mie Commesse", "📅 Pianificazione"]),
+            ("🏭 Le mie Commesse", ["Le mie Commesse", "📅 Pianificazione", PAGINA_MAPPA_IMPIANTI_VISTA]),
             ("📝 Richieste", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
         ]
         # Chi fa parte dell'area Service ha un unico menu "Trasferte e Team" (stesse voci
@@ -9262,7 +9330,7 @@ else:
             categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
         if pagina_utente not in ("Timbrature", PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI,
-                                    PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM):
+                                    PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA):
             df = carica_dati_db()
 
         if pagina_utente == "Profilo":
@@ -9405,6 +9473,9 @@ else:
 
         elif pagina_utente == "Le mie Commesse":
             render_le_mie_commesse(dipendente_scelto, user_info["area"], key_prefix="user")
+
+        elif pagina_utente == PAGINA_MAPPA_IMPIANTI_VISTA:
+            render_mappa_impianti_vista(key_prefix="user")
 
         elif pagina_utente == "📅 Pianificazione":
             render_pianificazione_commessa(df, key_prefix="user_pianificazione", puo_modificare=False)
