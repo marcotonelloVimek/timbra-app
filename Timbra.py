@@ -2955,7 +2955,7 @@ def render_gestione_fasi_commessa(scope_area=None, allow_create_commessa=False, 
                     # e l'impianto si localizza poi dalla pagina Mappa impianti.
                     esito_ok, esito_msg = aggiorna_impianto_commessa(nome_creata, nuovo_indirizzo_impianto, nuovo_nome_impianto)
                     # la pagina si ricarica subito dopo: l'esito si mostra al giro successivo
-                    st.session_state["_avviso_impianto"] = (f"Commessa '{nome_creata}': {esito_msg}", esito_ok and "non è stato localizzato" not in esito_msg and "non calcolata" not in esito_msg)
+                    st.session_state["_avviso_impianto"] = (f"Commessa '{nome_creata}': {esito_msg}", esito_ok and "non è stato localizzato" not in esito_msg and "non calcolata" not in esito_msg and "APPROSSIMATA" not in esito_msg)
                 if applica_template_cc and ha_template_cc:
                     n_copiate = applica_template_a_commessa(nuova_tipologia, nome_creata, attore)
                     if n_copiate:
@@ -3799,21 +3799,72 @@ def _chiedi_json(url):
     except Exception as e:
         raise ErroreViaggio(f"Servizio di calcolo percorso non raggiungibile ({type(e).__name__}). Riprova tra poco oppure inserisci le ore a mano.")
 
+_ABBREVIAZIONI_INDIRIZZO = [
+    (r"\bstr\.?(?=\s)", "Strada"), (r"\bv\.le\b|\bvle\b", "Viale"), (r"\bp\.?\s?zza\b|\bp\.za\b", "Piazza"),
+    (r"\bc\.so\b", "Corso"), (r"\bloc\.(?=\s)", "Località"), (r"\bfraz\.(?=\s)", "Frazione"), (r"\bv\.(?=\s)", "Via"),
+]
+
+def varianti_indirizzo(testo):
+    """Versioni sempre meno precise di un indirizzo, da provare in ordine finché Nominatim ne
+    trova una: [(testo, approssimata)]. Le prime correggono ciò che spesso non viene
+    riconosciuto (abbreviazioni come 'Str.', frazioni tra parentesi, lettera dopo il numero
+    civico, Italia sottintesa); le ultime tolgono il civico e poi la via, e danno quindi una
+    posizione APPROSSIMATA (via o località)."""
+    originale = " ".join(str(testo or "").split())
+    if not originale:
+        return []
+    pulito = re.sub(r"\([^)]*\)", " ", originale)                        # "(Mezzavia)": frazioni tra parentesi
+    for pattern, sostituzione in _ABBREVIAZIONI_INDIRIZZO:
+        pulito = re.sub(pattern, sostituzione, pulito, flags=re.IGNORECASE)
+    pulito = re.sub(r"\b(\d+)\s?[/\-]?\s?[A-Za-z]\b", r"\1", pulito)      # civico "110A", "3/B", "5 bis" (solo una lettera) -> numero
+    pulito = " ".join(pulito.replace(" ,", ",").split())
+    italia = bool(re.search(r"\b\d{5}\b", pulito)) and not re.search(r"italia|italy|deutschland|france|españa|schweiz|österreich", pulito, re.IGNORECASE)
+    def con_italia(t_):
+        return f"{t_}, Italia" if italia else t_
+    parti = [p.strip() for p in pulito.split(",") if p.strip()]
+    senza_cap = " ".join(re.sub(r"\b\d{5}\b", " ", pulito).split())
+    parti_senza_civico = [p for p in parti if not re.fullmatch(r"\d+\s?[/\-]?\s?[A-Za-z]?", p)]
+    via = parti_senza_civico[0] if parti_senza_civico else ""
+    via_senza_civico = re.sub(r"[\s,]+\d+\s?[/\-]?\s?[A-Za-z]?$", "", via)             # "Via Roma 1" -> "Via Roma"
+    resto = parti_senza_civico[1:]
+    cap = re.search(r"\b\d{5}\b", pulito)
+    candidati = [
+        (originale, False), (con_italia(pulito), False), (con_italia(senza_cap), False),
+        (con_italia(", ".join([via_senza_civico] + resto)), True),             # senza numero civico
+        (con_italia(f"{via_senza_civico}, {cap.group(0)}" if via_senza_civico and cap else ""), True),   # via + CAP
+        (con_italia(", ".join(resto)), True),                                  # solo località (e CAP)
+        (con_italia(cap.group(0)) if cap else "", True),                       # solo CAP
+    ]
+    # Una variante approssimata deve restare una località: un nome solo (es. soltanto "Italia")
+    # porterebbe al centro del Paese, peggio di non trovare nulla.
+    candidati = [(t_, appr) for t_, appr in candidati if not appr or re.search(r"\b\d{5}\b", t_) or t_.count(",") >= 1]
+    visti, risultato = set(), []
+    for t_, approssimata in candidati:
+        chiave = t_.strip().casefold()
+        if chiave and chiave not in visti:
+            visti.add(chiave)
+            risultato.append((t_.strip(), approssimata))
+    return risultato
+
 @st.cache_data(ttl=86400)
 def geocodifica_indirizzo(testo):
-    """(latitudine, longitudine, nome trovato) di un indirizzo, oppure None se non
-    trovato. Il risultato resta in cache un giorno (anche per rispettare i limiti di
-    Nominatim); un errore di rete NON viene messo in cache."""
-    testo = (testo or "").strip()
-    if not testo:
-        return None
-    dati = _chiedi_json(f"{URL_NOMINATIM}?q={urllib.parse.quote(testo)}&format=jsonv2&limit=1")
-    if not dati:
-        return None
-    try:
-        return float(dati[0]["lat"]), float(dati[0]["lon"]), str(dati[0].get("display_name") or testo)
-    except (KeyError, ValueError, TypeError, IndexError):
-        raise ErroreViaggio("Risposta inattesa dal servizio degli indirizzi.")
+    """(latitudine, longitudine, nome trovato, approssimata, testo usato) di un indirizzo, oppure
+    None se non trovato. Se l'indirizzo scritto non viene riconosciuto prova versioni via via
+    più semplici (vedi varianti_indirizzo): 'approssimata' è True se si è dovuto togliere il
+    numero civico o la via. Il risultato resta in cache un giorno (anche per rispettare i limiti
+    di Nominatim); un errore di rete NON viene messo in cache."""
+    varianti = varianti_indirizzo(testo)
+    for numero, (variante, approssimata) in enumerate(varianti):
+        if numero and _PAUSA_NOMINATIM_SECONDI:
+            time.sleep(_PAUSA_NOMINATIM_SECONDI)      # Nominatim: massimo una richiesta al secondo
+        dati = _chiedi_json(f"{URL_NOMINATIM}?q={urllib.parse.quote(variante)}&format=jsonv2&limit=1")
+        if not dati:
+            continue
+        try:
+            return float(dati[0]["lat"]), float(dati[0]["lon"]), str(dati[0].get("display_name") or variante), approssimata, variante
+        except (KeyError, ValueError, TypeError, IndexError):
+            raise ErroreViaggio("Risposta inattesa dal servizio degli indirizzi.")
+    return None
 
 def calcola_percorso_auto(lat1, lon1, lat2, lon2):
     """(km, ore) del percorso in auto più veloce tra due punti."""
@@ -3932,6 +3983,9 @@ def imposta_sede_aziendale(indirizzo):
         c.execute("UPDATE commesse SET dist_sede_km=NULL, dist_sede_ore=NULL, dist_sede_rif=NULL, dist_sede_percorso=NULL")
         conn.commit()
     get_commesse_dettaglio.clear()
+    if punto[3]:
+        return True, (f"Sede salvata con posizione APPROSSIMATA: l'indirizzo esatto non è stato riconosciuto, ho usato '{punto[4]}'. "
+                      "Le distanze sono quindi indicative. Le distanze degli impianti si ricalcolano da sole quando servono.")
     return True, "Sede salvata. Le distanze degli impianti si ricalcolano da sole quando servono."
 
 def distanza_in_linea_d_aria_km(lat1, lon1, lat2, lon2):
@@ -3987,6 +4041,7 @@ def localizza_commessa(commessa):
                      WHERE nome=?""", (punto[0], punto[1], commessa))
         conn.commit()
     get_commesse_dettaglio.clear()
+    localizza_commessa.approssimata = punto[4] if punto[3] else ""      # letta da aggiorna_impianto_commessa
     return punto[0], punto[1]
 
 def calcola_distanza_sede_commessa(commessa):
@@ -4052,15 +4107,17 @@ def aggiorna_impianto_commessa(commessa, indirizzo, nome_impianto="", calcola_di
         localizza_commessa(commessa)
     except ErroreViaggio as e:
         return True, f"Salvato, ma l'impianto non è stato localizzato: {e}"
+    avviso = (f" Posizione APPROSSIMATA: l'indirizzo esatto non è stato riconosciuto, ho usato '{localizza_commessa.approssimata}'."
+              if getattr(localizza_commessa, "approssimata", "") else "")
     if not calcola_distanza:
-        return True, "Impianto salvato e localizzato."
+        return True, "Impianto salvato e localizzato." + avviso
     try:
         dati = calcola_distanza_sede_commessa(commessa)
     except ErroreViaggio as e:
-        return True, f"Impianto salvato e localizzato. Distanza dalla sede non calcolata: {e}"
+        return True, f"Impianto salvato e localizzato. Distanza dalla sede non calcolata: {e}" + avviso
     if dati["percorso"] == 0:
-        return True, "Impianto salvato e localizzato. Dalla sede non c'è un percorso in auto: servirà l'aereo."
-    return True, f"Impianto salvato e localizzato: {dati['km']:.0f} km, {formatta_durata(dati['ore'])} in auto dalla sede."
+        return True, "Impianto salvato e localizzato. Dalla sede non c'è un percorso in auto: servirà l'aereo." + avviso
+    return True, f"Impianto salvato e localizzato: {dati['km']:.0f} km, {formatta_durata(dati['ore'])} in auto dalla sede." + avviso
 
 def get_impianti_mappa(oggi=None):
     """Una riga per commessa (con indirizzo) con i dati dell'impianto e, se ci sono, gli
@@ -4230,7 +4287,7 @@ def render_mappa_impianti(key_prefix, puo_impostare_sede=False):
             ok, msg = aggiorna_impianto_commessa(commessa_imp, indirizzo_in, nome_imp_in)
             if not ok:
                 st.error(msg)
-            elif "non è stato localizzato" in msg or "non calcolata" in msg or "senza indirizzo" in msg:
+            elif "non è stato localizzato" in msg or "non calcolata" in msg or "senza indirizzo" in msg or "APPROSSIMATA" in msg:
                 st.warning(msg)
             else:
                 st.success(msg)
@@ -4246,7 +4303,7 @@ def render_mappa_impianti(key_prefix, puo_impostare_sede=False):
         nuova_sede = st.text_input("Indirizzo della sede", value=sede["indirizzo"], key=f"{key_prefix}_mappa_sede")
         if st.button("💾 Salva sede", key=f"{key_prefix}_mappa_sede_salva"):
             ok, msg = imposta_sede_aziendale(nuova_sede)
-            (st.success if ok else st.error)(msg)
+            (st.warning if ok and "APPROSSIMATA" in msg else (st.success if ok else st.error))(msg)
 
 def valida_viaggio(viaggio):
     """Controllo dei dati di viaggio prima del salvataggio. Restituisce (ok, errore)."""
