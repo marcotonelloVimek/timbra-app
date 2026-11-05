@@ -1376,13 +1376,36 @@ def _inject_stile_vimek():
         box-shadow: 0 1px 3px rgba(20,30,45,.08);
     }}
 
-    /* Menu di navigazione in alto (sezioni e pagine): pulsanti ben visibili, che vanno a
-       capo da soli su schermi stretti. Il contenitore ha la chiave "navmenu". */
-    div[class*="st-key-navmenu"] div[role="radiogroup"] {{
-        gap: 6px 8px;
+    /* Menu di navigazione in alto. Con st.pills lo stile è già quello giusto: qui si
+       ritoccano solo dimensioni e colori. Per le versioni di Streamlit senza st.pills i
+       radio orizzontali preceduti da un marcatore (.navsezioni-marker / .navpagine-marker)
+       vengono resi a pulsanti arrotondati. */
+    div[data-testid="stPills"] button, div[data-testid="stSegmentedControl"] button {{
+        font-size: 1rem;
+    }}
+    div[data-testid="stPills"] button[aria-checked="true"], div[data-testid="stPills"] button[aria-pressed="true"],
+    div[data-testid="stPills"] button[kind="pillsActive"] {{
+        background-color: {VIMEK_NAVY} !important;
+        border-color: {VIMEK_NAVY} !important;
+        color: #fff !important;
+    }}
+    div[data-testid="stPills"] button[aria-checked="true"] *, div[data-testid="stPills"] button[aria-pressed="true"] *,
+    div[data-testid="stPills"] button[kind="pillsActive"] * {{
+        color: #fff !important;
+    }}
+    div[data-testid="stElementContainer"]:has(.navsezioni-marker), div[data-testid="stElementContainer"]:has(.navpagine-marker),
+    .element-container:has(.navsezioni-marker), .element-container:has(.navpagine-marker) {{ display: none; }}
+    div[data-testid="stElementContainer"]:has(.navsezioni-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"],
+    div[data-testid="stElementContainer"]:has(.navpagine-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"],
+    .element-container:has(.navsezioni-marker) + .element-container div[role="radiogroup"],
+    .element-container:has(.navpagine-marker) + .element-container div[role="radiogroup"] {{
+        gap: 8px;
         flex-wrap: wrap;
     }}
-    div[class*="st-key-navmenu"] div[role="radiogroup"] > label {{
+    div[data-testid="stElementContainer"]:has(.navsezioni-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"] > label,
+    div[data-testid="stElementContainer"]:has(.navpagine-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"] > label,
+    .element-container:has(.navsezioni-marker) + .element-container div[role="radiogroup"] > label,
+    .element-container:has(.navpagine-marker) + .element-container div[role="radiogroup"] > label {{
         background: #eef3f8;
         border: 1px solid #d5dfea;
         border-radius: 999px;
@@ -1390,20 +1413,25 @@ def _inject_stile_vimek():
         margin: 0;
         cursor: pointer;
     }}
-    div[class*="st-key-navmenu"] div[role="radiogroup"] > label > div:first-child {{
-        display: none;              /* nasconde il pallino del radio: resta solo il "pulsante" */
+    div[data-testid="stElementContainer"]:has(.navsezioni-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"] > label > div:first-child,
+    div[data-testid="stElementContainer"]:has(.navpagine-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"] > label > div:first-child,
+    .element-container:has(.navsezioni-marker) + .element-container div[role="radiogroup"] > label > div:first-child,
+    .element-container:has(.navpagine-marker) + .element-container div[role="radiogroup"] > label > div:first-child {{
+        display: none;
     }}
-    div[class*="st-key-navmenu"] div[role="radiogroup"] > label:has(input:checked) {{
+    div[data-testid="stElementContainer"]:has(.navsezioni-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"] > label:has(input:checked),
+    div[data-testid="stElementContainer"]:has(.navpagine-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"] > label:has(input:checked),
+    .element-container:has(.navsezioni-marker) + .element-container div[role="radiogroup"] > label:has(input:checked),
+    .element-container:has(.navpagine-marker) + .element-container div[role="radiogroup"] > label:has(input:checked) {{
         background: {VIMEK_NAVY};
         border-color: {VIMEK_NAVY};
     }}
-    div[class*="st-key-navmenu"] div[role="radiogroup"] > label:has(input:checked) * {{
+    div[data-testid="stElementContainer"]:has(.navsezioni-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"] > label:has(input:checked) *,
+    div[data-testid="stElementContainer"]:has(.navpagine-marker) + div[data-testid="stElementContainer"] div[role="radiogroup"] > label:has(input:checked) *,
+    .element-container:has(.navsezioni-marker) + .element-container div[role="radiogroup"] > label:has(input:checked) *,
+    .element-container:has(.navpagine-marker) + .element-container div[role="radiogroup"] > label:has(input:checked) * {{
         color: #fff !important;
         font-weight: 600;
-    }}
-    div[class*="st-key-navmenu-sezioni"] div[role="radiogroup"] > label {{
-        padding: 9px 18px;
-        font-size: 1.05rem;
     }}
 
     /* Telefono: margini ridotti, pulsanti e campi comodi da toccare col dito */
@@ -1415,10 +1443,7 @@ def _inject_stile_vimek():
             min-height: 3rem;
             font-size: 1.05rem;
         }}
-        div[class*="st-key-navmenu"] div[role="radiogroup"] > label {{
-            padding: 10px 14px;
-            font-size: 1rem;
-        }}
+        div[data-testid="stPills"] button {{ min-height: 2.6rem; }}
         h1 {{ font-size: 1.6rem !important; }}
         h2, h3 {{ font-size: 1.25rem !important; }}
         div[data-testid="stMetric"] {{ padding: 10px 12px; }}
@@ -8707,37 +8732,54 @@ def vai_a_pagina(prefisso_menu, categoria, pagina=None, modalita=None):
         st.session_state[f"{prefisso_menu}_pagina_{categoria}"] = pagina
 
 
+def _ripristina_scelta(chiave):
+    """Con i pulsanti a scelta singola si può togliere la selezione cliccando di nuovo
+    quello attivo: qui si rimette l'ultima scelta, così una pagina resta sempre selezionata."""
+    if st.session_state.get(chiave) is None:
+        st.session_state[chiave] = st.session_state.get(f"{chiave}__ultima")
+    else:
+        st.session_state[f"{chiave}__ultima"] = st.session_state[chiave]
+
+def scelta_a_pulsanti(etichetta, opzioni, chiave, classe_css="navmenu"):
+    """Scelta di una voce tra poche, mostrata come fila di pulsanti arrotondati (st.pills,
+    che vanno a capo da soli sul telefono e si toccano comodamente). Se la versione di
+    Streamlit non ha st.pills si usa un normale radio orizzontale, reso a pulsanti dallo
+    stile in _inject_stile_vimek. Restituisce l'opzione scelta (mai None)."""
+    opzioni = list(opzioni)
+    if st.session_state.get(chiave) not in opzioni:
+        st.session_state.pop(chiave, None)           # valore rimasto da un altro menu: riparte dalla prima voce
+    if hasattr(st, "pills"):
+        parametri = {} if chiave in st.session_state else {"default": opzioni[0]}
+        scelta = st.pills(etichetta, opzioni, selection_mode="single", key=chiave, format_func=etichetta_menu,
+                          label_visibility="collapsed", on_change=_ripristina_scelta, args=(chiave,), **parametri)
+        if scelta is None:
+            scelta = st.session_state.get(f"{chiave}__ultima") or opzioni[0]
+        st.session_state[f"{chiave}__ultima"] = scelta
+        return scelta
+    # Versioni più vecchie: radio orizzontale + marcatore per lo stile a pulsanti.
+    st.markdown(f'<span class="{classe_css}-marker"></span>', unsafe_allow_html=True)
+    return st.radio(etichetta, opzioni, key=chiave, horizontal=True, label_visibility="collapsed", format_func=etichetta_menu)
+
+
 def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
-    """Menu di navigazione in alto, a due livelli e a "pulsanti": prima la sezione
-    (poche voci), poi la pagina di quella sezione. Sta nell'area principale e non nel
-    menu laterale perché sul telefono il menu laterale è nascosto e va aperto a mano,
-    mentre qui è sempre sotto gli occhi e va a capo da solo sugli schermi stretti.
-    'categorie' è una lista di tuple (nome_sezione, [pagine]). Restituisce il nome
-    interno della pagina scelta, come prima: il resto del codice che lo confronta con
-    le singole pagine non cambia (i testi mostrati vengono da ETICHETTE_MENU)."""
+    """Menu di navigazione in alto, a due livelli: prima la sezione (poche voci), poi la
+    pagina di quella sezione, entrambe come file di pulsanti (vedi scelta_a_pulsanti).
+    Sta nell'area principale e non nel menu laterale perché sul telefono il menu laterale
+    è nascosto e va aperto a mano. 'categorie' è una lista di tuple (nome_sezione,
+    [pagine]). Restituisce il nome interno della pagina scelta, come prima: il resto del
+    codice che lo confronta con le singole pagine non cambia (i testi mostrati vengono
+    da ETICHETTE_MENU)."""
     st.session_state["_menu_attivo"] = key_prefix
     mappa_pagine_per_categoria = dict(categorie)
     nomi_categorie = list(mappa_pagine_per_categoria.keys())
-    try:
-        contenitore = st.container(key=f"navmenu-{key_prefix}")
-    except TypeError:                         # versioni di Streamlit senza chiave sui contenitori
-        contenitore = st.container()
-    with contenitore:
-        if len(nomi_categorie) > 1:
-            try:
-                contenitore_sezioni = st.container(key=f"navmenu-sezioni-{key_prefix}")
-            except TypeError:
-                contenitore_sezioni = st.container()
-            with contenitore_sezioni:
-                categoria_scelta = st.radio(titolo_categoria, nomi_categorie, key=f"{key_prefix}_categoria",
-                                            horizontal=True, label_visibility="collapsed", format_func=etichetta_menu)
-        else:
-            categoria_scelta = nomi_categorie[0]
-        pagine_categoria = mappa_pagine_per_categoria[categoria_scelta]
-        if len(pagine_categoria) == 1:
-            return pagine_categoria[0]        # una sola pagina: niente seconda scelta
-        return st.radio(categoria_scelta, pagine_categoria, key=f"{key_prefix}_pagina_{categoria_scelta}",
-                        horizontal=True, label_visibility="collapsed", format_func=etichetta_menu)
+    if len(nomi_categorie) > 1:
+        categoria_scelta = scelta_a_pulsanti(titolo_categoria, nomi_categorie, f"{key_prefix}_categoria", "navsezioni")
+    else:
+        categoria_scelta = nomi_categorie[0]
+    pagine_categoria = mappa_pagine_per_categoria[categoria_scelta]
+    if len(pagine_categoria) == 1:
+        return pagine_categoria[0]            # una sola pagina: niente seconda scelta
+    return scelta_a_pulsanti(categoria_scelta, pagine_categoria, f"{key_prefix}_pagina_{categoria_scelta}", "navpagine")
 
 
 # --- PAGINA INIZIALE "OGGI" ----------------------------------------------------------
@@ -9315,13 +9357,7 @@ else:
         if is_area_amministrazione(user_info["area"]):
             opzioni_modalita.append("👥 Risorse Umane")
         if len(opzioni_modalita) > 1:
-            try:
-                _cont_modalita = st.container(key="navmenu-sezioni-modalita")
-            except TypeError:
-                _cont_modalita = st.container()
-            with _cont_modalita:
-                modalita = st.radio("Area di lavoro", opzioni_modalita, key="resp_modalita", horizontal=True,
-                                    label_visibility="collapsed", format_func=etichetta_menu)
+            modalita = scelta_a_pulsanti("Area di lavoro", opzioni_modalita, "resp_modalita", "navsezioni")
         else:
             modalita = opzioni_modalita[0]
 
