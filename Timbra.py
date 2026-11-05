@@ -5529,6 +5529,28 @@ def carica_timbrature_reparto(nomi, da, a):
         return pd.DataFrame(columns=EXPECTED_COLS)
     return df.rename(columns={"Dettaglio_Trasferta": "Dettaglio Trasferta", "Dettaglio_Fase": "Dettaglio Fase"})
 
+GANTT_REPARTO_MAX_GIORNI = 62      # oltre due mesi il grafico diventa illeggibile e la lettura pesante
+
+def _date_input_supporta_formato():
+    """True se st.date_input accetta il parametro format (versioni recenti di Streamlit)."""
+    try:
+        import inspect
+        return "format" in inspect.signature(st.date_input).parameters
+    except (TypeError, ValueError):
+        return False
+
+def preparazione_gantt_reparto(gantt):
+    """Aggiunge ai segmenti del Gantt le colonne per la vista 'Giorno per giorno': Giorno
+    (testo gg/mm e giorno della settimana), ora_inizio/ora_fine portate su una data fissa,
+    così tutti i giorni si confrontano sullo stesso asse delle ore."""
+    g = gantt.copy()
+    g["Giorno"] = g["Data"].apply(lambda d: f"{['lun','mar','mer','gio','ven','sab','dom'][d.weekday()]} {d.strftime('%d/%m')}")
+    base = datetime.datetime(2000, 1, 1)
+    g["ora_inizio"] = g["start"].apply(lambda t: base.replace(hour=t.hour, minute=t.minute, second=t.second))
+    g["ora_fine"] = g.apply(lambda r: base.replace(hour=r["end"].hour, minute=r["end"].minute, second=r["end"].second)
+                            if r["end"].date() == r["start"].date() else base.replace(hour=23, minute=59), axis=1)
+    return g
+
 def render_mio_reparto(area, nome_utente, key_prefix):
     """Pagina 'Il mio reparto', per tutti i dipendenti: dove sono e su cosa stanno
     lavorando, adesso, i colleghi della PROPRIA area (nessuna altra: amministratore e
@@ -5575,30 +5597,59 @@ def render_mio_reparto(area, nome_utente, key_prefix):
     nomi = tabella["Dipendente"].tolist()
     st.markdown("---")
     st.markdown("### 📊 Gantt del reparto")
-    giorno = st.date_input("Giorno", value=adesso.date(), key=f"{key_prefix}_reparto_giorno")
-    df_giorno = carica_timbrature_reparto(nomi, giorno, giorno)
-    segmenti = [compute_commessa_gantt_segments(df_giorno, giorno, giorno, n) for n in nomi]
+    oggi_d = adesso.date()
+    periodo = st.date_input("Periodo (dal - al)", value=(oggi_d - datetime.timedelta(days=oggi_d.weekday()), oggi_d),
+                            key=f"{key_prefix}_reparto_periodo", format="DD/MM/YYYY") if _date_input_supporta_formato() else \
+              st.date_input("Periodo (dal - al)", value=(oggi_d - datetime.timedelta(days=oggi_d.weekday()), oggi_d), key=f"{key_prefix}_reparto_periodo")
+    if isinstance(periodo, (tuple, list)):
+        if len(periodo) != 2:
+            st.info("Scegli anche la data di fine: basta cliccare un secondo giorno (anche lo stesso, per un giorno solo).")
+            return
+        dal, al = periodo
+    else:
+        dal = al = periodo
+    if al < dal:
+        dal, al = al, dal
+    if (al - dal).days > GANTT_REPARTO_MAX_GIORNI:
+        st.warning(f"Periodo troppo lungo: mostro gli ultimi {GANTT_REPARTO_MAX_GIORNI} giorni, fino al {al.strftime('%d/%m/%Y')}.")
+        dal = al - datetime.timedelta(days=GANTT_REPARTO_MAX_GIORNI)
+    colleghi = st.selectbox("Collega", ["Tutto il reparto"] + nomi, key=f"{key_prefix}_reparto_collega")
+    nomi_gantt = nomi if colleghi == "Tutto il reparto" else [colleghi]
+    vista = "Linea del tempo"
+    if dal != al:
+        vista = st.radio("Vista", ["Linea del tempo", "Giorno per giorno"], horizontal=True, key=f"{key_prefix}_reparto_vista",
+                         help="Linea del tempo: una riga per collega lungo tutto il periodo. Giorno per giorno: una riga per giorno, con le ore della giornata.")
+    df_periodo = carica_timbrature_reparto(nomi_gantt, dal, al)
+    segmenti = [compute_commessa_gantt_segments(df_periodo, dal, al, n) for n in nomi_gantt]
     segmenti = [x for x in segmenti if not x.empty]
     if not segmenti:
-        st.info("Nessuna fase lavorata dal reparto in questo giorno.")
+        st.info("Nessuna fase lavorata in questo periodo.")
     else:
         gantt = pd.concat(segmenti, ignore_index=True)
-        grafico = alt.Chart(gantt).mark_bar().encode(
-            x=alt.X("start:T", title="Ora"), x2="end:T", y=alt.Y("Dipendente:N", title=None),
-            color=alt.Color("Commessa:N"), tooltip=["Dipendente:N", "Commessa:N", "Fase:N", "start:T", "end:T", "Ore:Q"]
-        ).properties(height=50 * len(nomi) + 80)
+        gantt = preparazione_gantt_reparto(gantt)
+        tooltip = ["Dipendente:N", "Commessa:N", "Fase:N", "Giorno:N", "start:T", "end:T", "Ore:Q"]
+        if vista == "Giorno per giorno":
+            grafico = alt.Chart(gantt).mark_bar().encode(
+                x=alt.X("ora_inizio:T", title="Ora del giorno", axis=alt.Axis(format="%H:%M")), x2="ora_fine:T",
+                y=alt.Y("Giorno:N", title=None, sort=alt.EncodingSortField(field="Data", order="ascending")),
+                color=alt.Color("Commessa:N"), tooltip=tooltip
+            ).properties(height=34 * gantt["Giorno"].nunique() + 80)
+        else:
+            grafico = alt.Chart(gantt).mark_bar().encode(
+                x=alt.X("start:T", title="Data e ora"), x2="end:T", y=alt.Y("Dipendente:N", title=None),
+                color=alt.Color("Commessa:N"), tooltip=tooltip
+            ).properties(height=50 * len(nomi_gantt) + 80)
         st.altair_chart(grafico, use_container_width=True)
         st.caption("Ogni barra è una fase timbrata (colore = commessa). Per le scadenze delle commesse del reparto vai su Commesse → Pianificazione.")
 
-    st.markdown("### ⏱️ Ore della settimana per collega e commessa")
-    lunedi = giorno - datetime.timedelta(days=giorno.weekday())
-    df_sett = carica_timbrature_reparto(nomi, lunedi, lunedi + datetime.timedelta(days=6))
-    ore = compute_hours_by_commessa(df_sett, lunedi, lunedi + datetime.timedelta(days=6)) if not df_sett.empty else pd.DataFrame()
+    st.markdown("### ⏱️ Ore per collega e commessa nel periodo")
+    ore = compute_hours_by_commessa(df_periodo, dal, al) if not df_periodo.empty else pd.DataFrame()
     if ore.empty:
-        st.info("Nessuna ora su commessa in questa settimana.")
+        st.info("Nessuna ora su commessa in questo periodo.")
     else:
-        st.caption(f"Settimana dal {lunedi.strftime('%d/%m')} al {(lunedi + datetime.timedelta(days=6)).strftime('%d/%m')}")
+        st.caption(f"Dal {dal.strftime('%d/%m/%Y')} al {al.strftime('%d/%m/%Y')}")
         st.dataframe(ore.pivot_table(index="Dipendente", columns="Commessa", values="Ore_lavorate", aggfunc="sum", fill_value=0), use_container_width=True)
+
 
 REPORT_PER_PAGINA = 10
 
