@@ -464,7 +464,8 @@ def init_db():
                         distanza_km REAL DEFAULT 0,
                         orario_fine_giornata TEXT DEFAULT '',
                         pausa_pranzo_inizio TEXT DEFAULT '',
-                        pausa_pranzo_fine TEXT DEFAULT ''
+                        pausa_pranzo_fine TEXT DEFAULT '',
+                        email TEXT DEFAULT ''
                     )''')
 
         # Migrazione: aggiungi le colonne livello (inquadramento CCNL), data di
@@ -476,6 +477,7 @@ def init_db():
             ("codice_fiscale", "TEXT DEFAULT ''"), ("data_nascita", "TEXT DEFAULT ''"),
             ("distanza_km", "REAL DEFAULT 0"), ("orario_fine_giornata", "TEXT DEFAULT ''"),
             ("pausa_pranzo_inizio", "TEXT DEFAULT ''"), ("pausa_pranzo_fine", "TEXT DEFAULT ''"),
+            ("email", "TEXT DEFAULT ''"),
         ]:
             try:
                 c.execute(f"ALTER TABLE utenti ADD COLUMN {colonna_utente} {tipo_colonna}")
@@ -726,8 +728,21 @@ def init_db():
                         Motivo TEXT,
                         Stato TEXT,
                         Data_richiesta TEXT,
-                        Approvato_da TEXT DEFAULT NULL
+                        Approvato_da TEXT DEFAULT NULL,
+                        Approvatore_Richiesto TEXT DEFAULT '',
+                        Commessa TEXT DEFAULT '',
+                        Fase TEXT DEFAULT ''
                     )''')
+        # Migrazione: chi deve approvare la correzione (il responsabile del reparto) si
+        # memorizza al momento della richiesta; il DB esistente non ha ancora la colonna.
+        # Idem per Commessa e Fase: una correzione di 'Inizio fase'/'Fine fase' deve dire su
+        # quale commessa e fase, altrimenti la timbratura registrata non finisce su nessuna.
+        for colonna_rett in ("Approvatore_Richiesto", "Commessa", "Fase"):
+            try:
+                c.execute(f"ALTER TABLE rettifiche ADD COLUMN {colonna_rett} TEXT DEFAULT ''")
+                conn.commit()
+            except db_migration_error_classes():
+                pass  # Colonna già esistente
 
         # Tabella Trasferte - programmate da chi fa parte dell'area Service (o
         # dall'admin) per un operatore scelto tra tutti i dipendenti. Il cliente si
@@ -1026,34 +1041,166 @@ def validate_timbratura(nome_dipendente, tipo_azione):
     
     return True, "", "Valida"
 
-def send_email(destinatario, oggetto, corpo):
-    """Invia una email (configurare credenziali SMTP)."""
+def _config_invio(nome, default=""):
+    """Valore di configurazione dell'invio email: prima variabile d'ambiente, poi Streamlit
+    Secrets (su Streamlit Cloud i Secrets sono il posto giusto per la password)."""
+    valore = os.getenv(nome)
+    if valore:
+        return valore
     try:
-        # CONFIGURARE QUESTI PARAMETRI CON LE CREDENZIALI AZIENDALI
-        SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-        SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-        EMAIL_SENDER = os.getenv("EMAIL_SENDER", "no-reply@azienda.com")
-        EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
-        
-        if not EMAIL_PASSWORD:
-            st.warning("⚠️ Email non configurate. Contatta l'amministratore.")
+        valore = st.secrets.get(nome)
+    except Exception:
+        valore = None
+    return str(valore) if valore else default
+
+def _http_post(url, dati, intestazioni):
+    """POST HTTP: restituisce (codice di stato, testo della risposta). Isolata in una funzione
+    per poterla sostituire nei test."""
+    richiesta = urllib.request.Request(url, data=dati, headers=intestazioni, method="POST")
+    try:
+        with urllib.request.urlopen(richiesta, timeout=20) as risposta:
+            return risposta.status, risposta.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+def _invia_via_graph(destinatari, oggetto, corpo, mittente, tenant, client_id, segreto):
+    """Invio con Microsoft Graph (Microsoft 365 / Outlook) con un'app registrata: non usa la
+    password della casella, quindi continua a funzionare quando Microsoft disattiva l'accesso
+    SMTP con password. Serve il permesso applicativo Mail.Send per la casella mittente."""
+    stato, testo = _http_post(
+        f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+        urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": client_id, "client_secret": segreto,
+                                "scope": "https://graph.microsoft.com/.default"}).encode(),
+        {"Content-Type": "application/x-www-form-urlencoded"})
+    if stato != 200:
+        raise RuntimeError(f"accesso a Microsoft 365 rifiutato (codice {stato}): controlla ID tenant, ID applicazione e segreto")
+    token = json.loads(testo)["access_token"]
+    messaggio = {"message": {"subject": oggetto, "body": {"contentType": "Text", "content": corpo},
+                             "toRecipients": [{"emailAddress": {"address": d}} for d in destinatari]},
+                 "saveToSentItems": True}
+    stato, testo = _http_post(
+        f"https://graph.microsoft.com/v1.0/users/{urllib.parse.quote(mittente)}/sendMail",
+        json.dumps(messaggio).encode("utf-8"),
+        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    if stato not in (200, 202):
+        raise RuntimeError(f"Microsoft 365 non ha accettato l'email (codice {stato}): {testo[:200]}")
+
+def send_email(destinatari, oggetto, corpo):
+    """Invia una email a uno o più indirizzi (stringa o lista). Restituisce True se è
+    partita. Se non riesce non interrompe la pagina: l'esito si mostra con notifica()
+    (un messaggio scritto subito sparirebbe col ricaricamento che segue).
+    Due modi, in base alla configurazione (variabili d'ambiente o Streamlit Secrets):
+    - Microsoft Graph, se ci sono GRAPH_TENANT_ID, GRAPH_CLIENT_ID e GRAPH_CLIENT_SECRET
+      (consigliato per Outlook / Microsoft 365);
+    - altrimenti SMTP (di base smtp.office365.com, porta 587) con EMAIL_SENDER e EMAIL_PASSWORD."""
+    if isinstance(destinatari, str):
+        destinatari = [destinatari]
+    destinatari = list(dict.fromkeys(d.strip() for d in destinatari if d and d.strip()))
+    if not destinatari:
+        return False
+    try:
+        EMAIL_SENDER = _config_invio("EMAIL_SENDER", "")
+        tenant, client_id, segreto = (_config_invio("GRAPH_TENANT_ID"), _config_invio("GRAPH_CLIENT_ID"), _config_invio("GRAPH_CLIENT_SECRET"))
+        if tenant and client_id and segreto:
+            if not EMAIL_SENDER:
+                raise RuntimeError("manca EMAIL_SENDER (la casella da cui partono le email)")
+            _invia_via_graph(destinatari, oggetto, corpo, EMAIL_SENDER, tenant, client_id, segreto)
+            return True
+
+        SMTP_SERVER = _config_invio("SMTP_SERVER", "smtp.office365.com")
+        SMTP_PORT = int(_config_invio("SMTP_PORT", "587"))
+        EMAIL_PASSWORD = _config_invio("EMAIL_PASSWORD", "")
+        if not EMAIL_SENDER or not EMAIL_PASSWORD:
+            notifica("⚠️ Le email non sono ancora configurate (mittente e password, o app Microsoft 365, nei Secrets): la richiesta è salvata, ma nessuna email è partita. Avvisa l'amministratore.", "warning")
             return False
-        
+
         msg = MIMEMultipart()
         msg['From'] = EMAIL_SENDER
-        msg['To'] = destinatario
+        msg['To'] = ", ".join(destinatari)
         msg['Subject'] = oggetto
-        msg.attach(MIMEText(corpo, 'plain'))
-        
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+        msg.attach(MIMEText(corpo, 'plain', 'utf-8'))
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20)
+        try:
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.send_message(msg, to_addrs=destinatari)
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
         return True
     except Exception as e:
-        st.error(f"Errore nell'invio email: {e}")
+        notifica(f"⚠️ Email non inviata ({type(e).__name__}: {e}). La richiesta è comunque salvata.", "warning")
         return False
+
+EMAIL_REGEX = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
+APPROVATORE_HR = "Risorse Umane"      # valore di Approvatore_Richiesto per le richieste ferie/permessi
+
+def email_valida(indirizzo):
+    """True se l'indirizzo è vuoto (campo facoltativo) o ha una forma plausibile."""
+    indirizzo = (indirizzo or "").strip()
+    return indirizzo == "" or bool(EMAIL_REGEX.match(indirizzo))
+
+def aggiorna_email_utente(username, email):
+    """Salva l'indirizzo email di un utente (lo può cambiare lui stesso dal Profilo).
+    Restituisce (ok, errore)."""
+    email = (email or "").strip()
+    if not email_valida(email):
+        return False, "L'indirizzo email non sembra valido (es. nome@azienda.com)."
+    try:
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE utenti SET email=? WHERE username=?", (email, username))
+            conn.commit()
+    except Exception as e:
+        return False, _errore_database_leggibile("salvare l'email", e)
+    return True, ""
+
+def get_email_utente(nome):
+    """(nome, email) del dipendente con quel nome; email vuota se non impostata."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, COALESCE(email,'') FROM utenti WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?))", (nome,))
+        riga = c.fetchone()
+    return (riga[0], (riga[1] or "").strip()) if riga else (nome, "")
+
+def _destinatari_da_query(query, params, escludi_nome=None):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute(query, params)
+        righe = c.fetchall()
+    escludi = (escludi_nome or "").strip().lower()
+    return [(n, (e or "").strip()) for n, e in righe if (n or "").strip().lower() != escludi]
+
+def get_destinatari_admin(escludi_nome=None):
+    """Amministratori [(nome, email)]: destinatari di riserva quando non c'è nessun altro."""
+    return _destinatari_da_query("SELECT nome, COALESCE(email,'') FROM utenti WHERE LOWER(COALESCE(role,'')) = 'admin' ORDER BY nome", (), escludi_nome)
+
+def get_destinatari_risorse_umane(escludi_nome=None):
+    """Chi approva ferie e permessi: i dipendenti dell'area Amministrazione (Risorse Umane),
+    senza il richiedente stesso. Se non ce n'è nessuno, gli amministratori."""
+    destinatari = _destinatari_da_query(
+        "SELECT nome, COALESCE(email,'') FROM utenti WHERE LOWER(TRIM(COALESCE(area,''))) = 'amministrazione' "
+        "AND LOWER(COALESCE(role,'')) IN ('user','responsabile') ORDER BY nome", (), escludi_nome)
+    return destinatari or get_destinatari_admin(escludi_nome)
+
+def get_destinatari_responsabili_area(area, escludi_nome=None):
+    """Responsabili del reparto indicato (chi approva le correzioni di timbratura), senza il
+    richiedente. Se il reparto non ha un responsabile, gli amministratori."""
+    destinatari = _destinatari_da_query(
+        "SELECT nome, COALESCE(email,'') FROM utenti WHERE LOWER(COALESCE(role,'')) = 'responsabile' "
+        "AND LOWER(TRIM(COALESCE(area,''))) = LOWER(TRIM(?)) ORDER BY nome", (area or "",), escludi_nome)
+    return destinatari or get_destinatari_admin(escludi_nome)
+
+def invia_email_a(destinatari, oggetto, corpo):
+    """Invia a [(nome, email)] e segnala (con notifica) chi non ha un indirizzo. True se
+    almeno una email è partita."""
+    senza = [n for n, e in destinatari if not e]
+    if senza:
+        notifica(f"✉️ Email non inviata a {', '.join(senza)}: manca l'indirizzo email (lo imposta l'amministratore in Utenti e password).", "warning")
+    return send_email([e for _, e in destinatari if e], oggetto, corpo)
 
 def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, _df_requests=None, df_ore_fasi_commessa=None):
     """Genera un rapporto PDF professionale. df_ore_fasi_commessa (facoltativo, da
@@ -3284,149 +3431,229 @@ def carica_richieste():
         df = pd.read_sql("SELECT * FROM richieste", conn)
     return df if not df.empty else pd.DataFrame(columns=REQUESTS_COLS)
 
+def _descrizione_richiesta(tipo, data_inizio, data_fine, ore_permesso):
+    """Riga di testo con il periodo richiesto, per le email."""
+    inizio, fine = str(data_inizio), str(data_fine)
+    if str(tipo).lower().startswith("permess"):
+        ore = f" ({ore_permesso} ore)" if str(ore_permesso or "").strip() else ""
+        return f"il {inizio}{ore}" if inizio == fine else f"dal {inizio} al {fine}{ore}"
+    return f"il {inizio}" if inizio == fine else f"dal {inizio} al {fine}"
+
 def salva_richiesta(dipendente, tipo, data_inizio, data_fine, ore_permesso, motivo, ruolo_richiedente="user"):
-    """Salva una richiesta con flusso di approvazione gerarchico:
-    - Se ruolo_richiedente = 'user': approva il responsabile dell'area
-    - Se ruolo_richiedente = 'responsabile': approva solo l'admin
-    """
+    """Salva una richiesta di ferie/permesso. Le richieste le approva Risorse Umane (chi fa
+    parte dell'area Amministrazione; l'amministratore può sempre farlo). Partono due email:
+    una a Risorse Umane con la richiesta da approvare e una al richiedente come conferma di
+    ricezione; l'esito arriverà poi a lui con aggiorna_stato_richiesta."""
     request_id = str(int(datetime.datetime.now().timestamp() * 1000))
     ore_str = str(ore_permesso) if ore_permesso else ""
     oggi_str = datetime.date.today().isoformat()
-    
-    # Determina l'approvatore in base al ruolo di chi fa la richiesta
-    if ruolo_richiedente == "responsabile":
-        approvatore_richiesto = "admin"  # I responsabili sono approvati direttamente dall'admin
-    else:
-        # Gli utenti normali vengono approvati dal responsabile della loro area
-        approvatore_richiesto = "admin"  # default
-        with db_connect() as conn:
-            c = conn.cursor()
-            # Leggi l'area del dipendente
-            c.execute("SELECT area FROM utenti WHERE nome = ?", (dipendente,))
-            area_result = c.fetchone()
-            
-            if area_result and area_result[0]:
-                dipendente_area = area_result[0]
-                # Cerca il responsabile di quella area
-                c.execute("SELECT nome FROM utenti WHERE role = 'responsabile' AND area = ?", (dipendente_area,))
-                resp_result = c.fetchone()
-                if resp_result:
-                    approvatore_richiesto = resp_result[0]
-    
+
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""INSERT INTO richieste 
                      (ID, Dipendente, Tipo, Data_inizio, Data_fine, Ore_permesso, Motivo, Stato, Data_richiesta, Approvatore_Richiesto) 
                      VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                  (request_id, dipendente, tipo, data_inizio.isoformat(), data_fine.isoformat(), 
-                   ore_str, motivo, "In attesa", oggi_str, approvatore_richiesto))
+                  (request_id, dipendente, tipo, data_inizio.isoformat(), data_fine.isoformat(),
+                   ore_str, motivo, "In attesa", oggi_str, APPROVATORE_HR))
         conn.commit()
-    
-    # 📧 Invia email di notifica all'approvatore appropriato
-    email_approvatore = approvatore_richiesto.replace(" ", ".").lower() + "@azienda.com"
-    oggetto = f"📋 Nuova richiesta {tipo} da {dipendente}"
-    corpo = f"""
-Ciao,
 
-{dipendente} ha inviato una nuova richiesta di {tipo.lower()}.
+    periodo = _descrizione_richiesta(tipo, data_inizio.isoformat(), data_fine.isoformat(), ore_str)
+    # 1) email a Risorse Umane: richiesta da approvare
+    corpo_hr = f"""Ciao,
+
+{dipendente} ha chiesto {tipo.lower()} {periodo}.
 
 Dettagli:
 - Dipendente: {dipendente}
 - Tipo: {tipo}
 - Data inizio: {data_inizio.isoformat()}
 - Data fine: {data_fine.isoformat()}
-- Motivo: {motivo}
-- Ore (se permesso): {ore_str}
+- Ore (se permesso): {ore_str or '-'}
+- Motivo: {motivo or '-'}
 
-Accedi al sistema per approvarla o rifiutarla.
+Per approvarla o rifiutarla apri Timbra e vai su Risorse umane → Ferie e permessi da approvare.
 
 Cordiali saluti,
 Sistema Timbrature
-    """
-    send_email(email_approvatore, oggetto, corpo)
-    
-    notifica("✅ Richiesta inviata correttamente. È in attesa di approvazione: la vedi nell'elenco qui sotto.")
+"""
+    invia_email_a(get_destinatari_risorse_umane(escludi_nome=dipendente), f"📋 Nuova richiesta di {tipo.lower()} da {dipendente}", corpo_hr)
+    # 2) email di conferma di ricezione al richiedente
+    corpo_dip = f"""Ciao {dipendente},
 
-def aggiorna_stato_richiesta(request_id, stato):
+abbiamo ricevuto la tua richiesta di {tipo.lower()} {periodo}.
+È ora in attesa di approvazione da parte di Risorse Umane: riceverai un'altra email con l'esito.
+
+Cordiali saluti,
+Sistema Timbrature
+"""
+    invia_email_a([get_email_utente(dipendente)], f"📨 Richiesta di {tipo.lower()} ricevuta", corpo_dip)
+
+    notifica("✅ Richiesta inviata correttamente. È in attesa di approvazione di Risorse Umane: la vedi nell'elenco qui sotto.")
+
+def aggiorna_stato_richiesta(request_id, stato, deciso_da=""):
+    """Approva o rifiuta una richiesta di ferie/permesso e avvisa il richiedente con una email."""
     with db_connect() as conn:
         c = conn.cursor()
-        # Recupera dati richiesta per inviare email
-        c.execute("SELECT Dipendente, Tipo, Data_inizio, Data_fine FROM richieste WHERE ID = ?", (str(request_id),))
+        c.execute("SELECT Dipendente, Tipo, Data_inizio, Data_fine, Ore_permesso FROM richieste WHERE ID = ?", (str(request_id),))
         row = c.fetchone()
-        
-        # Aggiorna stato
         c.execute("UPDATE richieste SET Stato = ? WHERE ID = ?", (stato, str(request_id)))
         conn.commit()
     get_mappa_assenze_approvate.clear()
 
-    # 📧 Invia email di notifica al dipendente
     if row:
-        dipendente, tipo_richiesta, data_inizio, data_fine = row
-        
-        # Recupera email del dipendente
-        with db_connect() as conn:
-            c = conn.cursor()
-            c.execute("SELECT username FROM utenti WHERE nome = ?", (dipendente,))
-            email_result = c.fetchone()
-            email_dipendente = email_result[0] + "@azienda.com" if email_result else None
-        
-        if email_dipendente:
-            emoji = "✅" if stato == "Approvato" else "❌"
-            oggetto = f"{emoji} {tipo_richiesta} - Richiesta {stato.lower()}"
-            corpo = f"""
-Ciao {dipendente},
+        dipendente, tipo_richiesta, data_inizio, data_fine, ore_permesso = row
+        emoji = "✅" if stato == "Approvato" else "❌"
+        esito = "approvata" if stato == "Approvato" else "rifiutata"
+        periodo = _descrizione_richiesta(tipo_richiesta, data_inizio, data_fine, ore_permesso)
+        corpo = f"""Ciao {dipendente},
 
-La tua richiesta di {tipo_richiesta.lower()} è stata {stato.lower()}.
+la tua richiesta di {str(tipo_richiesta).lower()} {periodo} è stata {esito}{f' da {deciso_da}' if deciso_da else ''}.
 
 Dettagli:
 - Tipo: {tipo_richiesta}
 - Dal: {data_inizio}
 - Al: {data_fine}
-- Stato: {stato}
+- Esito: {stato}
 
 Cordiali saluti,
-Amministrazione Timbrature
-            """
-            send_email(email_dipendente, oggetto, corpo)
+Risorse Umane - Sistema Timbrature
+"""
+        invia_email_a([get_email_utente(dipendente)], f"{emoji} {tipo_richiesta}: richiesta {esito}", corpo)
 
 # --- FUNZIONI RETTIFICHE TIMBRATURE ---
+# Le correzioni di timbratura le approva il responsabile del reparto del dipendente (se il
+# richiedente è lui stesso il responsabile, o il reparto non ne ha uno, l'amministratore).
 
-def salva_richiesta_rettifica(dipendente, azione, data_prevista, ora_prevista, motivo):
-    """Salva una richiesta di rettifica timbratura."""
+def get_area_utente(nome):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(area,'') FROM utenti WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?))", (nome,))
+        riga = c.fetchone()
+    return (riga[0] or "").strip() if riga else ""
+
+AZIONI_FASE = ("Inizio fase", "Fine fase")
+
+def render_selettore_fase_rettifica(azione, area, key_prefix):
+    """Per una correzione di 'Inizio fase' / 'Fine fase' chiede anche su cosa si lavorava
+    (commessa e fase, oppure attività di reparto, oppure Varie), perché la timbratura che
+    verrà registrata li contenga. Restituisce (commessa, fase); ('', '') per le altre azioni
+    o se non si è scelto nulla di valido."""
+    if azione not in AZIONI_FASE:
+        return "", ""
+    st.markdown("**Su cosa lavoravi?**")
+    tipo = st.radio("Tipo di attività", ["Commessa", "Attività di reparto", "Varie"], horizontal=True, key=f"{key_prefix}_rett_tipo")
+    if tipo == "Varie":
+        return ATTIVITA_VARIE, ATTIVITA_VARIE
+    if tipo == "Attività di reparto":
+        attivita = get_attivita_reparto(area)
+        if not attivita:
+            st.info("Il tuo reparto non ha attività fisse: scegli Commessa o Varie.")
+            return "", ""
+        return ATTIVITA_REPARTO, st.selectbox("Attività", attivita, key=f"{key_prefix}_rett_attivita")
+    if not get_commesse_names():
+        st.info("Nessuna commessa configurata.")
+        return "", ""
+    commessa = selettore_commessa_filtrato(f"{key_prefix}_rett", key_commessa=f"{key_prefix}_rett_commessa", etichetta="Commessa")
+    if not commessa:
+        return "", ""
+    fasi = list(dict.fromkeys(get_fasi_per_commessa_e_area(commessa, area) + fasi_virtuali_per_reparto(area)))
+    if not fasi:
+        fasi = list(dict.fromkeys(f[1] for f in get_fasi_commessa(commessa)))
+    if not fasi:
+        st.info("Questa commessa non ha fasi configurate.")
+        return "", ""
+    return commessa, st.selectbox("Fase", fasi, key=f"{key_prefix}_rett_fase")
+
+def salva_richiesta_rettifica(dipendente, azione, data_prevista, ora_prevista, motivo, commessa="", fase=""):
+    """Salva una richiesta di correzione timbratura e avvisa per email il responsabile del
+    reparto (che deve approvarla); al richiedente arriva una conferma di ricezione. Per le
+    correzioni di fase servono anche commessa e fase (vedi render_selettore_fase_rettifica)."""
+    if azione in AZIONI_FASE and not (commessa and fase):
+        notifica("Per correggere un inizio o una fine fase indica la commessa e la fase.", "error")
+        return False
     rettifica_id = str(int(datetime.datetime.now().timestamp() * 1000))
     oggi_str = datetime.date.today().isoformat()
+    destinatari = get_destinatari_responsabili_area(get_area_utente(dipendente), escludi_nome=dipendente)
+    approvatore = destinatari[0][0] if destinatari else "admin"
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""INSERT INTO rettifiche 
-                     (ID, Dipendente, Azione, Data_prevista, Ora_prevista, Motivo, Stato, Data_richiesta)
-                     VALUES (?,?,?,?,?,?,?,?)""",
-                  (rettifica_id, dipendente, azione, data_prevista.isoformat(), ora_prevista, motivo, "In attesa", oggi_str))
+                     (ID, Dipendente, Azione, Data_prevista, Ora_prevista, Motivo, Stato, Data_richiesta, Approvatore_Richiesto, Commessa, Fase)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                  (rettifica_id, dipendente, azione, data_prevista.isoformat(), ora_prevista, motivo, "In attesa", oggi_str, approvatore, commessa or "", fase or ""))
         conn.commit()
-    notifica("📝 Richiesta di correzione inviata. Resta in attesa di approvazione: la vedi nell'elenco qui sotto.")
+
+    corpo_resp = f"""Ciao,
+
+{dipendente} ha chiesto una correzione di timbratura.
+
+Dettagli:
+- Dipendente: {dipendente}
+- Azione da registrare: {azione}{f" ({commessa} → {fase})" if commessa else ""}
+- Data: {data_prevista.isoformat()}
+- Ora: {ora_prevista}
+- Motivo: {motivo or '-'}
+
+Per approvarla o rifiutarla apri Timbra → Il mio team → Presenze team → Correzioni da approvare.
+
+Cordiali saluti,
+Sistema Timbrature
+"""
+    invia_email_a(destinatari, f"📝 Richiesta di correzione timbratura da {dipendente}", corpo_resp)
+    corpo_dip = f"""Ciao {dipendente},
+
+abbiamo ricevuto la tua richiesta di correzione: {azione}{f" ({commessa} → {fase})" if commessa else ""} del {data_prevista.isoformat()} alle {ora_prevista}.
+È in attesa di approvazione del tuo responsabile: riceverai un'altra email con l'esito.
+
+Cordiali saluti,
+Sistema Timbrature
+"""
+    invia_email_a([get_email_utente(dipendente)], "📨 Richiesta di correzione timbratura ricevuta", corpo_dip)
+    notifica("📝 Richiesta di correzione inviata. Resta in attesa di approvazione del tuo responsabile: la vedi nell'elenco qui sotto.")
+    return True
 
 def carica_rettifiche():
     """Carica tutte le richieste di rettifica."""
     with db_connect() as conn:
         df = pd.read_sql("SELECT * FROM rettifiche", conn)
-    return df if not df.empty else pd.DataFrame(columns=["ID", "Dipendente", "Azione", "Data_prevista", "Ora_prevista", "Motivo", "Stato", "Data_richiesta", "Approvato_da"])
+    return df if not df.empty else pd.DataFrame(columns=["ID", "Dipendente", "Azione", "Data_prevista", "Ora_prevista", "Motivo", "Stato", "Data_richiesta", "Approvato_da", "Approvatore_Richiesto", "Commessa", "Fase"])
+
+def rettifiche_da_approvare(rettifiche, user_info, dipendenti_area=None):
+    """Correzioni in attesa che questo utente può approvare: l'amministratore le vede tutte;
+    il responsabile quelle del proprio reparto o a lui indirizzate, mai le proprie."""
+    if rettifiche.empty:
+        return rettifiche
+    in_attesa = rettifiche[rettifiche["Stato"] == "In attesa"]
+    if user_info["role"] == "admin":
+        return in_attesa
+    mio_nome = user_info["name"]
+    membri = set(dipendenti_area or [])
+    indirizzate = in_attesa["Approvatore_Richiesto"].fillna("") == mio_nome if "Approvatore_Richiesto" in in_attesa.columns else False
+    return in_attesa[((in_attesa["Dipendente"].isin(membri)) | indirizzate) & (in_attesa["Dipendente"] != mio_nome)]
 
 def approva_rettifica(rettifica_id, admin_username):
-    """Approva una rettifica e registra la timbratura."""
+    """Approva una rettifica, registra la timbratura e avvisa il dipendente per email."""
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("SELECT Dipendente, Azione, Data_prevista, Ora_prevista FROM rettifiche WHERE ID = ?", (rettifica_id,))
+        c.execute("SELECT Dipendente, Azione, Data_prevista, Ora_prevista, COALESCE(Commessa,''), COALESCE(Fase,''), Stato FROM rettifiche WHERE ID = ?", (rettifica_id,))
         row = c.fetchone()
         if not row:
-            st.error("Rettifica non trovata.")
+            notifica("Rettifica non trovata.", "error")
             return False
         
-        dipendente, azione, data_prevista, ora_prevista = row
+        dipendente, azione, data_prevista, ora_prevista, commessa_rett, fase_rett, stato_attuale = row
+        if stato_attuale != "In attesa":
+            notifica("Questa correzione è già stata decisa.", "warning")
+            return False
+        if (admin_username or "").strip().casefold() == (dipendente or "").strip().casefold():
+            notifica("Non puoi approvare una tua correzione: la deve approvare un'altra persona.", "error")
+            return False
         
-        # Registra la timbratura
+        # Registra la timbratura (con commessa e fase per le correzioni di fase)
         c.execute("""INSERT INTO timbrature 
                      (Data, Dipendente, Ora, Azione, Luogo, Dettaglio_Trasferta, Commessa, Fase, Dettaglio_Fase, Ruolo, Stato)
                      VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                  (data_prevista, dipendente, ora_prevista, azione, "Rettifica", "-", "", "", "", "", "Rettificata"))
+                  (data_prevista, dipendente, ora_prevista, azione, "Rettifica", "-", commessa_rett, fase_rett, "", "", "Rettificata"))
         
         # Aggiorna lo stato della rettifica
         c.execute("UPDATE rettifiche SET Stato = ?, Approvato_da = ? WHERE ID = ?",
@@ -3435,36 +3662,57 @@ def approva_rettifica(rettifica_id, admin_username):
     carica_dati_db.clear()  # è stata aggiunta una nuova timbratura (quella rettificata)
     _svuota_stato_timbratura()
 
-    # 📧 Invia email di notifica al dipendente
-    email_dipendente = dipendente.replace(" ", ".").lower() + "@azienda.com"
-    oggetto = "✅ Rettifica timbratura approvata"
-    corpo = f"""
-Ciao {dipendente},
+    corpo = f"""Ciao {dipendente},
 
-La tua richiesta di rettifica è stata approvata.
+la tua richiesta di correzione è stata approvata.
+
+Dettagli:
+- Azione: {azione}{f" ({commessa_rett} → {fase_rett})" if commessa_rett else ""}
+- Data: {data_prevista}
+- Ora: {ora_prevista}
+- Approvata da: {admin_username}
+
+La timbratura è stata registrata nel sistema.
+
+Cordiali saluti,
+Sistema Timbrature
+"""
+    invia_email_a([get_email_utente(dipendente)], "✅ Correzione timbratura approvata", corpo)
+    notifica("✅ Correzione approvata e timbratura registrata.")
+    return True
+
+def rifiuta_rettifica(rettifica_id, deciso_da=""):
+    """Rifiuta una rettifica e avvisa il dipendente per email."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT Dipendente, Azione, Data_prevista, Ora_prevista, Stato FROM rettifiche WHERE ID = ?", (rettifica_id,))
+        riga_db = c.fetchone()
+        if not riga_db or riga_db[4] != "In attesa":
+            notifica("Questa correzione è già stata decisa (o non esiste più).", "warning")
+            return
+        if (deciso_da or "").strip().casefold() == (riga_db[0] or "").strip().casefold():
+            notifica("Non puoi decidere su una tua correzione: la deve decidere un'altra persona.", "error")
+            return
+        row = riga_db[:4]
+        c.execute("UPDATE rettifiche SET Stato = ?, Approvato_da = ? WHERE ID = ?", ("Rifiutato", deciso_da or None, rettifica_id))
+        conn.commit()
+    if row:
+        dipendente, azione, data_prevista, ora_prevista = row
+        corpo = f"""Ciao {dipendente},
+
+la tua richiesta di correzione è stata rifiutata{f' da {deciso_da}' if deciso_da else ''}.
 
 Dettagli:
 - Azione: {azione}
 - Data: {data_prevista}
 - Ora: {ora_prevista}
-- Approvato da: {admin_username}
 
-La timbratura è stata registrata nel sistema.
+Per chiarimenti parla con il tuo responsabile.
 
 Cordiali saluti,
-Amministrazione Timbrature
-    """
-    send_email(email_dipendente, oggetto, corpo)
-    
-    notifica("✅ Correzione approvata e timbratura registrata.")
-    return True
-
-def rifiuta_rettifica(rettifica_id):
-    """Rifiuta una rettifica."""
-    with db_connect() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE rettifiche SET Stato = ? WHERE ID = ?", ("Rifiutato", rettifica_id))
-        conn.commit()
+Sistema Timbrature
+"""
+        invia_email_a([get_email_utente(dipendente)], "❌ Correzione timbratura rifiutata", corpo)
     notifica("❌ Correzione rifiutata.")
 
 # --- FUNZIONI TRASFERTE SERVICE E REPORT INTERVENTI ---
@@ -5619,7 +5867,8 @@ def render_mio_reparto(area, nome_utente, key_prefix):
     if dal != al:
         vista = st.radio("Vista", ["Linea del tempo", "Giorno per giorno"], horizontal=True, key=f"{key_prefix}_reparto_vista",
                          help="Linea del tempo: una riga per collega lungo tutto il periodo. Giorno per giorno: una riga per giorno, con le ore della giornata.")
-    df_periodo = carica_timbrature_reparto(nomi_gantt, dal, al)
+    # un giorno in più: l'uscita di un turno notturno cade il giorno dopo (vedi _assegna_turni_notturni)
+    df_periodo = carica_timbrature_reparto(nomi_gantt, dal, al + datetime.timedelta(days=1))
     segmenti = [compute_commessa_gantt_segments(df_periodo, dal, al, n) for n in nomi_gantt]
     segmenti = [x for x in segmenti if not x.empty]
     if not segmenti:
@@ -6072,33 +6321,96 @@ def attach_request_area(df_requests):
     df["Area"] = df["Dipendente"].map(get_users_area_map()).fillna("Unknown")
     return df
 
+# Giorni di ferie: si scalano solo i giorni lavorativi. Il sabato non è lavorativo
+# (settimana di 5 giorni; metti True se in azienda il sabato conta come giorno di ferie).
+SABATO_LAVORATIVO = False
+# Festività locali (es. il santo patrono) come coppie (mese, giorno): ((6, 13),) = 13 giugno.
+# Le festività nazionali sono già comprese (vedi festivita_italiane).
+FESTIVITA_LOCALI = ()
+
 def calculate_ferie_days(start_date, end_date):
+    """Giorni di ferie da scalare tra due date (estremi inclusi): solo i giorni lavorativi,
+    cioè senza domeniche, sabati (se SABATO_LAVORATIVO è False), festività nazionali e
+    festività locali (FESTIVITA_LOCALI)."""
     if pd.isna(start_date) or pd.isna(end_date) or end_date < start_date: return 0
-    return (end_date - start_date).days + 1
+    festivi = {}
+    giorni = 0
+    giorno = start_date
+    while giorno <= end_date:
+        if giorno.weekday() < 6 and (giorno.weekday() < 5 or SABATO_LAVORATIVO):
+            if giorno.year not in festivi:
+                festivi[giorno.year] = festivita_italiane(giorno.year)
+            if giorno not in festivi[giorno.year] and (giorno.month, giorno.day) not in FESTIVITA_LOCALI:
+                giorni += 1
+        giorno += datetime.timedelta(days=1)
+    return giorni
+
+NOTA_SALDI_FERIE = ("Disponibili = spettanza dell'anno secondo il livello CCNL del dipendente (impostabile in Utenti e password → Livelli CCNL), "
+                    "in proporzione ai mesi dalla data di assunzione. Le ferie si contano in giorni lavorativi: sabati, domeniche e festivi non vengono scalati.")
+
+def get_users_data_assunzione_map():
+    """Mappa {nome_dipendente: data di assunzione (date) o None}, una sola query."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, data_assunzione FROM utenti")
+        righe = c.fetchall()
+    mappa = {}
+    for nome, valore in righe:
+        try:
+            mappa[nome] = datetime.datetime.strptime(valore, "%Y-%m-%d").date() if valore else None
+        except (ValueError, TypeError):
+            mappa[nome] = None
+    return mappa
+
+def get_livelli_ferie_permessi_map():
+    """Mappa {livello: (ferie_giorni_anno, permesso_ore_anno)}, una sola query."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT livello, ferie_giorni_anno, permesso_ore_anno FROM livelli_ferie_permessi")
+        return {r[0]: (float(r[1]), float(r[2])) for r in c.fetchall()}
 
 def compute_leave_balances(df_requests, year=None, area="Tutte le aree"):
+    """Saldo ferie/permessi per dipendente nell'anno indicato (di base quello in corso).
+    Usa le stesse regole del cartellino mensile (compute_saldo_ferie_permessi_mensile): il
+    monte annuale è quello del livello CCNL del dipendente, in proporzione alla data di
+    assunzione, e le ferie si contano in giorni lavorativi."""
+    anno = year if year is not None else datetime.date.today().year
     requests = attach_request_area(df_requests)
     required_cols = ["Dipendente", "Stato", "Tipo", "Data_inizio", "Data_fine", "Ore_permesso"]
+    colonne = ["Dipendente", "Area", "Ferie disponibili", "Ferie usate", "Ferie residue", "Permesso ore disponibili", "Permesso ore usate", "Permesso ore residue"]
     if requests.empty or not all(col in requests.columns for col in required_cols):
-        return pd.DataFrame(columns=["Dipendente", "Area", "Ferie disponibili", "Ferie usate", "Ferie residue", "Permesso ore disponibili", "Permesso ore usate", "Permesso ore residue"])
-    if not requests.empty:
-        requests["Data_inizio"] = pd.to_datetime(requests["Data_inizio"], errors="coerce").dt.date
-        requests["Data_fine"] = pd.to_datetime(requests["Data_fine"], errors="coerce").dt.date
-    if year is not None: requests = requests[requests["Data_inizio"].apply(lambda d: pd.notna(d) and d.year == year)]
+        return pd.DataFrame(columns=colonne)
+    requests["Data_inizio"] = pd.to_datetime(requests["Data_inizio"], errors="coerce").dt.date
+    requests["Data_fine"] = pd.to_datetime(requests["Data_fine"], errors="coerce").dt.date
     if area != "Tutte le aree" and "Area" in requests.columns: requests = requests[requests["Area"] == area]
 
+    inizio_anno, fine_anno = datetime.date(anno, 1, 1), datetime.date(anno, 12, 31)
     rows = []
     mappa_aree = get_users_area_map()  # una sola query, invece di una per dipendente nel ciclo
+    mappa_livelli = get_users_livello_map()
+    mappa_ferie_livello = get_livelli_ferie_permessi_map()
+    mappa_assunzioni = get_users_data_assunzione_map()
     for name in get_users_in_area(area):
         area_name = mappa_aree.get(name, "Unknown")
-        user_requests = requests[(requests["Dipendente"] == name) & (requests["Stato"] == "Approvato")] if "Dipendente" in requests.columns else pd.DataFrame()
+        ferie_annue, permesso_annuo = mappa_ferie_livello.get(mappa_livelli.get(name, ""), (float(DEFAULT_FERIE_GIORNI), float(DEFAULT_PERMESSO_ORE)))
+        mesi = mesi_maturazione_nell_anno(mappa_assunzioni.get(name), anno, 12)
+        ferie_disponibili = round(ferie_annue / 12 * mesi, 2)
+        permesso_disponibile = round(permesso_annuo / 12 * mesi, 2)
+        user_requests = requests[(requests["Dipendente"] == name) & (requests["Stato"] == "Approvato")]
         ferie_presi = 0; permesso_ore_presi = 0.0
         for _, row in user_requests.iterrows():
-            if row["Tipo"] == "Ferie": ferie_presi += calculate_ferie_days(row["Data_inizio"], row["Data_fine"])
-            elif row["Tipo"] == "Permesso":
+            if pd.isna(row["Data_inizio"]) or pd.isna(row["Data_fine"]):
+                continue
+            if row["Tipo"] == "Ferie":
+                # solo i giorni che cadono nell'anno (una ferie a cavallo d'anno si divide)
+                ferie_presi += calculate_ferie_days(max(row["Data_inizio"], inizio_anno), min(row["Data_fine"], fine_anno))
+            elif row["Tipo"] == "Permesso" and row["Data_inizio"].year == anno:
                 try: permesso_ore_presi += float(row["Ore_permesso"]) if row["Ore_permesso"] else 0.0
-                except: pass
-        rows.append({"Dipendente": name, "Area": area_name, "Ferie disponibili": DEFAULT_FERIE_GIORNI, "Ferie usate": ferie_presi, "Ferie residue": max(DEFAULT_FERIE_GIORNI - ferie_presi, 0), "Permesso ore disponibili": DEFAULT_PERMESSO_ORE, "Permesso ore usate": round(permesso_ore_presi, 1), "Permesso ore residue": round(max(DEFAULT_PERMESSO_ORE - permesso_ore_presi, 0), 1)})
+                except (TypeError, ValueError): pass
+        rows.append({"Dipendente": name, "Area": area_name, "Ferie disponibili": ferie_disponibili, "Ferie usate": ferie_presi,
+                     "Ferie residue": round(max(ferie_disponibili - ferie_presi, 0), 2),
+                     "Permesso ore disponibili": permesso_disponibile, "Permesso ore usate": round(permesso_ore_presi, 1),
+                     "Permesso ore residue": round(max(permesso_disponibile - permesso_ore_presi, 0), 1)})
     return pd.DataFrame(rows)
 
 # --- LIVELLI CCNL E CARTELLINO MENSILE ---
@@ -6380,7 +6692,8 @@ def compute_saldo_ferie_permessi_mensile(df_requests, nome_dipendente, anno, mes
                 requests["Data_inizio"].apply(lambda d: pd.notna(d) and d.year == anno and d <= fine_periodo))
         for _, row in requests[mask].iterrows():
             if row["Tipo"] == "Ferie":
-                ferie_usate += calculate_ferie_days(row["Data_inizio"], row["Data_fine"])
+                # fino alla fine dell'anno (una ferie a cavallo d'anno conta solo per la parte di quest'anno)
+                ferie_usate += calculate_ferie_days(row["Data_inizio"], min(row["Data_fine"], datetime.date(anno, 12, 31)))
             elif row["Tipo"] == "Permesso":
                 try:
                     permesso_usate += float(row["Ore_permesso"]) if row["Ore_permesso"] else 0.0
@@ -7764,13 +8077,46 @@ def compute_kpi_summary(df_requests, year=None, area="Tutte le aree"):
             except: pass
     return {"Totale richieste": total, "Richieste approvate": approvate, "Richieste rifiutate": rifiutate, "Richieste in attesa": in_attesa, "Tasso approvazione": f"{round(approvate/total*100,1)}%" if total else "0%", "Giorni ferie approvati": ferie_giorni, "Ore permesso approvate": round(permesso_ore, 1)}
 
+def _assegna_turni_notturni(df):
+    """Un turno che attraversa la mezzanotte (Ingresso il giorno D, Uscita il giorno D+1)
+    viene attribuito per intero al giorno dell'Ingresso: ingresso, fasi, pause e uscita
+    finiscono nello stesso giorno di lavoro, così tutti i calcoli che abbinano le timbrature
+    giorno per giorno (ore, cartellino, fasi, Gantt) vedono il turno completo invece di un
+    ingresso senza uscita e di un'uscita senza ingresso. Il Timestamp resta quello reale.
+    Si sposta solo ciò che sta dopo un Ingresso rimasto aperto, entro TIMBRATURA_STALE_HOURS
+    (oltre quella soglia l'uscita si considera dimenticata, come nel resto dell'app)."""
+    if df.empty or not {"Dipendente", "Azione", "Timestamp", "Data"} <= set(df.columns):
+        return df
+    lavoro = df[["Dipendente", "Azione", "Timestamp"]].reset_index(drop=True)
+    lavoro["_pos"] = range(len(lavoro))
+    ordine = lavoro.sort_values(["Dipendente", "Timestamp"], kind="stable")
+    ts, dip, azione = ordine["Timestamp"], ordine["Dipendente"], ordine["Azione"]
+    ultimo_ingresso = ts.where(azione == "Ingresso").groupby(dip).ffill()
+    ultima_uscita = ts.where(azione == "Uscita").groupby(dip).ffill()
+    uscita_prima = ultima_uscita.groupby(dip).shift(1)                       # per una Uscita conta lo stato PRIMA di lei
+    riferimento = uscita_prima.where(azione == "Uscita", ultima_uscita)
+    aperto = ultimo_ingresso.notna() & (riferimento.isna() | (riferimento < ultimo_ingresso)) & (azione != "Ingresso")
+    entro_soglia = (ts - ultimo_ingresso) <= pd.Timedelta(hours=TIMBRATURA_STALE_HOURS)
+    sposta = (aperto & entro_soglia).to_numpy()
+    if not sposta.any():
+        return df
+    giorno_ingresso = ultimo_ingresso.dt.date
+    giorni = list(df["Data"])
+    posizioni = ordine["_pos"].to_numpy()
+    for k in range(len(ordine)):
+        if sposta[k] and pd.notna(giorno_ingresso.iloc[k]):
+            giorni[posizioni[k]] = giorno_ingresso.iloc[k]
+    df = df.copy()
+    df["Data"] = giorni
+    return df
+
 def normalize_datetime(df):
     if df.empty: return df
     df = df.copy()
     df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
     df["Ora"] = pd.to_datetime(df["Ora"], format="%H:%M:%S", errors="coerce").dt.time
     df["Timestamp"] = pd.to_datetime(df["Data"].astype(str) + " " + df["Ora"].astype(str), errors="coerce")
-    return df
+    return _assegna_turni_notturni(df)
 
 def compute_daily_work(df):
     """Ore lavorate per dipendente e giorno (Ingresso->Uscita) al netto della pausa
@@ -8833,26 +9179,96 @@ def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
     return scelta_a_pulsanti(categoria_scelta, pagine_categoria, f"{key_prefix}_pagina_{categoria_scelta}", "navpagine")
 
 
+def render_email_profilo(username, nome, key_prefix):
+    """Campo 'La tua email' del Profilo: ognuno inserisce il proprio indirizzo (non per tutti è
+    nome.cognome), usato per le email di richiesta ed esito di ferie, permessi e correzioni."""
+    attuale = get_email_utente(nome)[1]
+    nuova = st.text_input("La tua email", value=attuale, key=f"{key_prefix}_profilo_email",
+                          help="Ci arrivano le email di conferma e di esito delle tue richieste (ferie, permessi, correzioni timbrature).")
+    if not attuale:
+        st.caption("⚠️ Non hai ancora inserito la tua email: senza non ricevi le conferme delle tue richieste.")
+    if st.button("Salva email", key=f"{key_prefix}_profilo_email_salva"):
+        ok, errore = aggiorna_email_utente(username, nuova)
+        if ok:
+            notifica_e_ricarica("Email salvata.")
+        else:
+            st.error(errore)
+
+
+# --- FERIE E PERMESSI: PAGINA DI APPROVAZIONE (RISORSE UMANE) -----------------------
+def utente_e_risorse_umane(user_info):
+    """Vero per chi può approvare ferie e permessi: l'amministratore e chi fa parte dell'area
+    Amministrazione (Risorse Umane)."""
+    return user_info["role"] == "admin" or is_area_amministrazione(user_info.get("area"))
+
+def richieste_ferie_da_approvare(richieste, user_info):
+    """Richieste di ferie/permesso in attesa che questo utente può approvare. Le nuove
+    richieste sono indirizzate a Risorse Umane (mai approvabili dal richiedente stesso);
+    l'amministratore vede anche quelle storiche indirizzate a lui."""
+    if richieste.empty or "Approvatore_Richiesto" not in richieste.columns:
+        return richieste.iloc[0:0] if not richieste.empty else richieste
+    in_attesa = richieste["Stato"] == "In attesa"
+    if user_info["role"] == "admin":
+        return richieste[in_attesa & richieste["Approvatore_Richiesto"].isin(["admin", APPROVATORE_HR])]
+    if is_area_amministrazione(user_info.get("area")):
+        return richieste[in_attesa & (richieste["Approvatore_Richiesto"] == APPROVATORE_HR) & (richieste["Dipendente"] != user_info["name"])]
+    return richieste.iloc[0:0]
+
+def render_richieste_ferie_hr(user_info, key_prefix):
+    """Pagina 'Ferie e permessi da approvare' per Risorse Umane e amministratore: richieste in
+    attesa con approvazione/rifiuto (ogni decisione manda l'email di esito al dipendente),
+    storico delle decise e saldo ferie/permessi."""
+    st.subheader("🌴 Ferie e permessi da approvare")
+    if not utente_e_risorse_umane(user_info):
+        st.warning("Questa pagina è riservata a Risorse Umane.")
+        return
+    richieste = carica_richieste()
+    da_approvare = richieste_ferie_da_approvare(richieste, user_info)
+    if da_approvare.empty:
+        st.success("✅ Nessuna richiesta in attesa.")
+    else:
+        st.caption(LEGENDA_COLORI_RICHIESTE)
+        for _, r in da_approvare.iterrows():
+            with st.container(border=True):
+                periodo = _descrizione_richiesta(r["Tipo"], r["Data_inizio"], r["Data_fine"], r.get("Ore_permesso", ""))
+                st.markdown(f"**{r['Dipendente']}** — {r['Tipo']} {periodo}")
+                st.caption(f"Motivo: {r.get('Motivo') or '-'} · richiesta il {r.get('Data_richiesta') or '-'}")
+                col1, col2 = st.columns(2)
+                rid = str(r["ID"])
+                if col1.button("✅ Approva", key=f"{key_prefix}_ferie_ok_{rid}", use_container_width=True):
+                    aggiorna_stato_richiesta(rid, "Approvato", deciso_da=user_info["name"])
+                    notifica_e_ricarica(f"Richiesta di {r['Dipendente']} approvata: email di conferma inviata.")
+                if col2.button("❌ Rifiuta", key=f"{key_prefix}_ferie_no_{rid}", use_container_width=True):
+                    aggiorna_stato_richiesta(rid, "Rifiutato", deciso_da=user_info["name"])
+                    notifica_e_ricarica(f"Richiesta di {r['Dipendente']} rifiutata: email inviata.")
+    st.markdown("---")
+    st.markdown("**Richieste già decise**")
+    decise = richieste[(richieste["Stato"] != "In attesa")] if not richieste.empty else richieste
+    if decise.empty:
+        st.info("Nessuna richiesta decisa finora.")
+    else:
+        st.caption(LEGENDA_COLORI_RICHIESTE)
+        st.dataframe(evidenzia_richieste_per_stato(decise), use_container_width=True)
+    st.markdown("---")
+    st.markdown("**Saldo ferie e permessi**")
+    anno = st.number_input("Anno", min_value=2020, max_value=datetime.date.today().year + 1, value=datetime.date.today().year, key=f"{key_prefix}_anno_saldo_ferie")
+    st.caption(NOTA_SALDI_FERIE)
+    st.dataframe(compute_leave_balances(richieste, year=anno), use_container_width=True)
+
+
 # --- PAGINA INIZIALE "OGGI" ----------------------------------------------------------
 def _conta_da_approvare(user_info):
-    """(richieste ferie/permessi in attesa, correzioni timbrature in attesa) che spettano
-    a questo utente: all'amministratore quelle a lui dirette, al responsabile quelle dei
-    dipendenti della sua area che aspettano proprio lui."""
-    richieste = carica_richieste()
-    if richieste.empty:
-        n_richieste = 0
-    elif user_info["role"] == "admin":
-        mask = richieste.get("Approvatore_Richiesto", "admin") == "admin"
-        n_richieste = int(((richieste["Stato"] == "In attesa") & mask).sum())
-    else:
-        n_richieste = int(((richieste["Stato"] == "In attesa") & (richieste["Approvatore_Richiesto"] == user_info["name"])).sum())
+    """(richieste ferie/permessi in attesa, correzioni timbrature in attesa) che spettano a
+    questo utente: ferie e permessi a Risorse Umane (e all'amministratore), le correzioni al
+    responsabile del reparto (e all'amministratore)."""
+    n_richieste = len(richieste_ferie_da_approvare(carica_richieste(), user_info)) if utente_e_risorse_umane(user_info) else 0
     n_rettifiche = 0
-    if user_info["role"] == "admin":
-        rettifiche = carica_rettifiche()
-        n_rettifiche = int((rettifiche["Stato"] == "In attesa").sum()) if not rettifiche.empty else 0
+    if user_info["role"] in ("admin", "responsabile"):
+        membri = get_users_in_area(user_info["area"]) if user_info["role"] == "responsabile" else None
+        n_rettifiche = len(rettifiche_da_approvare(carica_rettifiche(), user_info, membri))
     return n_richieste, n_rettifiche
 
-def render_home(user_info, menu_prefix, azioni, mostra_stato_personale=True, mostra_panoramica=False, approvazioni=None):
+def render_home(user_info, menu_prefix, azioni, mostra_stato_personale=True, mostra_panoramica=False, approvazioni=None, profilo=None):
     """Pagina iniziale 'Oggi': in una schermata ciò che serve sapere e fare adesso.
     - stato della propria timbratura (in servizio / fase aperta / pausa) e prossime trasferte;
     - per chi approva: quante richieste aspettano una risposta (con il pulsante per andarci);
@@ -8862,6 +9278,13 @@ def render_home(user_info, menu_prefix, azioni, mostra_stato_personale=True, mos
     nome = user_info["name"]
     oggi = get_current_datetime().date()
     st.subheader("🏠 Oggi")
+    if not get_email_utente(nome)[1]:
+        if user_info["role"] == "admin":
+            st.warning("✉️ Il tuo utente non ha un indirizzo email: impostalo in Utenti e password.")
+        else:
+            st.warning("✉️ Non hai ancora inserito la tua email: senza non ricevi le conferme delle tue richieste.")
+            if profilo:
+                st.button("✉️ Inserisci la tua email", key=f"{menu_prefix}_home_email", on_click=vai_a_pagina, args=profilo)
     if mostra_stato_personale:
         if is_clocked_in(nome):
             fase = get_fase_aperta(nome)
@@ -8890,8 +9313,9 @@ def render_home(user_info, menu_prefix, azioni, mostra_stato_personale=True, mos
         if n_ric or n_ret:
             st.markdown("**Da approvare**")
             c1, c2 = st.columns(2)
-            c1.metric("Ferie/permessi in attesa", n_ric)
-            if user_info["role"] == "admin":
+            if utente_e_risorse_umane(user_info):
+                c1.metric("Ferie/permessi in attesa", n_ric)
+            if user_info["role"] in ("admin", "responsabile"):
                 c2.metric("Correzioni timbrature in attesa", n_ret)
         else:
             st.success("✅ Non hai richieste da approvare.")
@@ -8912,8 +9336,9 @@ def render_home(user_info, menu_prefix, azioni, mostra_stato_personale=True, mos
     for i, azione in enumerate(azioni):
         testo, sezione, pagina = azione[:3]
         modalita = azione[3] if len(azione) > 3 else None
+        prefisso = azione[4] if len(azione) > 4 else menu_prefix      # menu di destinazione, se è un altro (es. modalità del responsabile)
         colonne[i % 2].button(testo, key=f"{menu_prefix}_home_azione_{i}", use_container_width=True,
-                              on_click=vai_a_pagina, args=(menu_prefix, sezione, pagina, modalita))
+                              on_click=vai_a_pagina, args=(prefisso, sezione, pagina, modalita))
 
 
 # --- CONFERME CHE NON SPARISCONO ---------------------------------------------------
@@ -9088,43 +9513,7 @@ else:
                 st.info("Nessun dato valido per il Gantt in questo mese.")
 
         elif admin_page == "Richieste ferie/permessi":
-            st.write("### Gestione Richieste")
-            richieste = carica_richieste()
-            richieste = attach_request_area(richieste)
-            
-            # Filtra solo le richieste dirette all'admin (Approvatore_Richiesto = "admin")
-            richieste_per_admin = richieste[richieste.get("Approvatore_Richiesto", "admin") == "admin"]
-            richieste_in_attesa = richieste_per_admin[richieste_per_admin["Stato"] == "In attesa"]
-            
-            if richieste_in_attesa.empty:
-                st.info("Nessuna richiesta in attesa per te. Questo significa che i responsabili stanno già gestendo le loro aree.")
-            else:
-                st.caption(LEGENDA_COLORI_RICHIESTE)
-                st.dataframe(evidenzia_richieste_per_stato(richieste_in_attesa), use_container_width=True)
-                selected_id = st.selectbox("Seleziona ID richiesta da gestire", richieste_in_attesa["ID"].tolist())
-                col1, col2 = st.columns(2)
-                if col1.button("Approva"):
-                    aggiorna_stato_richiesta(selected_id, "Approvato")
-                    notifica_e_ricarica("Approvata!")
-                if col2.button("Rifiuta"):
-                    aggiorna_stato_richiesta(selected_id, "Rifiutato")
-                    notifica_e_ricarica("Richiesta rifiutata.")
-            
-            st.markdown("---")
-            st.subheader("ℹ️ Richieste da Responsabili (Escalate all'Admin)")
-            # Mostra le richieste dei responsabili (quelle che spettano direttamente all'admin)
-            richieste_resp_escalate = richieste[(richieste.get("Approvatore_Richiesto", "admin") == "admin") & 
-                                                (richieste["Stato"] != "In attesa")]
-            if richieste_resp_escalate.empty:
-                st.info("Nessuna richiesta escalata dai responsabili.")
-            else:
-                st.caption(LEGENDA_COLORI_RICHIESTE)
-                st.dataframe(evidenzia_richieste_per_stato(richieste_resp_escalate), use_container_width=True)
-
-            st.markdown("---")
-            st.subheader("Saldo ferie e permessi")
-            anno_saldo_admin = st.number_input("Anno", min_value=2020, max_value=datetime.date.today().year + 1, value=datetime.date.today().year, key="admin_anno_saldo_ferie")
-            st.dataframe(compute_leave_balances(carica_richieste(), year=anno_saldo_admin), use_container_width=True)
+            render_richieste_ferie_hr(user_info, key_prefix="admin")
 
         elif admin_page == "Rettifiche timbrature":
             st.write("### 📝 Gestione Rettifiche Timbrature")
@@ -9140,13 +9529,13 @@ else:
                 with col_ret1:
                     selected_rettifica = st.selectbox("Seleziona rettifica da approvare", rettifiche_in_attesa["ID"].tolist())
                     if st.button("✅ Approva"):
-                        approva_rettifica(selected_rettifica, st.session_state.username)
+                        approva_rettifica(selected_rettifica, user_info["name"])
                         st.rerun()
                 
                 with col_ret2:
                     selected_rettifica_rifiuta = st.selectbox("Seleziona rettifica da rifiutare", rettifiche_in_attesa["ID"].tolist(), key="rifiuta")
                     if st.button("❌ Rifiuta"):
-                        rifiuta_rettifica(selected_rettifica_rifiuta)
+                        rifiuta_rettifica(selected_rettifica_rifiuta, user_info["name"])
                         st.rerun()
             
             st.markdown("---")
@@ -9242,7 +9631,7 @@ else:
 
             # Carica elenco utenti live per gestirli
             with db_connect() as conn:
-                utenti_db = pd.read_sql("SELECT username, nome, role, area, posizione, livello, colore, data_assunzione, codice_fiscale, data_nascita, distanza_km FROM utenti", conn)
+                utenti_db = pd.read_sql("SELECT username, nome, email, role, area, posizione, livello, colore, data_assunzione, codice_fiscale, data_nascita, distanza_km FROM utenti", conn)
 
             livelli_disponibili = get_livelli_disponibili()
 
@@ -9254,6 +9643,7 @@ else:
             elif user_action == "Aggiungi utente":
                 new_username = st.text_input("Username (univoco)").lower().strip()
                 new_name = st.text_input("Nome completo")
+                new_email = st.text_input("Email", placeholder="nome@azienda.com", help="Serve per le email di richiesta ed esito di ferie, permessi e correzioni timbrature.").strip()
                 new_password = st.text_input("Password", type="password")
                 new_role = st.selectbox("Ruolo", ["user", "admin", "responsabile"])
                 new_area = st.text_input("Area").strip()
@@ -9265,12 +9655,14 @@ else:
                 if st.button("Salva nuovo utente nel DB"):
                     if not new_username or not new_password:
                         st.error("Username e Password sono obbligatori.")
+                    elif not email_valida(new_email):
+                        st.error("L'indirizzo email non sembra valido (es. nome@azienda.com).")
                     else:
                         try:
                             with db_connect() as conn:
                                 c = conn.cursor()
-                                c.execute("INSERT INTO utenti (username, nome, password, role, area, posizione, livello, colore, data_assunzione) VALUES (?,?,?,?,?,?,?,?,?)",
-                                          (new_username, new_name, hash_password(new_password), new_role, new_area, new_position, new_level, new_color, new_hire_date.isoformat()))
+                                c.execute("INSERT INTO utenti (username, nome, password, role, area, posizione, livello, colore, data_assunzione, email) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                          (new_username, new_name, hash_password(new_password), new_role, new_area, new_position, new_level, new_color, new_hire_date.isoformat(), new_email))
                                 conn.commit()
                             get_area_names.clear()
                             get_users_in_area.clear()
@@ -9280,6 +9672,9 @@ else:
 
             elif user_action == "Modifica password/ruolo":
                 selected_username = st.selectbox("Seleziona username", utenti_db["username"].tolist())
+                email_attuale = utenti_db.loc[utenti_db["username"] == selected_username, "email"].iloc[0] if selected_username in utenti_db["username"].tolist() else ""
+                nuova_email = st.text_input("Email", value=email_attuale or "", key=f"modifica_email_{selected_username}",
+                                            help="Serve per le email di richiesta ed esito di ferie, permessi e correzioni timbrature.").strip()
                 new_password = st.text_input("Nuova password (lascia vuoto per non cambiare)", type="password")
                 new_role = st.selectbox("Nuovo Ruolo", ["user", "admin", "responsabile"])
                 livello_attuale = utenti_db.loc[utenti_db["username"] == selected_username, "livello"].iloc[0] if selected_username in utenti_db["username"].tolist() else ""
@@ -9295,16 +9690,19 @@ else:
                 new_color = st.color_picker("Nuovo colore", value="#4fa8ff")
 
                 if st.button("Aggiorna utente"):
-                    with db_connect() as conn:
-                        c = conn.cursor()
-                        if new_password:
-                            c.execute("UPDATE utenti SET password=?, role=?, livello=?, colore=?, data_assunzione=? WHERE username=?", (hash_password(new_password), new_role, new_level, new_color, new_hire_date.isoformat(), selected_username))
-                        else:
-                            c.execute("UPDATE utenti SET role=?, livello=?, colore=?, data_assunzione=? WHERE username=?", (new_role, new_level, new_color, new_hire_date.isoformat(), selected_username))
-                        conn.commit()
-                    get_area_names.clear()
-                    get_users_in_area.clear()
-                    notifica_e_ricarica("Utente aggiornato!")
+                    if not email_valida(nuova_email):
+                        st.error("L'indirizzo email non sembra valido (es. nome@azienda.com).")
+                    else:
+                        with db_connect() as conn:
+                            c = conn.cursor()
+                            if new_password:
+                                c.execute("UPDATE utenti SET password=?, role=?, livello=?, colore=?, data_assunzione=?, email=? WHERE username=?", (hash_password(new_password), new_role, new_level, new_color, new_hire_date.isoformat(), nuova_email, selected_username))
+                            else:
+                                c.execute("UPDATE utenti SET role=?, livello=?, colore=?, data_assunzione=?, email=? WHERE username=?", (new_role, new_level, new_color, new_hire_date.isoformat(), nuova_email, selected_username))
+                            conn.commit()
+                        get_area_names.clear()
+                        get_users_in_area.clear()
+                        notifica_e_ricarica("Utente aggiornato!")
 
             elif user_action == "Elimina utente":
                 to_delete = st.selectbox("Utente da eliminare", [u for u in utenti_db["username"].tolist() if u != "admin"])
@@ -9437,11 +9835,14 @@ else:
             if pagina_utente == PAGINA_HOME:
                 azioni_resp = [
                     ("🕒 Timbra", "🕒 Timbra e ore", "Timbrature"),
-                    ("✅ Ferie e permessi da approvare", "🕒 Presenze team", "Richieste ferie/permessi", "Gestione Team"),
+                    ("✏️ Correzioni da approvare", "🕒 Presenze team", "Rettifiche timbrature", "Gestione Team", "resp_team_menu"),
                     ("👥 Il mio reparto", "👥 Il mio reparto", PAGINA_MIO_REPARTO),
                     ("🌴 Chiedi ferie o permessi", "🌴 Ferie e correzioni", "Richiesta ferie/permessi"),
                 ]
-                render_home(user_info, "resp_personale_menu", azioni_resp, approvazioni=True)
+                if is_area_amministrazione(user_info["area"]):
+                    azioni_resp.insert(1, ("✅ Ferie e permessi da approvare", "🧾 Risorse umane", "Richieste ferie/permessi", "👥 Risorse Umane", "resp_hr_menu"))
+                render_home(user_info, "resp_personale_menu", azioni_resp, approvazioni=True,
+                            profilo=("resp_personale_menu", "👤 Il mio profilo", "Profilo"))
 
             elif pagina_utente == PAGINA_MIO_REPARTO:
                 render_mio_reparto(user_info["area"], user_info["name"], key_prefix="resp_reparto")
@@ -9451,6 +9852,7 @@ else:
                 st.write(f"**Nome:** {dipendente_scelto}")
                 st.write(f"**Area:** {user_info['area']}")
                 st.write(f"**Ruolo:** {user_info['role']}")
+                render_email_profilo(st.session_state.username, dipendente_scelto, "resp")
                 st.markdown("---")
                 with st.form("change_password_form_resp"):
                     new_pw = st.text_input("Nuova password", type="password")
@@ -9557,6 +9959,8 @@ else:
                 data_inizio = st.date_input("Inizio")
                 data_fine = st.date_input("Fine") if tipo_richiesta == "Ferie" else data_inizio
                 ore_permesso = st.number_input("Ore", 0.5, 8.0, 0.5) if tipo_richiesta == "Permesso" else 8
+                if tipo_richiesta == "Ferie":
+                    st.caption(f"📅 Verranno scalati **{calculate_ferie_days(data_inizio, data_fine)}** giorni di ferie (sabati, domeniche e festivi non contano).")
                 motivo = st.text_area("Motivo")
                 
                 if st.button("Invia richiesta"):
@@ -9571,14 +9975,15 @@ else:
 
             elif pagina_utente == "Richiesta rettifica":
                 st.subheader("📝 Richiesta Rettifica Timbratura")
-                st.info("Hai dimenticato di timbrare? Richiedi una rettifica all'amministratore.")
+                st.info("Hai dimenticato di timbrare? Chiedi la correzione: la approva il tuo responsabile di reparto (l'amministratore se non ne hai uno) e ricevi l'esito per email.")
                 azione = st.selectbox("Azione", ["Ingresso", "Uscita", "Inizio fase", "Fine fase"])
+                commessa_rett, fase_rett = render_selettore_fase_rettifica(azione, user_info["area"], "resp_rett")
                 data_rettifica = st.date_input("Data da rettificare")
                 ora_rettifica = st.time_input("Ora")
                 motivo_rettifica = st.text_area("Motivo della rettifica")
                 if st.button("Invia richiesta di rettifica"):
-                    salva_richiesta_rettifica(dipendente_scelto, azione, data_rettifica, ora_rettifica.isoformat(), motivo_rettifica)
-                    st.rerun()
+                    if salva_richiesta_rettifica(dipendente_scelto, azione, data_rettifica, ora_rettifica.isoformat(), motivo_rettifica, commessa_rett, fase_rett):
+                        st.rerun()
                 
                 st.write("### Tutte le tue rettifiche")
                 st.dataframe(carica_rettifiche()[carica_rettifiche()["Dipendente"] == dipendente_scelto], use_container_width=True)
@@ -9613,52 +10018,61 @@ else:
                     st.info("Nessun dato disponibile.")
             
             elif resp_page == "Richieste ferie/permessi":
-                st.subheader("✅ Gestione Richieste Ferie/Permessi")
+                st.subheader("🌴 Ferie e permessi del team")
+                st.info("Le richieste di ferie e permessi vengono approvate da Risorse Umane (il richiedente riceve l'esito per email). Qui vedi cosa ha chiesto il tuo team.")
                 richieste = carica_richieste()
                 richieste_area = richieste[richieste["Dipendente"].isin(dipendenti_area)]
-                
-                # Filtra solo le richieste che spettano a questo responsabile
-                richieste_da_approvare = richieste_area[(richieste_area["Stato"] == "In attesa") & 
+                # Richieste storiche ancora indirizzate a questo responsabile (prima del passaggio a Risorse Umane)
+                richieste_da_approvare = richieste_area[(richieste_area["Stato"] == "In attesa") &
                                                         (richieste_area["Approvatore_Richiesto"] == user_info["name"])]
-                if richieste_da_approvare.empty:
-                    st.info("Nessuna richiesta in attesa da approvare.")
-                else:
+                if not richieste_da_approvare.empty:
+                    st.markdown("**Richieste arretrate indirizzate a te**")
                     st.caption(LEGENDA_COLORI_RICHIESTE)
                     st.dataframe(evidenzia_richieste_per_stato(richieste_da_approvare), use_container_width=True)
                     selected_id = st.selectbox("Seleziona richiesta da gestire", richieste_da_approvare["ID"].tolist())
                     col1, col2 = st.columns(2)
                     if col1.button("✅ Approva"):
-                        aggiorna_stato_richiesta(selected_id, "Approvato")
+                        aggiorna_stato_richiesta(selected_id, "Approvato", deciso_da=user_info["name"])
                         notifica_e_ricarica("Richiesta approvata!")
                     if col2.button("❌ Rifiuta"):
-                        aggiorna_stato_richiesta(selected_id, "Rifiutato")
+                        aggiorna_stato_richiesta(selected_id, "Rifiutato", deciso_da=user_info["name"])
                         notifica_e_ricarica("Richiesta rifiutata.")
-                
+                st.markdown("**Richieste del team**")
+                if richieste_area.empty:
+                    st.info("Il tuo team non ha ancora fatto richieste.")
+                else:
+                    st.caption(LEGENDA_COLORI_RICHIESTE)
+                    st.dataframe(evidenzia_richieste_per_stato(richieste_area), use_container_width=True)
+
                 st.markdown("---")
                 st.subheader("Saldo ferie e permessi - Team")
+                st.caption(NOTA_SALDI_FERIE)
                 st.dataframe(compute_leave_balances(richieste_area, year=datetime.date.today().year, area=area_responsabile), use_container_width=True)
             
             elif resp_page == "Rettifiche timbrature":
-                st.subheader("📝 Rettifiche Timbrature")
+                st.subheader("✏️ Correzioni di timbratura da approvare")
+                st.caption("Le richieste del tuo reparto arrivano anche per email. Approvando o rifiutando, il dipendente riceve l'esito per email.")
                 rettifiche = carica_rettifiche()
-                rettifiche_area = rettifiche[rettifiche["Dipendente"].isin(dipendenti_area)]
-                
-                rettifiche_in_attesa = rettifiche_area[rettifiche_area["Stato"] == "In attesa"]
+                rettifiche_in_attesa = rettifiche_da_approvare(rettifiche, user_info, dipendenti_area)
                 if rettifiche_in_attesa.empty:
-                    st.info("Nessuna rettifica in attesa dal tuo team.")
+                    st.success("✅ Nessuna correzione in attesa dal tuo team.")
                 else:
                     st.dataframe(rettifiche_in_attesa, use_container_width=True)
                     col_ret1, col_ret2 = st.columns(2)
                     with col_ret1:
                         selected_rettifica = st.selectbox("Seleziona rettifica da approvare", rettifiche_in_attesa["ID"].tolist())
                         if st.button("✅ Approva"):
-                            approva_rettifica(selected_rettifica, st.session_state.username)
+                            approva_rettifica(selected_rettifica, user_info["name"])
                             st.rerun()
                     with col_ret2:
                         selected_rettifica_rifiuta = st.selectbox("Seleziona rettifica da rifiutare", rettifiche_in_attesa["ID"].tolist(), key="rifiuta_resp")
                         if st.button("❌ Rifiuta"):
-                            rifiuta_rettifica(selected_rettifica_rifiuta)
+                            rifiuta_rettifica(selected_rettifica_rifiuta, user_info["name"])
                             st.rerun()
+                storico = rettifiche[rettifiche["Dipendente"].isin(dipendenti_area)] if not rettifiche.empty else rettifiche
+                if not storico.empty:
+                    st.markdown("**Storico del team**")
+                    st.dataframe(storico, use_container_width=True)
             
             elif resp_page == "Gestione fasi commessa":
                 render_gestione_fasi_commessa(scope_area=area_responsabile, allow_create_commessa=False, attore=st.session_state.username)
@@ -9770,9 +10184,15 @@ else:
                 render_situazione_service(key_prefix="resp_personale")
 
         elif modalita == "👥 Risorse Umane":
-            st.session_state["_ultima_pagina_vista"] = "Cartellini dipendenti"
-            df = carica_dati_db()
-            render_risorse_umane(df, key_prefix="resp_hr")
+            hr_page = render_menu_a_categorie([
+                ("🧾 Risorse umane", ["Richieste ferie/permessi", "Cartellini dipendenti"]),
+            ], key_prefix="resp_hr_menu", titolo_categoria="Risorse umane")
+            st.session_state["_ultima_pagina_vista"] = hr_page
+            if hr_page == "Richieste ferie/permessi":
+                render_richieste_ferie_hr(user_info, key_prefix="resp_hr")
+            else:
+                df = carica_dati_db()
+                render_risorse_umane(df, key_prefix="resp_hr")
 
         elif modalita == "💰 Gestione Costi":
             costi_page = render_menu_a_categorie([
@@ -9815,7 +10235,7 @@ else:
         categorie_utente.append(("👤 Io", ["Riepilogo personale", "Report mensile", "Richiesta ferie/permessi", "Richiesta rettifica", "Profilo"]))
         # Risorse umane / Costi compaiono solo per chi fa parte di quelle aree.
         if is_area_amministrazione(user_info["area"]):
-            categorie_utente.append(("🧾 Risorse umane", ["Cartellini dipendenti"]))
+            categorie_utente.append(("🧾 Risorse umane", ["Richieste ferie/permessi", "Cartellini dipendenti"]))
         if is_area_costi(user_info["area"]):
             categorie_utente.append(("💰 Costi e statistiche", ["💰 Costi commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]))
         pagina_utente = render_menu_a_categorie(
@@ -9823,7 +10243,7 @@ else:
         st.session_state["_ultima_pagina_vista"] = pagina_utente
         if pagina_utente not in ("Timbrature", PAGINA_HOME, PAGINA_MIO_REPARTO, PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE,
                                     PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA,
-                                    "Profilo", "Richiesta ferie/permessi", "Richiesta rettifica"):
+                                    "Profilo", "Richiesta ferie/permessi", "Richiesta rettifica", "Richieste ferie/permessi"):
             df = carica_dati_db()
 
         if pagina_utente == PAGINA_HOME:
@@ -9835,7 +10255,10 @@ else:
                 azioni_utente.append(("👥 Il mio reparto", "👥 Il mio reparto", PAGINA_MIO_REPARTO))
             azioni_utente += [("🌴 Chiedi ferie o permessi", "👤 Io", "Richiesta ferie/permessi"),
                               ("🏭 Le mie commesse", "🏭 Commesse", "Le mie Commesse")]
-            render_home(user_info, "user_menu", azioni_utente, mostra_panoramica=sono_service)
+            if is_area_amministrazione(user_info["area"]):
+                azioni_utente.insert(1, ("✅ Ferie e permessi da approvare", "🧾 Risorse umane", "Richieste ferie/permessi"))
+            render_home(user_info, "user_menu", azioni_utente, mostra_panoramica=sono_service, profilo=("user_menu", "👤 Io", "Profilo"),
+                        approvazioni=True if is_area_amministrazione(user_info["area"]) else None)
 
         elif pagina_utente == PAGINA_MIO_REPARTO:
             render_mio_reparto(user_info["area"], user_info["name"], key_prefix="user_reparto")
@@ -9845,6 +10268,7 @@ else:
             st.write(f"**Nome:** {dipendente_scelto}")
             st.write(f"**Area:** {user_info['area']}")
             st.write(f"**Ruolo:** {user_info['role']}")
+            render_email_profilo(st.session_state.username, dipendente_scelto, "user")
             st.markdown("---")
             with st.form("change_password_form"):
                 new_pw = st.text_input("Nuova password", type="password")
@@ -9908,6 +10332,7 @@ else:
             st.subheader("📊 Riepilogo personale: ferie, Gantt e statistiche")
             saldi_completi = compute_leave_balances(richieste, year=datetime.date.today().year)
             saldi_personali = saldi_completi[saldi_completi["Dipendente"] == dipendente_scelto]
+            st.caption(NOTA_SALDI_FERIE)
             st.dataframe(saldi_personali, use_container_width=True)
 
             # Periodo per riepilogo personale
@@ -10011,6 +10436,9 @@ else:
         elif pagina_utente == PAGINA_SITUAZIONE_SERVICE:
             render_situazione_service(key_prefix="user")
 
+        elif pagina_utente == "Richieste ferie/permessi":
+            render_richieste_ferie_hr(user_info, key_prefix="user_hr")
+
         elif pagina_utente == "Cartellini dipendenti":
             render_risorse_umane(df, key_prefix="user_hr")
 
@@ -10029,6 +10457,8 @@ else:
             data_inizio = st.date_input("Inizio")
             data_fine = st.date_input("Fine") if tipo_richiesta == "Ferie" else data_inizio
             ore_permesso = st.number_input("Ore", 0.5, 8.0, 0.5) if tipo_richiesta == "Permesso" else 8
+            if tipo_richiesta == "Ferie":
+                st.caption(f"📅 Verranno scalati **{calculate_ferie_days(data_inizio, data_fine)}** giorni di ferie (sabati, domeniche e festivi non contano).")
             motivo = st.text_area("Motivo")
             
             if st.button("Invia richiesta"):
@@ -10043,16 +10473,17 @@ else:
 
         elif pagina_utente == "Richiesta rettifica":
             st.subheader("📝 Richiesta Rettifica Timbratura")
-            st.info("Hai dimenticato di timbrare? Richiedi una rettifica all'amministratore.")
+            st.info("Hai dimenticato di timbrare? Chiedi la correzione: la approva il tuo responsabile di reparto (l'amministratore se non ne hai uno) e ricevi l'esito per email.")
             
             azione_rettifica = st.selectbox("Azione dimenticata", ["Ingresso", "Uscita", "Inizio fase", "Fine fase"])
+            commessa_rett, fase_rett = render_selettore_fase_rettifica(azione_rettifica, user_info["area"], "user_rett")
             data_rettifica = st.date_input("Data della timbratura dimenticata")
             ora_rettifica = st.time_input("Ora della timbratura dimenticata")
             motivo_rettifica = st.text_area("Motivo della dimenticanza")
             
             if st.button("Invia richiesta di rettifica"):
-                salva_richiesta_rettifica(dipendente_scelto, azione_rettifica, data_rettifica, ora_rettifica.strftime("%H:%M:%S"), motivo_rettifica)
-                st.rerun()
+                if salva_richiesta_rettifica(dipendente_scelto, azione_rettifica, data_rettifica, ora_rettifica.strftime("%H:%M:%S"), motivo_rettifica, commessa_rett, fase_rett):
+                    st.rerun()
             
             st.write("### Le tue richieste di rettifica")
             rettifiche_utente = carica_rettifiche()[carica_rettifiche()["Dipendente"] == dipendente_scelto]
