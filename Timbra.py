@@ -793,6 +793,10 @@ def init_db():
             # 1 = le ore di viaggio effettive si aggiungono al cartellino (l'operatore non
             # timbra in viaggio); 0 = sono solo un dato statistico (timbra già: niente doppio conteggio).
             ("viaggio_da_pagare", "INTEGER DEFAULT 0"),
+            # Dati strutturati del volo (compagnia, numero, aeroporti, orari, andata e ritorno,
+            # prenotazione) e dell'auto a noleggio, in formato JSON; le colonne dettaglio_aereo e
+            # dettaglio_auto_noleggio ne contengono il riassunto leggibile.
+            ("dati_volo", "TEXT"), ("dati_noleggio", "TEXT"),
         ]:
             try:
                 c.execute(f"ALTER TABLE trasferte ADD COLUMN {colonna_trasferta} {tipo_colonna}")
@@ -4388,6 +4392,195 @@ def suggerisci_mezzo(ore_andata, percorso_auto=True):
         return "Auto o Treno", f"{formatta_durata(ore)} in auto all'andata: valuta auto (con più giorni) o treno."
     return "Aereo", f"{formatta_durata(ore)} in auto all'andata: conviene l'aereo, con auto a noleggio sul posto."
 
+# --- CONSIGLIO DEL MEZZO (con durata del volo) E DATI DI VOLO / NOLEGGIO ---
+# Il consiglio parte dalla distanza in LINEA D'ARIA tra la sede e la destinazione: oltre
+# SOGLIA_AEREO_KM_LINEA il viaggio in auto non è proponibile (anche se la strada esistesse).
+# La durata del volo è una stima: velocità media e margine per decollo e atterraggio.
+SOGLIA_AEREO_KM_LINEA = 1500.0
+VELOCITA_MEDIA_VOLO_KMH = 800.0
+MARGINE_VOLO_ORE = 0.5
+ORE_SCALO_MIN, ORE_SCALO_MAX = 2.0, 4.0           # in più, se il volo non è diretto
+ORE_AEROPORTI_PORTA_A_PORTA = 4.0                 # check-in, controlli, bagagli e trasferimenti
+
+def _km_it(km):
+    return f"{float(km):,.0f}".replace(",", ".")
+
+def stima_ore_volo(km_aria):
+    """Durata indicativa di un volo diretto per quella distanza in linea d'aria, in ore
+    (arrotondata al quarto d'ora)."""
+    return round((float(km_aria) / VELOCITA_MEDIA_VOLO_KMH + MARGINE_VOLO_ORE) * 4) / 4
+
+def consiglia_mezzi(km_aria, ore_auto=None, percorso_auto=True):
+    """Consiglio sul modo di raggiungere la destinazione: dizionario con 'mezzi' (da
+    selezionare), 'principale', 'motivo', 'km_aria', 'ore_volo' (solo se si consiglia
+    l'aereo) e 'ore_auto'. Per l'aereo consiglia anche l'auto a noleggio, che serve per
+    muoversi sul posto."""
+    km_aria = float(km_aria)
+    esito = {"km_aria": km_aria, "ore_auto": ore_auto, "ore_volo": None}
+    def aereo(inizio):
+        volo = stima_ore_volo(km_aria)
+        esito.update(mezzi=["Aereo", "Auto a noleggio"], principale="Aereo", ore_volo=volo, motivo=(
+            f"{inizio} Volo diretto stimato: circa {formatta_durata(volo)} (con scalo di solito tra "
+            f"{formatta_durata(volo + ORE_SCALO_MIN)} e {formatta_durata(volo + ORE_SCALO_MAX)}); "
+            f"contando aeroporti e trasferimenti, porta a porta circa {formatta_durata(volo + ORE_AEROPORTI_PORTA_A_PORTA)}. "
+            "Sul posto serve un'auto a noleggio per muoversi."))
+        return esito
+    if percorso_auto is False or percorso_auto == 0:
+        return aereo(f"Fino a destinazione ({_km_it(km_aria)} km in linea d'aria) non c'è un percorso in auto.")
+    stimato = ore_auto is None
+    ore = float(ore_auto) if not stimato else km_aria * 1.3 / 75.0
+    if km_aria >= SOGLIA_AEREO_KM_LINEA or ore > SOGLIA_VIAGGIO_AEREO_ORE:
+        return aereo(f"La destinazione è a circa {_km_it(km_aria)} km in linea d'aria"
+                     + ("." if stimato else f" ({formatta_durata(ore)} in auto all'andata)."))
+    durata = f"{formatta_durata(ore)} in auto all'andata{' (stima)' if stimato else ''}"
+    if ore <= SOGLIA_VIAGGIO_AUTO_ORE:
+        esito.update(mezzi=["Auto"], principale="Auto", motivo=f"{durata}: conviene l'auto.")
+    else:
+        esito.update(mezzi=["Auto"], principale="Auto", motivo=f"{durata}: valuta l'auto (con più giorni) oppure il treno.")
+    return esito
+
+def calcola_consiglio_mezzi(destinazione, sede, impianto=None, destinazione_e_impianto=False):
+    """Consiglio del mezzo (vedi consiglia_mezzi) per andare dalla sede alla destinazione.
+    Usa le coordinate già salvate sull'impianto se la destinazione è il suo indirizzo,
+    altrimenti localizza il testo con OpenStreetMap. Solleva ErroreViaggio se non è possibile."""
+    if not (destinazione or "").strip():
+        raise ErroreViaggio("Indica lo Stato o l'indirizzo della trasferta.")
+    if sede.get("lat") is None or sede.get("lon") is None:
+        raise ErroreViaggio("La sede aziendale non è impostata (o non è stata localizzata): si imposta in 'Mappa impianti'.")
+    dati_noti = None
+    if destinazione_e_impianto and impianto and impianto.get("lat") is not None:
+        lat, lon = impianto["lat"], impianto["lon"]
+    else:
+        punto = geocodifica_indirizzo(destinazione)
+        if punto is None:
+            raise ErroreViaggio(f"Non trovo '{destinazione}' sulla mappa: scrivi anche città e Stato.")
+        lat, lon = punto[0], punto[1]
+    km_aria = distanza_in_linea_d_aria_km(sede["lat"], sede["lon"], lat, lon)
+    if km_aria >= SOGLIA_AEREO_KM_LINEA:
+        return consiglia_mezzi(km_aria)                     # troppo lontano per l'auto: niente calcolo del percorso
+    ore_auto, percorso = None, True
+    if destinazione_e_impianto and impianto and impianto.get("commessa"):
+        dati_noti = assicura_distanza_sede(impianto["commessa"])
+    if dati_noti and distanza_sede_valida(dati_noti, sede):
+        percorso = bool(dati_noti["percorso"])
+        ore_auto = float(dati_noti["ore"]) if percorso and dati_noti.get("ore") is not None else None
+    else:
+        try:
+            ore_auto = calcola_percorso_auto(sede["lat"], sede["lon"], lat, lon)[1]
+        except ErroreNessunPercorso:
+            percorso = False
+        except ErroreViaggio:
+            ore_auto = None                                  # servizio dei percorsi non raggiungibile: stima dalla distanza
+    return consiglia_mezzi(km_aria, ore_auto, percorso)
+
+_ORA_REGEX = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+def _testo(valore):
+    return " ".join(str(valore or "").split())
+
+def _data_breve(data_iso, ora=""):
+    try:
+        giorno = datetime.date.fromisoformat(str(data_iso)[:10]).strftime("%d/%m")
+    except ValueError:
+        giorno = ""
+    return " ".join(x for x in (giorno, _testo(ora)) if x)
+
+CAMPI_TRATTA_VOLO = ("compagnia", "numero", "da", "a", "partenza_data", "partenza_ora", "arrivo_data", "arrivo_ora")
+
+def _pulisci_tratta(t):
+    return {k: _testo((t or {}).get(k)) for k in CAMPI_TRATTA_VOLO}
+
+def pulisci_dati_volo(d):
+    """Dati di volo con i testi ripuliti: {'da_prenotare', 'prenotazione', 'andata': {...}, 'ritorno': {...} | None}."""
+    d = d or {}
+    ritorno = _pulisci_tratta(d.get("ritorno")) if d.get("ritorno") else None
+    if ritorno and not any(v for k, v in ritorno.items() if k not in ("partenza_data", "arrivo_data")) and not (ritorno["partenza_data"] and ritorno["partenza_ora"]):
+        ritorno = None                       # tratta di ritorno rimasta vuota
+    return {"da_prenotare": bool(d.get("da_prenotare")), "prenotazione": _testo(d.get("prenotazione")),
+            "andata": _pulisci_tratta(d.get("andata")), "ritorno": ritorno}
+
+def volo_ha_dati(d):
+    """True se per il volo è stato scritto qualcosa di utile (compagnia, numero, aeroporti o prenotazione)."""
+    d = pulisci_dati_volo(d)
+    a = d["andata"]
+    return bool(d["prenotazione"] or a["compagnia"] or a["numero"] or a["da"] or a["a"])
+
+def valida_dati_volo(d):
+    """(ok, errore) dei dati di volo: serve almeno qualcosa del volo di andata, oppure
+    'da prenotare'; gli orari devono essere nel formato ore:minuti."""
+    if not d:
+        return True, ""
+    d = pulisci_dati_volo(d)
+    if d["da_prenotare"]:
+        return True, ""
+    if not volo_ha_dati(d):
+        return False, "Per il volo indica almeno il numero (o la compagnia, o gli aeroporti) oppure spunta «Volo ancora da prenotare»."
+    for nome, t in (("andata", d["andata"]), ("ritorno", d["ritorno"])):
+        for campo in ("partenza_ora", "arrivo_ora"):
+            if t and t[campo] and not _ORA_REGEX.match(t[campo]):
+                return False, f"Orario del volo di {nome} non valido ('{t[campo]}'): scrivilo come ore:minuti, per esempio 09:45."
+    return True, ""
+
+def _riassunto_tratta(t):
+    if not t:
+        return ""
+    volo = " ".join(x for x in (t["compagnia"], t["numero"]) if x)
+    rotta = "→".join(x for x in (t["da"], t["a"]) if x)
+    p, a = _data_breve(t["partenza_data"], t["partenza_ora"]), _data_breve(t["arrivo_data"], t["arrivo_ora"])
+    orari = f"{p} → {a}" if (p and a) else (f"partenza {p}" if p else (f"arrivo {a}" if a else ""))
+    return " · ".join(x for x in (volo, rotta, orari) if x)
+
+def riassunto_volo(d):
+    """Testo breve dei dati di volo (per l'elenco delle trasferte); vuoto se non c'è nulla."""
+    if not d:
+        return ""
+    d = pulisci_dati_volo(d)
+    if d["da_prenotare"]:
+        return "Da prenotare"
+    parti = [_riassunto_tratta(d["andata"])]
+    if d["ritorno"]:
+        parti.append("Ritorno: " + _riassunto_tratta(d["ritorno"]))
+    if d["prenotazione"]:
+        parti.append(f"Pren. {d['prenotazione']}")
+    return " | ".join(x for x in parti if x and x != "Ritorno: ")
+
+def pulisci_dati_noleggio(d):
+    d = d or {}
+    campi = ("agenzia", "prenotazione", "ritiro_luogo", "ritiro_data", "ritiro_ora", "riconsegna_luogo", "riconsegna_data", "riconsegna_ora", "note")
+    return {"da_prenotare": bool(d.get("da_prenotare")), **{k: _testo(d.get(k)) for k in campi}}
+
+def valida_dati_noleggio(d):
+    if not d:
+        return True, ""
+    d = pulisci_dati_noleggio(d)
+    for campo, nome in (("ritiro_ora", "ritiro"), ("riconsegna_ora", "riconsegna")):
+        if d[campo] and not _ORA_REGEX.match(d[campo]):
+            return False, f"Orario di {nome} dell'auto a noleggio non valido ('{d[campo]}'): scrivilo come ore:minuti, per esempio 09:45."
+    return True, ""
+
+def riassunto_noleggio(d):
+    """Testo breve dei dati dell'auto a noleggio (colonna 'Note noleggio' dell'elenco)."""
+    if not d:
+        return ""
+    d = pulisci_dati_noleggio(d)
+    if d["da_prenotare"]:
+        return "Da prenotare" + (f" · {d['note']}" if d["note"] else "")
+    ritiro = " ".join(x for x in (d["ritiro_luogo"], _data_breve(d["ritiro_data"], d["ritiro_ora"])) if x)
+    riconsegna = " ".join(x for x in (d["riconsegna_luogo"], _data_breve(d["riconsegna_data"], d["riconsegna_ora"])) if x)
+    parti = [d["agenzia"], f"Pren. {d['prenotazione']}" if d["prenotazione"] else "", f"ritiro: {ritiro}" if ritiro else "",
+             f"riconsegna: {riconsegna}" if riconsegna else "", d["note"]]
+    return " · ".join(x for x in parti if x)
+
+def _json_dati(d):
+    return json.dumps(d, ensure_ascii=False) if d else ""
+
+def _leggi_json_dati(testo):
+    try:
+        d = json.loads(testo) if testo else None
+    except (TypeError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
 def nome_impianto_predefinito(tipologia, cliente):
     """Nome proposto per un impianto quando non ne è stato scritto uno: tipo di impianto e
     cliente presi dalla commessa (es. 'Forno - Panificio Rossi'). Vuoto se mancano entrambi."""
@@ -4942,7 +5135,7 @@ def valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezio
     if "Treno" in mezzi_selezionati and not str(dettaglio_treno or "").strip():
         return False, "Inserisci il numero del treno."
     if "Aereo" in mezzi_selezionati and not str(dettaglio_aereo or "").strip():
-        return False, "Inserisci il numero del volo."
+        return False, "Inserisci i dati del volo (almeno il numero) oppure spunta «Volo ancora da prenotare»."
     return True, ""
 
 def _errore_database_leggibile(azione, e):
@@ -4951,20 +5144,39 @@ def _errore_database_leggibile(azione, e):
     testo = " ".join(str(e).split())[:300]
     return f"Impossibile {azione}: errore del database ({type(e).__name__}: {testo}). Riprova; se si ripete segnala questo messaggio."
 
+def _dati_volo_noleggio_per_salvataggio(mezzi, dati_volo, dati_noleggio, dettaglio_aereo, dettaglio_noleggio):
+    """Se ci sono dati strutturati (e il mezzo è selezionato) il riassunto prende il posto del
+    testo libero; se il mezzo non è selezionato i dati non si salvano."""
+    if "Aereo" not in mezzi:
+        dati_volo = None
+    elif dati_volo is not None:
+        dati_volo = pulisci_dati_volo(dati_volo)
+        dettaglio_aereo = riassunto_volo(dati_volo)
+    if "Auto a noleggio" not in mezzi:
+        dati_noleggio = None
+    elif dati_noleggio is not None:
+        dati_noleggio = pulisci_dati_noleggio(dati_noleggio)
+        dettaglio_noleggio = riassunto_noleggio(dati_noleggio)
+    return dati_volo, dati_noleggio, dettaglio_aereo, dettaglio_noleggio
+
 def crea_trasferta(dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi_selezionati,
                     dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio,
-                    note, creata_da, viaggio=None):
+                    note, creata_da, viaggio=None, dati_volo=None, dati_noleggio=None):
     """Programma una nuova trasferta per un operatore, su una commessa (da cui si
     ricava il cliente), con uno o più mezzi di trasporto insieme (es. aereo per
     arrivare + auto a noleggio per muoversi sul posto). 'viaggio' (facoltativo) è il
-    viaggio previsto, vedi render_stima_viaggio. Restituisce (ok, errore)."""
+    viaggio previsto, vedi render_stima_viaggio. 'dati_volo' e 'dati_noleggio' (facoltativi) sono i
+    dati strutturati di volo e auto a noleggio: se presenti il riassunto sostituisce il testo
+    libero. Restituisce (ok, errore)."""
+    dati_volo, dati_noleggio, dettaglio_aereo, dettaglio_auto_noleggio = _dati_volo_noleggio_per_salvataggio(
+        mezzi_selezionati, dati_volo, dati_noleggio, dettaglio_aereo, dettaglio_auto_noleggio)
     ok, errore = valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati,
                                    dettaglio_auto, dettaglio_treno, dettaglio_aereo)
     if not ok:
         return False, errore
-    ok, errore = valida_viaggio(viaggio)
-    if not ok:
-        return False, errore
+    for controllo in (valida_dati_volo(dati_volo), valida_dati_noleggio(dati_noleggio), valida_viaggio(viaggio)):
+        if not controllo[0]:
+            return False, controllo[1]
     try:
         cliente = get_cliente_commessa(commessa)
     except Exception as e:
@@ -4979,6 +5191,7 @@ def crea_trasferta(dipendente, data_inizio, data_fine, commessa, stato, indirizz
         "dettaglio_treno": str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
         "dettaglio_aereo": str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
         "dettaglio_auto_noleggio": str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
+        "dati_volo": _json_dati(dati_volo), "dati_noleggio": _json_dati(dati_noleggio),
         "note": str(note or "").strip(), "creata_da": creata_da, "data_creazione": datetime.date.today().isoformat(),
     }
     # Colonne vecchie: un database creato con una versione precedente del programma ha
@@ -5016,8 +5229,9 @@ def get_trasferte_dettaglio():
                                     commessa AS Commessa, cliente AS Cliente, stato AS Stato, indirizzo AS Indirizzo,
                                     albergo AS Albergo, mezzi AS Mezzi, dettaglio_auto AS Targa,
                                     CASE WHEN auto_propria=1 THEN 'Sì' ELSE 'No' END AS 'Auto propria',
-                                    dettaglio_treno AS 'Numero treno', dettaglio_aereo AS 'Numero volo',
-                                    dettaglio_auto_noleggio AS 'Note noleggio', note AS Note, creata_da AS 'Programmata da',
+                                    dettaglio_treno AS 'Numero treno', dettaglio_aereo AS 'Volo',
+                                    dettaglio_auto_noleggio AS 'Auto a noleggio', note AS Note, creata_da AS 'Programmata da',
+                                    (SELECT COUNT(*) FROM report_interventi r WHERE r.trasferta_id = trasferte.id) AS 'Rapporti ricevuti',
                                     viaggio_partenza AS 'Viaggio da', viaggio_ore_teoriche AS 'Ore viaggio previste',
                                     viaggio_ore_effettive AS 'Ore viaggio effettive',
                                     CASE WHEN viaggio_da_pagare=1 THEN 'Sì' ELSE 'No' END AS 'Viaggio nel cartellino'
@@ -5060,14 +5274,16 @@ def get_trasferta_by_id(trasferta_id):
         c.execute("""SELECT dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi,
                             dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio, note,
                             viaggio_partenza, viaggio_destinazione, viaggio_partenza_dt, viaggio_km, viaggio_ore_andata,
-                            viaggio_andata_ritorno, viaggio_ore_teoriche, viaggio_ore_effettive, viaggio_da_pagare
+                            viaggio_andata_ritorno, viaggio_ore_teoriche, viaggio_ore_effettive, viaggio_da_pagare,
+                            dati_volo, dati_noleggio
                      FROM trasferte WHERE id = ?""", (trasferta_id,))
         riga = c.fetchone()
     if not riga:
         return None
     (dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo, mezzi,
      dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo, dettaglio_auto_noleggio, note,
-     v_partenza, v_destinazione, v_partenza_dt, v_km, v_ore_andata, v_ar, v_ore_teoriche, v_ore_effettive, v_da_pagare) = riga
+     v_partenza, v_destinazione, v_partenza_dt, v_km, v_ore_andata, v_ar, v_ore_teoriche, v_ore_effettive, v_da_pagare,
+     json_volo, json_noleggio) = riga
     try:
         v_dt = datetime.datetime.fromisoformat(str(v_partenza_dt)) if v_partenza_dt else None
     except ValueError:
@@ -5090,13 +5306,15 @@ def get_trasferta_by_id(trasferta_id):
         "dettaglio_treno": dettaglio_treno or "",
         "dettaglio_aereo": dettaglio_aereo or "",
         "dettaglio_auto_noleggio": dettaglio_auto_noleggio or "",
+        "dati_volo": _leggi_json_dati(json_volo),
+        "dati_noleggio": _leggi_json_dati(json_noleggio),
         "note": note or "",
     }
 
 
 def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commessa, stato, indirizzo, albergo,
                         mezzi_selezionati, dettaglio_auto, auto_propria, dettaglio_treno, dettaglio_aereo,
-                        dettaglio_auto_noleggio, note, viaggio="invariato"):
+                        dettaglio_auto_noleggio, note, viaggio="invariato", dati_volo=None, dati_noleggio=None):
     """Modifica una trasferta già programmata, ad esempio per correggere un errore di
     data, indirizzo, albergo o mezzo scoperto dopo la creazione. A differenza della
     cancellazione, la modifica è permessa anche se la trasferta ha già un report
@@ -5104,10 +5322,15 @@ def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commess
     dipendente non è modificabile da qui: se serve cambiare operatore conviene
     eliminare la trasferta (se non ha ancora un report collegato) e ricrearla.
     Restituisce (ok, errore)."""
+    dati_volo, dati_noleggio, dettaglio_aereo, dettaglio_auto_noleggio = _dati_volo_noleggio_per_salvataggio(
+        mezzi_selezionati, dati_volo, dati_noleggio, dettaglio_aereo, dettaglio_auto_noleggio)
     ok, errore = valida_trasferta(dipendente, data_inizio, data_fine, commessa, mezzi_selezionati,
                                    dettaglio_auto, dettaglio_treno, dettaglio_aereo)
     if not ok:
         return False, errore
+    for controllo in (valida_dati_volo(dati_volo), valida_dati_noleggio(dati_noleggio)):
+        if not controllo[0]:
+            return False, controllo[1]
     if viaggio != "invariato":
         ok, errore = valida_viaggio(viaggio)
         if not ok:
@@ -5118,7 +5341,7 @@ def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commess
             c = conn.cursor()
             c.execute("""UPDATE trasferte SET data_inizio=?, data_fine=?, commessa=?, cliente=?, stato=?, indirizzo=?,
                                 albergo=?, mezzi=?, dettaglio_auto=?, auto_propria=?, dettaglio_treno=?, dettaglio_aereo=?,
-                                dettaglio_auto_noleggio=?, note=? WHERE id=?""",
+                                dettaglio_auto_noleggio=?, dati_volo=?, dati_noleggio=?, note=? WHERE id=?""",
                       (data_inizio.isoformat(), data_fine.isoformat(), commessa, cliente,
                        str(stato or "").strip(), str(indirizzo or "").strip(), str(albergo or "").strip(),
                        ",".join(mezzi_selezionati),
@@ -5127,6 +5350,7 @@ def aggiorna_trasferta(trasferta_id, dipendente, data_inizio, data_fine, commess
                        str(dettaglio_treno or "").strip() if "Treno" in mezzi_selezionati else "",
                        str(dettaglio_aereo or "").strip() if "Aereo" in mezzi_selezionati else "",
                        str(dettaglio_auto_noleggio or "").strip() if "Auto a noleggio" in mezzi_selezionati else "",
+                       _json_dati(dati_volo), _json_dati(dati_noleggio),
                        str(note or "").strip(), trasferta_id))
             righe_modificate = c.rowcount
             _svuota_cache_ore_viaggio()          # la data di inizio potrebbe essere cambiata
@@ -5445,6 +5669,114 @@ def compute_disponibilita_giornaliera(data_riferimento, area_filter=None):
                           "Stato": "In sede", "Dettaglio": ""})
     return pd.DataFrame(righe)
 
+def _applica_mezzi_consigliati(chiave_mezzi, mezzi):
+    st.session_state[chiave_mezzi] = list(mezzi)
+
+def render_consiglio_mezzi(key_prefix, destinazione, chiave_mezzi, impianto=None, destinazione_e_impianto=False):
+    """Riquadro 'Mezzo consigliato' del passo 3: confronta sede e destinazione (distanza in linea
+    d'aria e, se serve, tempo in auto) e dice se conviene auto, treno o aereo, con la durata
+    stimata del volo. Il calcolo si rifà solo se cambia la destinazione; il pulsante seleziona
+    in un colpo i mezzi consigliati (es. Aereo + Auto a noleggio)."""
+    destinazione = (destinazione or "").strip()
+    if not destinazione:
+        st.caption("💡 Scrivi lo Stato o l'indirizzo qui sopra: ti dico se conviene auto, treno o aereo.")
+        return None
+    chiave = f"{key_prefix}_consiglio_mezzi"
+    memo = st.session_state.get(chiave)
+    if not memo or memo.get("destinazione") != destinazione:
+        with st.spinner("Calcolo il mezzo consigliato..."):
+            try:
+                memo = {"destinazione": destinazione, "consiglio": calcola_consiglio_mezzi(
+                    destinazione, get_sede_aziendale(), impianto, destinazione_e_impianto)}
+            except ErroreViaggio as e:
+                memo = {"destinazione": destinazione, "errore": str(e)}
+            except Exception as e:                      # mai bloccare il modulo per un consiglio
+                memo = {"destinazione": destinazione, "errore": f"calcolo non riuscito ({type(e).__name__})"}
+        st.session_state[chiave] = memo
+    if memo.get("errore"):
+        st.caption(f"💡 Non riesco a consigliarti il mezzo: {memo['errore']}")
+        st.button("🔄 Riprova", key=f"{chiave}_riprova", on_click=lambda: st.session_state.pop(chiave, None))
+        return None
+    c = memo["consiglio"]
+    st.info(f"💡 **Mezzo consigliato: {' + '.join(c['mezzi'])}**\n\n{c['motivo']}")
+    if c.get("ore_volo"):
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Distanza in linea d'aria", f"{_km_it(c['km_aria'])} km")
+        col2.metric("Volo diretto (stima)", formatta_durata(c["ore_volo"]))
+        col3.metric("Porta a porta (stima)", formatta_durata(c["ore_volo"] + ORE_AEROPORTI_PORTA_A_PORTA))
+        st.caption("Stima indicativa: la durata reale dipende da rotta, vento e scali; gli orari e i prezzi li trovi sul sito della compagnia.")
+    if sorted(st.session_state.get(chiave_mezzi, [])) != sorted(c["mezzi"]):
+        st.button(f"✅ Seleziona {' + '.join(c['mezzi'])}", key=f"{chiave}_usa", on_click=_applica_mezzi_consigliati, args=(chiave_mezzi, c["mezzi"]))
+    return c
+
+def _data_da_iso(testo, default):
+    try:
+        return datetime.date.fromisoformat(str(testo)[:10])
+    except ValueError:
+        return default
+
+def _blocco_tratta_volo(k, titolo, iniziale, data_default):
+    st.markdown(f"**{titolo}**")
+    iniziale = iniziale or {}
+    col1, col2, col3 = st.columns(3)
+    compagnia = col1.text_input("Compagnia", value=iniziale.get("compagnia", ""), key=f"{k}_compagnia", placeholder="es. ITA Airways")
+    numero = col2.text_input("Numero volo", value=iniziale.get("numero", ""), key=f"{k}_numero", placeholder="es. AZ608")
+    da = col3.text_input("Da (aeroporto)", value=iniziale.get("da", ""), key=f"{k}_da", placeholder="es. VCE Venezia")
+    col4, col5, col6 = st.columns(3)
+    a = col4.text_input("A (aeroporto)", value=iniziale.get("a", ""), key=f"{k}_a", placeholder="es. JFK New York")
+    p_data = col5.date_input("Giorno di partenza", value=_data_da_iso(iniziale.get("partenza_data"), data_default), key=f"{k}_p_data")
+    p_ora = col6.text_input("Ora di partenza (hh:mm)", value=iniziale.get("partenza_ora", ""), key=f"{k}_p_ora", placeholder="09:45")
+    col7, col8, _col9 = st.columns(3)
+    a_data = col7.date_input("Giorno di arrivo", value=_data_da_iso(iniziale.get("arrivo_data"), p_data), key=f"{k}_a_data")
+    a_ora = col8.text_input("Ora di arrivo (hh:mm, ora locale)", value=iniziale.get("arrivo_ora", ""), key=f"{k}_a_ora", placeholder="13:30")
+    return {"compagnia": compagnia, "numero": numero, "da": da, "a": a,
+            "partenza_data": p_data.isoformat() if p_data else "", "partenza_ora": p_ora,
+            "arrivo_data": a_data.isoformat() if a_data else "", "arrivo_ora": a_ora}
+
+def render_dati_volo(key_prefix, iniziale, data_inizio, data_fine, ore_volo=None):
+    """Scheda 'Dati del volo': volo di andata (compagnia, numero, aeroporti, giorno e ora di
+    partenza e arrivo), volo di ritorno facoltativo, codice di prenotazione, oppure
+    'ancora da prenotare'. Restituisce il dizionario da salvare (vedi pulisci_dati_volo)."""
+    iniziale = pulisci_dati_volo(iniziale) if iniziale else {}
+    k = f"{key_prefix}_volo"
+    st.markdown("**✈️ Dati del volo**")
+    if ore_volo:
+        st.caption(f"Durata stimata di un volo diretto: circa {formatta_durata(ore_volo)}.")
+    da_prenotare = st.checkbox("Volo ancora da prenotare (inserirò i dati più avanti)", value=bool(iniziale.get("da_prenotare")), key=f"{k}_da_prenotare")
+    if da_prenotare:
+        return {"da_prenotare": True}
+    prenotazione = st.text_input("Codice di prenotazione", value=iniziale.get("prenotazione", ""), key=f"{k}_pren")
+    andata = _blocco_tratta_volo(f"{k}_andata", "Volo di andata", iniziale.get("andata"), data_inizio)
+    con_ritorno = st.checkbox("Aggiungi il volo di ritorno", value=bool(iniziale.get("ritorno")), key=f"{k}_con_ritorno")
+    ritorno = _blocco_tratta_volo(f"{k}_ritorno", "Volo di ritorno", iniziale.get("ritorno"), data_fine) if con_ritorno else None
+    return {"da_prenotare": False, "prenotazione": prenotazione, "andata": andata, "ritorno": ritorno}
+
+def render_dati_noleggio(key_prefix, iniziale, data_inizio, data_fine, con_volo=False):
+    """Scheda 'Auto a noleggio': agenzia, prenotazione, luogo e momento di ritiro e di
+    riconsegna, note; oppure 'ancora da prenotare'. Facoltativa."""
+    iniziale = pulisci_dati_noleggio(iniziale) if iniziale else {}
+    k = f"{key_prefix}_noleggio"
+    st.markdown("**🚗 Auto a noleggio**")
+    da_prenotare = st.checkbox("Auto ancora da prenotare", value=bool(iniziale.get("da_prenotare")), key=f"{k}_da_prenotare")
+    if da_prenotare:
+        note = st.text_input("Note (opzionale)", value=iniziale.get("note", ""), key=f"{k}_note_dp")
+        return {"da_prenotare": True, "note": note}
+    col1, col2 = st.columns(2)
+    agenzia = col1.text_input("Agenzia di noleggio", value=iniziale.get("agenzia", ""), key=f"{k}_agenzia", placeholder="es. Hertz")
+    prenotazione = col2.text_input("Codice di prenotazione", value=iniziale.get("prenotazione", ""), key=f"{k}_pren")
+    col3, col4, col5 = st.columns(3)
+    r_luogo = col3.text_input("Ritiro: dove", value=iniziale.get("ritiro_luogo", "") or ("Aeroporto di arrivo" if con_volo else ""), key=f"{k}_r_luogo")
+    r_data = col4.date_input("Ritiro: giorno", value=_data_da_iso(iniziale.get("ritiro_data"), data_inizio), key=f"{k}_r_data")
+    r_ora = col5.text_input("Ritiro: ora (hh:mm)", value=iniziale.get("ritiro_ora", ""), key=f"{k}_r_ora", placeholder="14:30")
+    col6, col7, col8 = st.columns(3)
+    c_luogo = col6.text_input("Riconsegna: dove", value=iniziale.get("riconsegna_luogo", "") or ("Aeroporto di partenza" if con_volo else ""), key=f"{k}_c_luogo")
+    c_data = col7.date_input("Riconsegna: giorno", value=_data_da_iso(iniziale.get("riconsegna_data"), data_fine), key=f"{k}_c_data")
+    c_ora = col8.text_input("Riconsegna: ora (hh:mm)", value=iniziale.get("riconsegna_ora", ""), key=f"{k}_c_ora", placeholder="10:00")
+    note = st.text_input("Note (opzionale)", value=iniziale.get("note", ""), key=f"{k}_note")
+    return {"da_prenotare": False, "agenzia": agenzia, "prenotazione": prenotazione,
+            "ritiro_luogo": r_luogo, "ritiro_data": r_data.isoformat() if r_data else "", "ritiro_ora": r_ora,
+            "riconsegna_luogo": c_luogo, "riconsegna_data": c_data.isoformat() if c_data else "", "riconsegna_ora": c_ora, "note": note}
+
 def render_nuova_trasferta(attore_nome, key_prefix):
     """Sotto-pagina 'Programmazione nuova Trasferta': scelta dell'operatore tra
     tutti i dipendenti, della commessa (da cui si ricava il cliente), del luogo di
@@ -5493,11 +5825,16 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     albergo_trasf = st.text_input("Albergo (nome e/o indirizzo)", key=f"{key_prefix}_trasf_albergo")
 
     st.markdown("##### 3️⃣ Come ci va")
+    destinazione_consiglio = ", ".join(x for x in (indirizzo_trasf, stato_trasf) if (x or "").strip())
+    indirizzo_e_quello_dell_impianto = bool(indirizzo_impianto_default) and (indirizzo_trasf or "").strip().casefold() == indirizzo_impianto_default.casefold()
+    consiglio_trasf = render_consiglio_mezzi(f"{key_prefix}_trasf", destinazione_consiglio, f"{key_prefix}_trasf_mezzi",
+                                             impianto=impianto_trasf, destinazione_e_impianto=indirizzo_e_quello_dell_impianto)
     st.caption("Puoi selezionarne più di uno: es. Aereo per arrivare e Auto a noleggio per muoversi una volta lì.")
     mezzi_scelti_trasf = st.multiselect("Seleziona uno o più mezzi", MEZZI_TRASPORTO_DISPONIBILI, key=f"{key_prefix}_trasf_mezzi")
 
     dettaglio_auto_trasf, auto_propria_trasf = "", False
     dettaglio_treno_trasf, dettaglio_aereo_trasf, dettaglio_noleggio_trasf = "", "", ""
+    dati_volo_trasf, dati_noleggio_trasf = None, None
 
     if "Auto" in mezzi_scelti_trasf:
         col_auto1, col_auto2 = st.columns(2)
@@ -5508,12 +5845,17 @@ def render_nuova_trasferta(attore_nome, key_prefix):
     if "Treno" in mezzi_scelti_trasf:
         dettaglio_treno_trasf = st.text_input("Numero treno", key=f"{key_prefix}_trasf_treno")
     if "Aereo" in mezzi_scelti_trasf:
-        dettaglio_aereo_trasf = st.text_input("Numero volo", key=f"{key_prefix}_trasf_volo")
+        with st.container(border=True):
+            dati_volo_trasf = render_dati_volo(f"{key_prefix}_trasf", None, data_inizio_trasf, data_fine_trasf,
+                                               ore_volo=(consiglio_trasf or {}).get("ore_volo"))
+            dettaglio_aereo_trasf = riassunto_volo(dati_volo_trasf)
     if "Auto a noleggio" in mezzi_scelti_trasf:
-        dettaglio_noleggio_trasf = st.text_input("Note auto a noleggio (agenzia, prenotazione, ecc. - opzionale)", key=f"{key_prefix}_trasf_noleggio")
+        with st.container(border=True):
+            dati_noleggio_trasf = render_dati_noleggio(f"{key_prefix}_trasf", None, data_inizio_trasf, data_fine_trasf,
+                                                       con_volo="Aereo" in mezzi_scelti_trasf)
+            dettaglio_noleggio_trasf = riassunto_noleggio(dati_noleggio_trasf)
 
     st.markdown("##### 4️⃣ Viaggio e ore pagate (facoltativo)")
-    indirizzo_e_quello_dell_impianto = bool(indirizzo_impianto_default) and (indirizzo_trasf or "").strip().casefold() == indirizzo_impianto_default.casefold()
     with st.expander("Calcola il tempo di viaggio e decidi se pagarlo", expanded=False):
         viaggio_trasf = render_stima_viaggio(f"{key_prefix}_trasf", destinazione_trasferta=", ".join(x for x in (indirizzo_trasf, stato_trasf) if (x or "").strip()),
                                              data_default=data_inizio_trasf,
@@ -5533,7 +5875,8 @@ def render_nuova_trasferta(attore_nome, key_prefix):
         ok, errore = crea_trasferta(operatore_scelto, data_inizio_trasf, data_fine_trasf, commessa_scelta_trasf,
                                      stato_trasf, indirizzo_trasf, albergo_trasf, mezzi_scelti_trasf,
                                      dettaglio_auto_trasf, auto_propria_trasf, dettaglio_treno_trasf,
-                                     dettaglio_aereo_trasf, dettaglio_noleggio_trasf, note_trasf, attore_nome, viaggio=viaggio_trasf)
+                                     dettaglio_aereo_trasf, dettaglio_noleggio_trasf, note_trasf, attore_nome, viaggio=viaggio_trasf,
+                                     dati_volo=dati_volo_trasf, dati_noleggio=dati_noleggio_trasf)
         if ok:
             for chiave_viaggio in (f"{key_prefix}_trasf_viaggio_stima", f"{key_prefix}_trasf_viaggio_ver"):
                 st.session_state.pop(chiave_viaggio, None)     # la prossima trasferta riparte senza la stima di questa
@@ -5542,16 +5885,42 @@ def render_nuova_trasferta(attore_nome, key_prefix):
             st.error(errore)
 
 
-def render_trasferte_programmate(key_prefix):
-    """Sotto-pagina 'Trasferte programmate': elenco di tutte le trasferte già
-    programmate, con la possibilità di modificarle (utile anche dopo che hanno
-    già un report intervento collegato) o eliminarle (se non hanno ancora un
-    report collegato)."""
-    st.subheader("🧳 Trasferte programmate")
+def separa_trasferte_per_periodo(trasferte_df, periodo, oggi=None):
+    """Aggiunge la colonna 'Situazione' (Da fare / In corso / Conclusa) e tiene solo le trasferte
+    del periodo richiesto: 'da_fare' = non ancora finite (la prossima per prima), 'effettuate' =
+    concluse (la più recente per prima), 'tutte' = senza filtro. Per le concluse la colonna
+    'Rapporto' dice se l'operatore ha già inviato il rapporto di intervento."""
+    oggi = (oggi or datetime.date.today()).isoformat()
+    df = trasferte_df.copy()
+    if df.empty:
+        return df
+    dal, al = df["Dal"].astype(str).str[:10], df["Al"].astype(str).str[:10]
+    df.insert(df.columns.get_loc("Al") + 1, "Situazione", ["Conclusa" if a < oggi else ("Da fare" if d > oggi else "In corso") for d, a in zip(dal, al)])
+    if "Rapporti ricevuti" in df.columns:
+        n = pd.to_numeric(df["Rapporti ricevuti"], errors="coerce").fillna(0)
+        df.insert(df.columns.get_loc("Situazione") + 1, "Rapporto", ["✅ ricevuto" if x > 0 else ("⚠️ mancante" if s_ == "Conclusa" else "") for x, s_ in zip(n, df["Situazione"])])
+    if periodo == "da_fare":
+        df = df[df["Situazione"] != "Conclusa"].sort_values(["Dal", "ID"], ascending=[True, True])
+    elif periodo == "effettuate":
+        df = df[df["Situazione"] == "Conclusa"].sort_values(["Al", "ID"], ascending=[False, False])
+    return df.reset_index(drop=True)
+
+def render_trasferte_programmate(key_prefix, periodo="tutte"):
+    """Sotto-pagine dell'elenco trasferte: 'da_fare' (in programma o in corso) ed 'effettuate'
+    (concluse), oppure 'tutte'. Permettono di modificare una trasferta (utile anche dopo che
+    ha già un report intervento collegato) o eliminarla (se non ha ancora un report collegato)."""
+    titoli = {"da_fare": "📅 Trasferte da fare", "effettuate": "✅ Trasferte effettuate", "tutte": "🧳 Trasferte programmate"}
+    vuoti = {"da_fare": "Nessuna trasferta da fare: programmane una da «Programma una trasferta».",
+             "effettuate": "Nessuna trasferta ancora conclusa.", "tutte": "Nessuna trasferta programmata."}
+    st.subheader(titoli.get(periodo, titoli["tutte"]))
+    if periodo == "da_fare":
+        st.caption("Quelle in programma e quelle in corso (la prossima per prima). Quando finiscono passano in «Trasferte effettuate».")
+    elif periodo == "effettuate":
+        st.caption("Le trasferte concluse, la più recente per prima. «Rapporto» dice se l'operatore ha già inviato il rapporto di intervento.")
     commesse_disponibili_trasf = get_commesse_names()
-    trasferte_df = get_trasferte_dettaglio()
+    trasferte_df = separa_trasferte_per_periodo(get_trasferte_dettaglio(), periodo)
     if trasferte_df.empty:
-        st.info("Nessuna trasferta programmata.")
+        st.info(vuoti.get(periodo, vuoti["tutte"]))
     else:
         st.dataframe(trasferte_df, use_container_width=True)
 
@@ -5611,11 +5980,22 @@ def render_trasferte_programmate(key_prefix):
                                                     key=f"{key_prefix}_trasf_mod_auto_propria_{trasferta_id_modifica}")
             if "Treno" in mezzi_mod:
                 dettaglio_treno_mod = st.text_input("Numero treno", value=dettaglio_treno_mod, key=f"{key_prefix}_trasf_mod_treno_{trasferta_id_modifica}")
+            dati_volo_mod, dati_noleggio_mod = None, None
             if "Aereo" in mezzi_mod:
-                dettaglio_aereo_mod = st.text_input("Numero volo", value=dettaglio_aereo_mod, key=f"{key_prefix}_trasf_mod_volo_{trasferta_id_modifica}")
+                iniziale_volo = dati_mod["dati_volo"]
+                if iniziale_volo is None and dettaglio_aereo_mod:       # trasferta salvata con il solo numero del volo
+                    iniziale_volo = {"andata": {"numero": dettaglio_aereo_mod}}
+                with st.container(border=True):
+                    dati_volo_mod = render_dati_volo(f"{key_prefix}_trasf_mod_{trasferta_id_modifica}", iniziale_volo, data_inizio_mod, data_fine_mod)
+                    dettaglio_aereo_mod = riassunto_volo(dati_volo_mod)
             if "Auto a noleggio" in mezzi_mod:
-                dettaglio_noleggio_mod = st.text_input("Note auto a noleggio (agenzia, prenotazione, ecc. - opzionale)",
-                                                        value=dettaglio_noleggio_mod, key=f"{key_prefix}_trasf_mod_noleggio_{trasferta_id_modifica}")
+                iniziale_noleggio = dati_mod["dati_noleggio"]
+                if iniziale_noleggio is None and dettaglio_noleggio_mod:   # trasferta salvata con note libere
+                    iniziale_noleggio = {"note": dettaglio_noleggio_mod}
+                with st.container(border=True):
+                    dati_noleggio_mod = render_dati_noleggio(f"{key_prefix}_trasf_mod_{trasferta_id_modifica}", iniziale_noleggio,
+                                                             data_inizio_mod, data_fine_mod, con_volo="Aereo" in mezzi_mod)
+                    dettaglio_noleggio_mod = riassunto_noleggio(dati_noleggio_mod)
 
             st.markdown("---")
             viaggio_mod = render_stima_viaggio(f"{key_prefix}_trasf_mod_{trasferta_id_modifica}", iniziale=dati_mod["viaggio"],
@@ -5631,7 +6011,8 @@ def render_trasferte_programmate(key_prefix):
                 ok, errore = aggiorna_trasferta(trasferta_id_modifica, dati_mod["dipendente"], data_inizio_mod, data_fine_mod,
                                                  commessa_mod, stato_mod, indirizzo_mod, albergo_mod, mezzi_mod,
                                                  dettaglio_auto_mod, auto_propria_mod, dettaglio_treno_mod, dettaglio_aereo_mod,
-                                                 dettaglio_noleggio_mod, note_mod, viaggio=viaggio_mod)
+                                                 dettaglio_noleggio_mod, note_mod, viaggio=viaggio_mod,
+                                                 dati_volo=dati_volo_mod, dati_noleggio=dati_noleggio_mod)
                 if ok:
                     notifica_e_ricarica("Trasferta aggiornata.")
                 else:
@@ -5658,11 +6039,12 @@ def render_trasferte_programmate(key_prefix):
 PAGINA_SITUAZIONE_SERVICE = "📍 Situazione dipendenti"
 # Sotto-menu delle trasferte (uguali per amministratore, responsabile e utenti Service).
 PAGINA_NUOVA_TRASFERTA = "Programmazione nuova Trasferta"
-PAGINA_TRASFERTE_PROGRAMMATE = "Trasferte programmate"
+PAGINA_TRASFERTE_PROGRAMMATE = "Trasferte programmate"            # quelle ancora da fare (in programma o in corso)
+PAGINA_TRASFERTE_EFFETTUATE = "Trasferte effettuate"              # quelle concluse
 PAGINA_STATISTICHE_ASSISTENZA = "🛠️ Statistiche Assistenza"
 PAGINA_REPORT_RICEVUTI = "Report interventi ricevuti"            # tutti i report inviati dai dipendenti
 PAGINA_REPORT_INTERVENTO = "📷 Compila Report Intervento"        # il report che compila il dipendente per la propria trasferta
-PAGINE_TRASFERTE = [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_STATISTICHE_ASSISTENZA]
+PAGINE_TRASFERTE = [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_STATISTICHE_ASSISTENZA]
 # Menu unico "Trasferte e Team" per chi gestisce le trasferte (area Service): le stesse
 # voci dell'amministratore, più il report intervento da compilare per le proprie trasferte.
 PAGINA_MAPPA_IMPIANTI = "🗺️ Mappa impianti"
@@ -9078,7 +9460,7 @@ PAGINA_HOME = "🏠 Oggi"
 # Pagine dell'amministratore che NON usano lo storico completo delle timbrature (la
 # lettura più pesante dell'app): per queste non viene caricato.
 PAGINE_ADMIN_SENZA_STORICO = {
-    PAGINA_HOME, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI,
+    PAGINA_HOME, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI,
     PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI, PAGINA_MAPPA_IMPIANTI_VISTA, PAGINA_SITUAZIONE_SERVICE,
     "Richieste ferie/permessi", "Rettifiche timbrature", "Gestione Commesse", "Gestione Utenti DB",
 }
@@ -9110,7 +9492,8 @@ ETICHETTE_MENU = {
     "Statistiche area": "📈 Statistiche del reparto",
     # --- trasferte
     PAGINA_NUOVA_TRASFERTA: "➕ Programma una trasferta",
-    PAGINA_TRASFERTE_PROGRAMMATE: "📋 Elenco trasferte",
+    PAGINA_TRASFERTE_PROGRAMMATE: "📅 Trasferte da fare",
+    PAGINA_TRASFERTE_EFFETTUATE: "✅ Trasferte effettuate",
     PAGINA_STATISTICHE_ASSISTENZA: "🛠️ Statistiche assistenza",
     PAGINA_REPORT_RICEVUTI: "📥 Rapporti ricevuti",
     PAGINA_REPORT_INTERVENTO: "📷 Rapporto di intervento",
@@ -9139,7 +9522,7 @@ def categorie_trasferte_service():
     responsabile Service e per l'utente Service: programmare e consultare le trasferte,
     vedere dove sono tutti, la mappa degli impianti e il proprio rapporto di intervento."""
     return [
-        ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
+        ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
         ("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]),
         ("🗺️ Impianti", [PAGINA_MAPPA_IMPIANTI]),
         ("📷 Il mio rapporto", [PAGINA_REPORT_INTERVENTO]),
@@ -9407,7 +9790,7 @@ def mostra_notifiche():
 PAGINE_SENZA_AUTOREFRESH_AUTOMATICO = {
     "Gestione Commesse", "Gestione fasi commessa", "Gestione Utenti DB",
     "Profilo", "Timbrature", PAGINA_REPORT_INTERVENTO, PAGINA_MAPPA_IMPIANTI,
-    "Programmazione nuova Trasferta", "Trasferte programmate", "🧳 Trasferte Service",
+    "Programmazione nuova Trasferta", "Trasferte programmate", "Trasferte effettuate", "🧳 Trasferte Service",
     "Richiesta ferie/permessi", "Richiesta rettifica",
     "💰 Costi commesse", "💰 Gestione Costi", "📅 Pianificazione",
     "Cartellini dipendenti", "🗂️ Attività di reparto",
@@ -9476,7 +9859,7 @@ else:
             ("🏠 Oggi", [PAGINA_HOME]),
             ("🕒 Presenze", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Cartellini dipendenti"]),
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI]),
-            ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
+            ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
             ("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]),
             ("📈 Statistiche e costi", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "💰 Costi commesse"]),
             ("⚙️ Utenti", ["Gestione Utenti DB"]),
@@ -9794,7 +10177,10 @@ else:
             render_nuova_trasferta(user_info["name"], key_prefix="admin")
 
         if admin_page == PAGINA_TRASFERTE_PROGRAMMATE:
-            render_trasferte_programmate(key_prefix="admin")
+            render_trasferte_programmate(key_prefix="admin", periodo="da_fare")
+
+        if admin_page == PAGINA_TRASFERTE_EFFETTUATE:
+            render_trasferte_programmate(key_prefix="admin_eff", periodo="effettuate")
 
         if admin_page == PAGINA_REPORT_RICEVUTI:
             render_report_interventi_ricevuti(key_prefix="admin")
@@ -10195,7 +10581,10 @@ else:
                 render_nuova_trasferta(user_info["name"], key_prefix="resp_service")
 
             elif trasferte_page == PAGINA_TRASFERTE_PROGRAMMATE:
-                render_trasferte_programmate(key_prefix="resp_service")
+                render_trasferte_programmate(key_prefix="resp_service", periodo="da_fare")
+
+            elif trasferte_page == PAGINA_TRASFERTE_EFFETTUATE:
+                render_trasferte_programmate(key_prefix="resp_service_eff", periodo="effettuate")
 
             elif trasferte_page == PAGINA_STATISTICHE_ASSISTENZA:
                 df = carica_dati_db()
@@ -10258,7 +10647,7 @@ else:
             ("🏠 Oggi", [PAGINA_HOME]),
         ]
         if sono_service:
-            categorie_utente.append(("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_REPORT_RICEVUTI,
+            categorie_utente.append(("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI,
                                                       PAGINA_REPORT_INTERVENTO, PAGINA_STATISTICHE_ASSISTENZA]))
             categorie_utente.append(("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]))
         else:
@@ -10275,7 +10664,7 @@ else:
         pagina_utente = render_menu_a_categorie(
             categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
-        if pagina_utente not in ("Timbrature", PAGINA_HOME, PAGINA_MIO_REPARTO, PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE,
+        if pagina_utente not in ("Timbrature", PAGINA_HOME, PAGINA_MIO_REPARTO, PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE,
                                     PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA,
                                     "Profilo", "Richiesta ferie/permessi", "Richiesta rettifica", "Richieste ferie/permessi"):
             df = carica_dati_db()
@@ -10456,7 +10845,10 @@ else:
             render_nuova_trasferta(user_info["name"], key_prefix="user_service")
 
         elif pagina_utente == PAGINA_TRASFERTE_PROGRAMMATE:
-            render_trasferte_programmate(key_prefix="user_service")
+            render_trasferte_programmate(key_prefix="user_service", periodo="da_fare")
+
+        elif pagina_utente == PAGINA_TRASFERTE_EFFETTUATE:
+            render_trasferte_programmate(key_prefix="user_service_eff", periodo="effettuate")
 
         elif pagina_utente == "🛠️ Statistiche Assistenza":
             render_statistiche_assistenza(df, key_prefix="user_assistenza")
