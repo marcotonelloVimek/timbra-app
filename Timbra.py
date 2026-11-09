@@ -4123,6 +4123,27 @@ _ABBREVIAZIONI_INDIRIZZO = [
     (r"\bc\.so\b", "Corso"), (r"\bloc\.(?=\s)", "Località"), (r"\bfraz\.(?=\s)", "Frazione"), (r"\bv\.(?=\s)", "Via"),
 ]
 
+# Nomi italiani (e sigle) dei Paesi più comuni -> nome inglese, che Nominatim riconosce sempre.
+_PAESI_IN_INGLESE = {
+    "stati uniti": "United States", "stati uniti d'america": "United States", "usa": "United States", "u.s.a.": "United States",
+    "us": "United States", "united states": "United States", "united states of america": "United States",
+    "regno unito": "United Kingdom", "gran bretagna": "United Kingdom", "uk": "United Kingdom", "united kingdom": "United Kingdom",
+    "germania": "Germany", "francia": "France", "spagna": "Spain", "svizzera": "Switzerland", "austria": "Austria",
+    "polonia": "Poland", "paesi bassi": "Netherlands", "olanda": "Netherlands", "belgio": "Belgium", "portogallo": "Portugal",
+    "grecia": "Greece", "turchia": "Turkey", "cina": "China", "giappone": "Japan", "messico": "Mexico", "brasile": "Brazil",
+    "canada": "Canada", "irlanda": "Ireland", "svezia": "Sweden", "norvegia": "Norway", "danimarca": "Denmark", "finlandia": "Finland",
+    "romania": "Romania", "ungheria": "Hungary", "repubblica ceca": "Czechia", "slovenia": "Slovenia", "croazia": "Croatia",
+    "india": "India", "australia": "Australia", "arabia saudita": "Saudi Arabia", "emirati arabi uniti": "United Arab Emirates",
+    "egitto": "Egypt", "marocco": "Morocco", "tunisia": "Tunisia", "sudafrica": "South Africa", "argentina": "Argentina", "cile": "Chile",
+}
+
+def _paese_dell_indirizzo(parti):
+    """Nome inglese del Paese scritto come ultima parte dell'indirizzo ('Stati Uniti' -> 'United States'),
+    oppure None se l'ultima parte non è un Paese noto."""
+    if not parti:
+        return None
+    return _PAESI_IN_INGLESE.get(parti[-1].strip().rstrip(".").casefold()) or _PAESI_IN_INGLESE.get(parti[-1].strip().casefold())
+
 def varianti_indirizzo(testo):
     """Versioni sempre meno precise di un indirizzo, da provare in ordine finché Nominatim ne
     trova una: [(testo, approssimata)]. Le prime correggono ciò che spesso non viene
@@ -4135,16 +4156,29 @@ def varianti_indirizzo(testo):
     pulito = re.sub(r"\([^)]*\)", " ", originale)                        # "(Mezzavia)": frazioni tra parentesi
     for pattern, sostituzione in _ABBREVIAZIONI_INDIRIZZO:
         pulito = re.sub(pattern, sostituzione, pulito, flags=re.IGNORECASE)
-    pulito = re.sub(r"\b(\d+)\s?[/\-]?\s?[A-Za-z]\b", r"\1", pulito)      # civico "110A", "3/B", "5 bis" (solo una lettera) -> numero
+    # civico "110A", "3/B", "5 B," (una sola lettera) -> numero; ma NON "1187 E 156th St", dove la lettera è
+    # una direzione (East/West/North/South) che fa parte del nome della via
+    pulito = re.sub(r"\b(\d+)[/\-]?[A-Za-z]\b(?!\.)", r"\1", pulito)
+    pulito = re.sub(r"\b(\d+)\s[/\-]?\s?[A-Za-z]\b(?=\s*(?:,|$))", r"\1", pulito)
     pulito = " ".join(pulito.replace(" ,", ",").split())
-    italia = bool(re.search(r"\b\d{5}\b", pulito)) and not re.search(r"italia|italy|deutschland|france|españa|schweiz|österreich", pulito, re.IGNORECASE)
-    def con_italia(t_):
-        return f"{t_}, Italia" if italia else t_
     parti = [p.strip() for p in pulito.split(",") if p.strip()]
-    senza_cap = " ".join(re.sub(r"\b\d{5}\b", " ", pulito).split())
+    paese_en = _paese_dell_indirizzo(parti)
+    if paese_en:                                                          # "Stati Uniti" -> "United States" (lo riconosce sempre)
+        parti[-1] = paese_en
+        pulito = ", ".join(parti)
+    estero = bool(paese_en) or bool(re.search(r"\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b", pulito))     # "NY 10474": CAP americano
+    italia = bool(re.search(r"\b\d{5}\b", pulito)) and not estero and not re.search(r"italia|italy|deutschland|france|españa|schweiz|österreich", pulito, re.IGNORECASE)
+    def con_italia(t_):
+        if italia:
+            return f"{t_}, Italia"
+        if paese_en and t_ and paese_en.casefold() not in t_.casefold():   # le varianti accorciate non devono perdere il Paese
+            return f"{t_}, {paese_en}"
+        return t_
+    senza_cap = " ".join(re.sub(r"\b\d{5}\b", " ", pulito).split()).replace(" ,", ",")
     parti_senza_civico = [p for p in parti if not re.fullmatch(r"\d+\s?[/\-]?\s?[A-Za-z]?", p)]
     via = parti_senza_civico[0] if parti_senza_civico else ""
     via_senza_civico = re.sub(r"[\s,]+\d+\s?[/\-]?\s?[A-Za-z]?$", "", via)             # "Via Roma 1" -> "Via Roma"
+    via_senza_civico = re.sub(r"^\d+\s+(?=\D)", "", via_senza_civico)                # formato americano "1187 E 156th St" -> "E 156th St"
     resto = parti_senza_civico[1:]
     cap = re.search(r"\b\d{5}\b", pulito)
     candidati = [
@@ -4152,7 +4186,7 @@ def varianti_indirizzo(testo):
         (con_italia(", ".join([via_senza_civico] + resto)), True),             # senza numero civico
         (con_italia(f"{via_senza_civico}, {cap.group(0)}" if via_senza_civico and cap else ""), True),   # via + CAP
         (con_italia(", ".join(resto)), True),                                  # solo località (e CAP)
-        (con_italia(cap.group(0)) if cap else "", True),                       # solo CAP
+        (con_italia(cap.group(0)) if cap and (italia or paese_en) else "", True),   # solo CAP (solo se il Paese è noto)
     ]
     # Una variante approssimata deve restare una località: un nome solo (es. soltanto "Italia")
     # porterebbe al centro del Paese, peggio di non trovare nulla.
