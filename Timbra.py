@@ -10473,7 +10473,7 @@ def _scegli_area_lavoro(chiave, valore):
     st.session_state[chiave] = valore
 
 def _voce_menu_laterale(testo, chiave, attiva, on_click, args):
-    st.button(testo, key=f"navv_{chiave}", use_container_width=True,
+    st.sidebar.button(testo, key=f"navv_{chiave}", use_container_width=True,
               type="primary" if attiva else "secondary", on_click=on_click, args=args)
 
 def render_selettore_area(opzioni, chiave):
