@@ -558,7 +558,9 @@ def init_db():
                                                 # OpenStreetMap) e, calcolata una sola volta, la distanza in auto dalla sede.
                                                 ("nome_impianto", "TEXT"), ("indirizzo_impianto", "TEXT"), ("lat", "REAL"), ("lon", "REAL"),
                                                 ("dist_sede_km", "REAL"), ("dist_sede_ore", "REAL"), ("dist_sede_rif", "TEXT"),
-                                                ("dist_sede_percorso", "INTEGER")]:
+                                                ("dist_sede_percorso", "INTEGER"),
+                                                # Valore (venduto) della commessa in euro, facoltativo: serve ai grafici di marginalita'.
+                                                ("valore_euro", "REAL")]:
             try:
                 c.execute(f"ALTER TABLE commesse ADD COLUMN {colonna_commessa} {tipo_colonna}")
                 conn.commit()
@@ -567,6 +569,36 @@ def init_db():
 
         # Impostazioni generali chiave/valore (es. indirizzo e coordinate della sede aziendale).
         c.execute('''CREATE TABLE IF NOT EXISTS impostazioni_generali (chiave TEXT PRIMARY KEY, valore TEXT)''')
+
+        # Centro notifiche dentro l'app (la campanella): una riga per destinatario.
+        c.execute('''CREATE TABLE IF NOT EXISTS notifiche_app (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        destinatario TEXT NOT NULL,
+                        titolo TEXT NOT NULL,
+                        testo TEXT,
+                        dove TEXT,
+                        tipo TEXT,
+                        creata TEXT NOT NULL,
+                        letta INTEGER NOT NULL DEFAULT 0
+                    )''')
+        # Posizione GPS rilevata al momento di Ingresso/Uscita (solo se la verifica è attiva):
+        # distanza dal punto in cui si doveva essere (sede o impianto della trasferta) ed esito.
+        c.execute('''CREATE TABLE IF NOT EXISTS posizioni_timbrature (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timbratura_id INTEGER,
+                        dipendente TEXT,
+                        data TEXT,
+                        ora TEXT,
+                        azione TEXT,
+                        luogo TEXT,
+                        lat REAL,
+                        lon REAL,
+                        accuratezza_m REAL,
+                        riferimento TEXT,
+                        raggio_m REAL,
+                        distanza_m REAL,
+                        esito TEXT
+                    )''')
 
         # Le commesse create prima dell'introduzione di priorità/stato non hanno questi
         # valori: le consideriamo "Media"/"In corso" di default (già avviate, non
@@ -1198,13 +1230,808 @@ def get_destinatari_responsabili_area(area, escludi_nome=None):
         "AND LOWER(TRIM(COALESCE(area,''))) = LOWER(TRIM(?)) ORDER BY nome", (area or "",), escludi_nome)
     return destinatari or get_destinatari_admin(escludi_nome)
 
-def invia_email_a(destinatari, oggetto, corpo):
+def invia_email_a(destinatari, oggetto, corpo, in_app=None):
     """Invia a [(nome, email)] e segnala (con notifica) chi non ha un indirizzo. True se
-    almeno una email è partita."""
+    almeno una email è partita. 'in_app' = (titolo, testo, dove): la stessa comunicazione arriva
+    anche come notifica nella campanella, anche a chi non ha l'email."""
+    if in_app:
+        crea_notifiche_app(destinatari, *in_app)
     senza = [n for n, e in destinatari if not e]
     if senza:
         notifica(f"✉️ Email non inviata a {', '.join(senza)}: manca l'indirizzo email (lo imposta l'amministratore in Utenti e password).", "warning")
     return send_email([e for _, e in destinatari if e], oggetto, corpo)
+
+# --- CENTRO NOTIFICHE IN-APP (campanella) ---
+# Le richieste (ferie, permessi, correzioni) e alcuni avvisi arrivano anche dentro l'app, oltre che
+# per email: una campanella con il numero di notifiche non lette, nella barra laterale e in alto.
+# La pagina si aggiorna da sola ogni 60 secondi (tranne mentre si compilano moduli), quindi una
+# notifica nuova compare entro un minuto: non è una notifica "push" istantanea.
+GIORNI_CONSERVAZIONE_NOTIFICHE = 60
+
+def _nomi_destinatari(destinatari):
+    """Nomi (senza doppioni) da [(nome, email)], [nome] o un solo nome."""
+    if isinstance(destinatari, str):
+        destinatari = [destinatari]
+    nomi, visti = [], set()
+    for d in destinatari or []:
+        nome = _testo(d[0] if isinstance(d, (tuple, list)) else d)
+        if nome and nome.casefold() not in visti:
+            visti.add(nome.casefold())
+            nomi.append(nome)
+    return nomi
+
+def crea_notifiche_app(destinatari, titolo, testo="", dove="", tipo="info"):
+    """Aggiunge una notifica per ciascun destinatario. Non solleva mai errori: una notifica
+    mancata non deve bloccare l'operazione che l'ha generata. Restituisce quante ne ha create."""
+    nomi = _nomi_destinatari(destinatari)
+    if not nomi:
+        return 0
+    adesso = get_current_datetime()
+    try:
+        with db_connect() as conn:
+            c = conn.cursor()
+            for nome in nomi:
+                c.execute("INSERT INTO notifiche_app (destinatario, titolo, testo, dove, tipo, creata, letta) VALUES (?,?,?,?,?,?,0)",
+                          (nome, _testo(titolo), str(testo or "").strip(), _testo(dove), tipo, adesso.strftime("%Y-%m-%d %H:%M:%S")))
+            limite = (adesso - datetime.timedelta(days=GIORNI_CONSERVAZIONE_NOTIFICHE)).strftime("%Y-%m-%d %H:%M:%S")
+            c.execute("DELETE FROM notifiche_app WHERE creata < ?", (limite,))
+            conn.commit()
+        conta_notifiche_non_lette.clear()
+    except Exception:
+        return 0
+    return len(nomi)
+
+@st.cache_data(ttl=20)
+def conta_notifiche_non_lette(nome):
+    try:
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM notifiche_app WHERE LOWER(TRIM(destinatario)) = LOWER(TRIM(?)) AND letta = 0", (nome,))
+            return int(c.fetchone()[0])
+    except Exception:
+        return 0
+
+def get_notifiche_app(nome, limite=15):
+    """Ultime notifiche del destinatario, le più recenti prima: [(id, titolo, testo, dove, creata, letta)]."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT id, titolo, COALESCE(testo,''), COALESCE(dove,''), creata, letta FROM notifiche_app
+                     WHERE LOWER(TRIM(destinatario)) = LOWER(TRIM(?)) ORDER BY id DESC LIMIT ?""", (nome, int(limite)))
+        return c.fetchall()
+
+def segna_notifiche_lette(nome, notifica_id=None):
+    """Segna come lette tutte le notifiche del destinatario (o solo quella indicata)."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        if notifica_id is None:
+            c.execute("UPDATE notifiche_app SET letta = 1 WHERE LOWER(TRIM(destinatario)) = LOWER(TRIM(?)) AND letta = 0", (nome,))
+        else:
+            c.execute("UPDATE notifiche_app SET letta = 1 WHERE id = ? AND LOWER(TRIM(destinatario)) = LOWER(TRIM(?))", (notifica_id, nome))
+        conn.commit()
+    conta_notifiche_non_lette.clear()
+
+def _quando(creata):
+    """'oggi 14:32', 'ieri 09:10' oppure '03/11 17:00'."""
+    try:
+        dt = datetime.datetime.strptime(str(creata)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(creata)
+    oggi = get_current_datetime().date()
+    if dt.date() == oggi:
+        return f"oggi {dt:%H:%M}"
+    if dt.date() == oggi - datetime.timedelta(days=1):
+        return f"ieri {dt:%H:%M}"
+    return f"{dt:%d/%m %H:%M}"
+
+def _segna_lette_callback(nome, notifica_id=None):
+    segna_notifiche_lette(nome, notifica_id)
+
+def render_notifiche_app(nome, key, contenitore, righe=None):
+    """Elenco delle notifiche dentro 'contenitore' (un expander o un popover): quelle non lette
+    in evidenza, con i pulsanti per segnarle come lette. 'righe' = risultato di get_notifiche_app."""
+    with contenitore:
+        if righe is None:
+            righe = get_notifiche_app(nome)
+        if not righe:
+            st.caption("Nessuna notifica da leggere.")
+            return
+        for id_, titolo, testo, dove, creata, letta in righe:
+            segno = "" if letta else "🔵 "
+            st.markdown(f"{segno}**{titolo}**" + (f"  \n{testo}" if testo else "") + f"  \n<span style='opacity:.65;font-size:.85em'>{_quando(creata)}"
+                        + (f" · vai a: {dove}" if dove and not letta else "") + "</span>", unsafe_allow_html=True)
+            if not letta:
+                st.button("✓ Letta", key=f"{key}_letta_{id_}", on_click=_segna_lette_callback, args=(nome, id_))
+        if any(not r[5] for r in righe):
+            st.button("Segna tutte come lette", key=f"{key}_tutte", on_click=_segna_lette_callback, args=(nome,))
+
+def render_campanella(nome, colonna_alto=None):
+    """Campanella nella barra laterale (come richiesto) e, se si passa 'colonna_alto', anche in alto
+    accanto al saluto, perché dal telefono la barra laterale è chiusa. Senza notifiche non fa nessuna
+    lettura del database oltre al conteggio (in cache 20 s). Restituisce quante ne ha da leggere."""
+    n = conta_notifiche_non_lette(nome)
+    righe = get_notifiche_app(nome) if n else []
+    etichetta = f"🔔 Notifiche ({n})" if n else "🔔 Notifiche"
+    render_notifiche_app(nome, "campanella_sb", st.sidebar.expander(etichetta, expanded=False), righe)
+    if colonna_alto is not None:
+        with colonna_alto:
+            popover = getattr(st, "popover", None)
+            contenitore = popover(f"🔔 {n}" if n else "🔔", use_container_width=True) if popover else st.expander(etichetta)
+            render_notifiche_app(nome, "campanella_top", contenitore, righe)
+    return n
+
+# --- POSIZIONE DELLE TIMBRATURE (GPS) ---
+# FACOLTATIVA e disattivata di default: la attiva l'amministratore in "Posizione timbrature".
+# Quando è attiva, all'Ingresso e all'Uscita (solo lì) il dipendente può premere "Rileva posizione":
+# il programma confronta le coordinate con la sede (modalità Vimek) o con l'impianto della
+# trasferta in corso e SEGNALA chi risulta fuori zona. Non blocca mai la timbratura.
+# Non c'è nessun tracciamento continuo: la posizione si legge solo quando si preme il pulsante.
+# Il dato si cancella da solo dopo un numero di giorni impostabile.
+# NB: in Italia la geolocalizzazione dei lavoratori è soggetta all'art. 4 dello Statuto dei
+# Lavoratori (accordo sindacale o autorizzazione) e alla normativa privacy: da verificare con il
+# consulente prima di attivarla.
+GEO_PREDEFINITI = {"geo_attiva": "0", "geo_raggio_sede_m": "300", "geo_raggio_impianto_m": "500",
+                   "geo_precisione_max_m": "300", "geo_conservazione_giorni": "90"}
+AZIONI_CON_POSIZIONE = ("Ingresso", "Uscita")
+GEO_VALIDITA_MINUTI = 15            # una posizione rilevata da più tempo non si usa
+ESITI_POSIZIONE = ["Dentro", "Fuori zona", "Incerta", "Senza posizione"]
+
+@st.cache_data(ttl=30)
+def geo_config():
+    """Impostazioni della verifica della posizione: {'attiva', 'raggio_sede', 'raggio_impianto', 'precisione_max', 'giorni'}."""
+    try:
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT chiave, valore FROM impostazioni_generali WHERE chiave LIKE 'geo_%'")
+            valori = dict(c.fetchall())
+    except Exception:
+        valori = {}
+    def numero(chiave):
+        try:
+            return float(valori.get(chiave, GEO_PREDEFINITI[chiave]))
+        except (TypeError, ValueError):
+            return float(GEO_PREDEFINITI[chiave])
+    return {"attiva": str(valori.get("geo_attiva", "0")) == "1", "raggio_sede": numero("geo_raggio_sede_m"),
+            "raggio_impianto": numero("geo_raggio_impianto_m"), "precisione_max": numero("geo_precisione_max_m"),
+            "giorni": int(numero("geo_conservazione_giorni"))}
+
+def salva_geo_config(attiva, raggio_sede, raggio_impianto, precisione_max, giorni):
+    for chiave, valore in (("geo_attiva", "1" if attiva else "0"), ("geo_raggio_sede_m", raggio_sede), ("geo_raggio_impianto_m", raggio_impianto),
+                           ("geo_precisione_max_m", precisione_max), ("geo_conservazione_giorni", giorni)):
+        set_impostazione(chiave, valore)
+    geo_config.clear()
+
+def geolocalizzazione_disponibile():
+    """True se il componente che legge il GPS del dispositivo (streamlit-geolocation) è installato."""
+    modulo = _load_optional_dependency("streamlit_geolocation")
+    return modulo is not None and hasattr(modulo, "streamlit_geolocation")
+
+def normalizza_posizione(valore):
+    """{'lat', 'lon', 'acc'} dal dizionario del componente GPS, oppure None se non c'è una posizione valida."""
+    if not isinstance(valore, dict):
+        return None
+    try:
+        lat, lon = float(valore.get("latitude")), float(valore.get("longitude"))
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0 and lon == 0):
+        return None
+    try:
+        acc = float(valore.get("accuracy")) if valore.get("accuracy") is not None else None
+    except (TypeError, ValueError):
+        acc = None
+    return {"lat": lat, "lon": lon, "acc": acc}
+
+def posizione_in_corso():
+    """Posizione rilevata dall'utente in questa sessione, se ancora valida (vedi GEO_VALIDITA_MINUTI)."""
+    pos = st.session_state.get("_posizione_gps")
+    if not pos:
+        return None
+    if (get_current_datetime() - pos["ts"]).total_seconds() > GEO_VALIDITA_MINUTI * 60:
+        return None
+    return pos
+
+def valuta_posizione(distanza_m, accuratezza_m, raggio_m, precisione_max_m):
+    """'Dentro', 'Fuori zona' o 'Incerta' (la distanza dal punto è compatibile con l'imprecisione
+    del GPS, oppure il GPS è troppo impreciso per dire)."""
+    acc = float(accuratezza_m or 0)
+    if distanza_m - acc > raggio_m:
+        return "Fuori zona"
+    if distanza_m <= raggio_m and acc <= precisione_max_m:
+        return "Dentro"
+    return "Incerta"
+
+def riferimento_posizione(nome, luogo, data_iso, cfg):
+    """(etichetta, lat, lon, raggio_m) del punto in cui il dipendente dovrebbe trovarsi, oppure None
+    se non c'è nulla da controllare: modalità Vimek = sede aziendale; Trasferta = impianto della
+    commessa della trasferta in corso (se ha le coordinate); Smart = nessun controllo."""
+    if luogo == "Vimek":
+        sede = get_sede_aziendale()
+        if sede["lat"] is None or sede["lon"] is None:
+            return None
+        return "Sede aziendale", sede["lat"], sede["lon"], cfg["raggio_sede"]
+    if luogo == "Trasferta":
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("""SELECT commessa FROM trasferte WHERE LOWER(TRIM(dipendente)) = LOWER(TRIM(?)) AND data_inizio <= ? AND data_fine >= ?
+                         AND COALESCE(commessa,'') <> '' ORDER BY id""", (nome, data_iso, data_iso))
+            commesse = [r[0] for r in c.fetchall()]
+        for commessa in commesse:
+            impianto = get_dati_impianto(commessa)
+            if impianto and impianto.get("lat") is not None:
+                return f"Impianto {commessa}", impianto["lat"], impianto["lon"], cfg["raggio_impianto"]
+    return None
+
+def prepara_posizione_timbratura(nome, azione, luogo, data_iso, pos):
+    """Dati da salvare sulla posizione di questa timbratura, oppure None se non va controllato nulla
+    (verifica disattiva, azione diversa da Ingresso/Uscita, nessun punto di riferimento). Non solleva errori."""
+    if azione not in AZIONI_CON_POSIZIONE:
+        return None
+    try:
+        cfg = geo_config()
+        if not cfg["attiva"]:
+            return None
+        rif = riferimento_posizione(nome, luogo, data_iso, cfg)
+        if not rif:
+            return None
+        etichetta, lat, lon, raggio = rif
+        if not pos:
+            return {"lat": None, "lon": None, "acc": None, "riferimento": etichetta, "raggio": raggio, "distanza": None, "esito": "Senza posizione"}
+        distanza = distanza_in_linea_d_aria_km(pos["lat"], pos["lon"], lat, lon) * 1000.0
+        return {"lat": pos["lat"], "lon": pos["lon"], "acc": pos.get("acc"), "riferimento": etichetta, "raggio": raggio,
+                "distanza": round(distanza, 1), "esito": valuta_posizione(distanza, pos.get("acc"), raggio, cfg["precisione_max"])}
+    except Exception:
+        return None
+
+def elimina_posizioni_vecchie():
+    giorni = geo_config()["giorni"]
+    limite = (get_current_datetime().date() - datetime.timedelta(days=max(giorni, 1))).isoformat()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM posizioni_timbrature WHERE data < ?", (limite,))
+        conn.commit()
+
+def carica_posizioni_timbrature(da, a, dipendenti=None):
+    """Posizioni rilevate tra due date (incluse), le più recenti prima; 'dipendenti' (lista di nomi) restringe l'elenco."""
+    with db_connect() as conn:
+        df = pd.read_sql("""SELECT data AS Data, ora AS Ora, dipendente AS Dipendente, azione AS Azione, luogo AS Luogo, esito AS Esito,
+                                   riferimento AS Riferimento, distanza_m AS 'Distanza (m)', raggio_m AS 'Raggio (m)',
+                                   accuratezza_m AS 'Precisione GPS (m)', lat, lon
+                            FROM posizioni_timbrature WHERE data >= ? AND data <= ? ORDER BY data DESC, ora DESC, id DESC""",
+                         conn, params=(da.isoformat(), a.isoformat()))
+    if dipendenti is not None:
+        df = df[df["Dipendente"].isin(list(dipendenti))]
+    df["Mappa"] = [f"https://www.openstreetmap.org/?mlat={la}&mlon={lo}#map=17/{la}/{lo}" if pd.notna(la) and pd.notna(lo) else None
+                   for la, lo in zip(df["lat"], df["lon"])]
+    return df.drop(columns=["lat", "lon"]).reset_index(drop=True)
+
+# --- PROMEMORIA "USCITA DIMENTICATA" ---
+# Chi ha un turno ancora aperto la sera (dalle PROMEMORIA_USCITA_ORA) o il giorno dopo riceve una
+# notifica nella campanella e, se ha l'email, un messaggio. Il controllo parte quando QUALCUNO apre
+# l'app (al massimo ogni 15 minuti per tutti): l'app non ha un servizio che gira da solo, quindi se
+# nessuno la apre dopo l'ora indicata il promemoria arriva alla prima apertura successiva.
+PROMEMORIA_USCITA_ORA = 19
+INTERVALLO_CONTROLLO_USCITE_MIN = 15
+
+def controlla_uscite_dimenticate(adesso=None):
+    """Manda il promemoria a chi non ha timbrato l'Uscita. Restituisce i nomi avvisati. Non solleva errori."""
+    adesso = adesso or get_current_datetime()
+    try:
+        ultimo = get_impostazione("ultimo_controllo_uscite", "")
+        try:
+            if ultimo and (adesso - datetime.datetime.fromisoformat(ultimo)).total_seconds() < INTERVALLO_CONTROLLO_USCITE_MIN * 60:
+                return []
+        except ValueError:
+            pass
+        set_impostazione("ultimo_controllo_uscite", adesso.isoformat())
+        da = (adesso.date() - datetime.timedelta(days=1)).isoformat()
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT Dipendente, Azione, Data, Ora FROM timbrature WHERE Data >= ? ORDER BY Data, Ora, id", (da,))
+            righe = c.fetchall()
+        ultime = {}
+        for dip, azione, data_str, ora_str in righe:
+            ultime[dip] = (azione, data_str, ora_str)
+        avvisati = []
+        for dip, (azione, data_str, ora_str) in ultime.items():
+            if azione == "Uscita":
+                continue
+            ts = _parse_timbratura_timestamp(data_str, ora_str)
+            if ts is None:
+                continue
+            ieri_o_prima = ts.date() < adesso.date()
+            if not (ieri_o_prima or adesso.hour >= PROMEMORIA_USCITA_ORA):
+                continue
+            with db_connect() as conn:
+                c = conn.cursor()
+                c.execute("""SELECT 1 FROM notifiche_app WHERE tipo = 'promemoria_uscita' AND LOWER(TRIM(destinatario)) = LOWER(TRIM(?))
+                             AND creata >= ? LIMIT 1""", (dip, adesso.strftime("%Y-%m-%d") + " 00:00:00"))
+                if c.fetchone():
+                    continue
+            quando = f"{ts:%d/%m} alle {ts:%H:%M}"
+            testo = f"Il tuo ultimo turno risulta ancora aperto dalla timbratura del {quando}. Se hai finito, timbra l'Uscita; se è passato troppo tempo, chiedi una correzione."
+            crea_notifiche_app([dip], "⏰ Hai dimenticato di timbrare l'uscita?", testo, "Timbra" if not ieri_o_prima else "Richiesta rettifica", "promemoria_uscita")
+            email = get_email_utente(dip)[1]
+            if email:
+                try:
+                    send_email([email], "⏰ Promemoria: uscita non timbrata", f"Ciao {dip},\n\n{testo}\n\nSistema Timbrature")
+                except Exception:
+                    pass
+            avvisati.append(dip)
+        return avvisati
+    except Exception:
+        return []
+
+# --- VALORE DELLE COMMESSE E INDICATORI (BI) ---
+def get_valori_commesse():
+    """{commessa: valore in euro} per le commesse che hanno il valore compilato."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, valore_euro FROM commesse WHERE valore_euro IS NOT NULL")
+        return {n: float(v) for n, v in c.fetchall()}
+
+def imposta_valore_commessa(commessa, valore):
+    """Salva il valore (euro) di una commessa; valore None/vuoto lo toglie. Restituisce (ok, errore)."""
+    if valore is not None:
+        try:
+            valore = float(valore)
+        except (TypeError, ValueError):
+            return False, "Il valore deve essere un numero."
+        if valore < 0:
+            return False, "Il valore non può essere negativo."
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE commesse SET valore_euro = ? WHERE nome = ?", (valore, commessa))
+        if c.rowcount == 0:
+            return False, "Commessa non trovata."
+        conn.commit()
+    return True, ""
+
+def calcola_marginalita_commesse(riepilogo_costi, valori):
+    """Marginalità per commessa: unisce il riepilogo dei costi (get_riepilogo_costi_commesse) con il
+    valore della commessa. Margine = Valore - costo reale totale (ore del personale x costo orario +
+    costo delle trasferte); non comprende materiali, acquisti e costi generali. Margine previsto =
+    Valore - costo ipotetico delle fasi (preventivo). Le commesse senza valore restano in elenco con
+    margine vuoto."""
+    colonne = ["Commessa", "Cliente", "Valore", "Costo_personale", "Costo_trasferte", "Costo_totale",
+               "Margine", "Margine_%", "Costo_preventivo", "Margine_previsto"]
+    if riepilogo_costi is None or riepilogo_costi.empty:
+        return pd.DataFrame(columns=colonne)
+    r = riepilogo_costi.copy()
+    r["Valore"] = r["Commessa"].map(valori)
+    r = r.rename(columns={"Costo_reale_fasi": "Costo_personale", "Costo_ipotetico_fasi": "Costo_preventivo"})
+    r["Margine"] = r["Valore"] - r["Costo_totale"]
+    r["Margine_%"] = (r["Margine"] / r["Valore"].where(r["Valore"] > 0) * 100).round(1)
+    r["Margine_previsto"] = r["Valore"] - r["Costo_preventivo"]
+    for col in ("Margine", "Margine_previsto"):
+        r[col] = r[col].round(2)
+    return r[colonne].sort_values("Margine_%", ascending=True, na_position="last").reset_index(drop=True)
+
+def compute_sessioni_fasi(df):
+    """Una riga per ogni sessione Inizio fase -> Fine fase: [Dipendente, Commessa, Fase, Area, Inizio, Ore]
+    (ore nette della pausa pranzo, stessa logica dei costi). Serve ai trend di produttività."""
+    colonne = ["Dipendente", "Commessa", "Fase", "Area", "Inizio", "Ore"]
+    dfn = normalize_datetime(df)
+    if dfn.empty:
+        return pd.DataFrame(columns=colonne)
+    dfn = dfn.copy()
+    dfn["Area"] = dfn["Dipendente"].map(get_users_area_map()).fillna("Unknown")
+    indice_pause = IndicePauseFasi(dfn)
+    dfn = dfn[dfn["Azione"].isin(["Inizio fase", "Fine fase"])]
+    mappa_orario_fine = get_users_orario_fine_map()
+    ora_attuale = get_current_datetime()
+    righe = []
+    for (dip, commessa, fase, area), gruppo in dfn.groupby(["Dipendente", "Commessa", "Fase", "Area"]):
+        if not commessa or not fase:
+            continue
+        for inizio, ore, _det in _sessioni_fase_con_fallback_dettaglio(gruppo.sort_values("Timestamp"), dip, mappa_orario_fine, ora_attuale, indice_pause):
+            righe.append({"Dipendente": dip, "Commessa": commessa, "Fase": fase, "Area": area, "Inizio": inizio, "Ore": ore})
+    return pd.DataFrame(righe, columns=colonne)
+
+def compute_trend_produttivita(fasi_costi, sessioni):
+    """Per mese e reparto: ore stimate vs ore effettive delle fasi COMPLETATE (il mese è quello dell'ultima
+    sessione di lavoro della fase), con l'indice stimate/effettive (sopra 1 = più veloci del previsto).
+    Restituisce [Mese, Area, Ore_stimate, Ore_effettive, Indice, Fasi]."""
+    colonne = ["Mese", "Area", "Ore_stimate", "Ore_effettive", "Indice", "Fasi"]
+    if fasi_costi is None or fasi_costi.empty or sessioni is None or sessioni.empty:
+        return pd.DataFrame(columns=colonne)
+    completate = fasi_costi[(fasi_costi["Stato"] == "Completata") & (fasi_costi["Ore_stimate"] > 0) & (fasi_costi["Ore_effettive"] > 0)]
+    if completate.empty:
+        return pd.DataFrame(columns=colonne)
+    ultima = sessioni.groupby(["Commessa", "Fase", "Area"], as_index=False)["Inizio"].max()
+    m = completate.merge(ultima, on=["Commessa", "Fase", "Area"], how="inner")
+    if m.empty:
+        return pd.DataFrame(columns=colonne)
+    m["Mese"] = pd.to_datetime(m["Inizio"]).dt.strftime("%Y-%m")
+    t = m.groupby(["Mese", "Area"], as_index=False).agg(Ore_stimate=("Ore_stimate", "sum"), Ore_effettive=("Ore_effettive", "sum"), Fasi=("Fase", "count"))
+    t["Indice"] = (t["Ore_stimate"] / t["Ore_effettive"]).round(2)
+    t["Ore_stimate"] = t["Ore_stimate"].round(1)
+    t["Ore_effettive"] = t["Ore_effettive"].round(1)
+    return t[colonne].sort_values(["Mese", "Area"]).reset_index(drop=True)
+
+def render_rilevamento_posizione(luogo):
+    """Pulsante 'Rileva posizione' sopra Ingresso/Uscita (solo se la verifica è attiva, la modalità
+    è Vimek o Trasferta e il componente GPS è installato). Il browser chiede il permesso la prima volta
+    e serve una connessione HTTPS. Non blocca nulla: senza posizione la timbratura passa e viene segnalata."""
+    if luogo not in ("Vimek", "Trasferta"):
+        return
+    try:
+        if not geo_config()["attiva"] or not geolocalizzazione_disponibile():
+            return
+        modulo = _load_optional_dependency("streamlit_geolocation")
+        n = st.session_state.get("_geo_n", 0)
+        st.caption("📍 Prima di timbrare Ingresso o Uscita premi «Rileva posizione»: serve a verificare dove timbri. "
+                   "La posizione si legge solo quando premi il pulsante (nessun tracciamento) e la vedono solo il tuo responsabile e l'amministratore.")
+        try:
+            valore = modulo.streamlit_geolocation(key=f"geo_{n}")
+        except TypeError:
+            valore = modulo.streamlit_geolocation()
+        pos = normalizza_posizione(valore)
+        if pos:
+            precedente = st.session_state.get("_posizione_gps")
+            if precedente and (precedente["lat"], precedente["lon"]) == (pos["lat"], pos["lon"]):
+                pos["ts"] = precedente["ts"]                           # stessa posizione: non rinnova la scadenza
+            else:
+                pos["ts"] = get_current_datetime()
+            st.session_state["_posizione_gps"] = pos
+        attuale = posizione_in_corso()
+        if attuale:
+            st.success("📍 Posizione rilevata" + (f" (precisione ±{attuale['acc']:.0f} m)" if attuale.get("acc") is not None else ""))
+        else:
+            st.session_state.pop("_posizione_gps", None)
+            st.caption("Posizione non ancora rilevata.")
+    except Exception:
+        st.caption("📍 Non riesco a leggere la posizione di questo dispositivo: puoi timbrare lo stesso.")
+
+def _colonna_link_mappa():
+    try:
+        try:
+            return st.column_config.LinkColumn("Mappa", display_text="Apri mappa")
+        except TypeError:
+            return st.column_config.LinkColumn("Mappa")
+    except Exception:
+        return None
+
+def render_posizioni_timbrature(user_info, key_prefix):
+    """Pagina 'Posizione timbrature': l'amministratore attiva e configura la verifica; amministratore e
+    responsabili (per il proprio reparto) vedono chi ha timbrato lontano dal luogo di lavoro, in
+    modo impreciso o senza posizione. Non è un controllo disciplinare automatico: è una segnalazione."""
+    st.subheader("📍 Dove si è timbrato")
+    cfg = geo_config()
+    e_admin = user_info.get("role") == "admin"
+    if e_admin:
+        with st.expander("⚙️ Impostazioni della verifica (solo amministratore)", expanded=not cfg["attiva"]):
+            st.warning("In Italia la geolocalizzazione dei lavoratori richiede informativa privacy e, di norma, accordo sindacale o "
+                       "autorizzazione dell'Ispettorato del Lavoro (art. 4 Statuto dei Lavoratori): verifica con il consulente del lavoro "
+                       "prima di attivarla. La posizione si legge solo quando il dipendente preme «Rileva posizione», solo su Ingresso e Uscita, "
+                       "e non blocca mai la timbratura.")
+            if geolocalizzazione_disponibile():
+                st.success("✅ Il componente per leggere il GPS è installato.")
+            else:
+                st.error("Il componente per leggere il GPS non è installato: aggiungi la riga `streamlit-geolocation` al file requirements.txt e riavvia l'app.")
+            sede = get_sede_aziendale()
+            if sede["lat"] is None:
+                st.warning("La sede aziendale non ha coordinate: impostala in «Mappa impianti» altrimenti per le timbrature in sede non c'è nulla da confrontare.")
+            attiva = st.checkbox("Attiva la verifica della posizione", value=cfg["attiva"], key=f"{key_prefix}_attiva")
+            c1, c2, c3, c4 = st.columns(4)
+            raggio_sede = c1.number_input("Raggio sede (m)", min_value=50.0, max_value=5000.0, step=50.0, value=float(cfg["raggio_sede"]), key=f"{key_prefix}_r_sede")
+            raggio_imp = c2.number_input("Raggio impianto (m)", min_value=50.0, max_value=10000.0, step=50.0, value=float(cfg["raggio_impianto"]), key=f"{key_prefix}_r_imp")
+            precisione = c3.number_input("Precisione GPS massima (m)", min_value=20.0, max_value=5000.0, step=20.0, value=float(cfg["precisione_max"]), key=f"{key_prefix}_prec",
+                                         help="Se il GPS è meno preciso di così e la distanza non basta a dire che è fuori zona, l'esito è «Incerta».")
+            giorni = c4.number_input("Conserva per (giorni)", min_value=7, max_value=730, step=1, value=int(cfg["giorni"]), key=f"{key_prefix}_giorni",
+                                     help="Le posizioni più vecchie vengono cancellate automaticamente.")
+            if st.button("💾 Salva impostazioni", key=f"{key_prefix}_salva_cfg"):
+                salva_geo_config(attiva, float(raggio_sede or 300), float(raggio_imp or 500), float(precisione or 300), int(giorni or 90))
+                notifica_e_ricarica("Impostazioni della posizione salvate.")
+            st.caption("Cosa si controlla: in modalità «Vimek» la distanza dalla sede; in «Trasferta» la distanza dall'impianto della commessa della trasferta "
+                       "(se l'impianto ha le coordinate); in «Smart» niente. Esiti: Dentro, Fuori zona, Incerta (GPS troppo impreciso), Senza posizione.")
+    if not cfg["attiva"]:
+        st.info("La verifica della posizione non è attiva: nessuna posizione viene rilevata." + ("" if e_admin else " La attiva l'amministratore."))
+    try:
+        elimina_posizioni_vecchie()
+    except Exception:
+        pass
+    periodo = st.selectbox("Periodo", ["Ultimi 7 giorni", "Ultimi 30 giorni", "Ultimi 90 giorni"], key=f"{key_prefix}_periodo")
+    giorni_periodo = {"Ultimi 7 giorni": 7, "Ultimi 30 giorni": 30, "Ultimi 90 giorni": 90}[periodo]
+    oggi = datetime.date.today()
+    nomi = None if e_admin else get_users_in_area(user_info.get("area"))
+    df = carica_posizioni_timbrature(oggi - datetime.timedelta(days=giorni_periodo), oggi, nomi)
+    if df.empty:
+        st.info("Nessuna posizione registrata nel periodo.")
+        return
+    colonne = st.columns(len(ESITI_POSIZIONE))
+    for col, esito in zip(colonne, ESITI_POSIZIONE):
+        col.metric(esito, int((df["Esito"] == esito).sum()))
+    scelti = st.multiselect("Mostra", ESITI_POSIZIONE, default=["Fuori zona", "Incerta", "Senza posizione"], key=f"{key_prefix}_esiti")
+    vista = df[df["Esito"].isin(scelti)] if scelti else df
+    if vista.empty:
+        st.success("Nessuna timbratura da segnalare con questi filtri.")
+        return
+    config = {"Mappa": _colonna_link_mappa()} if _colonna_link_mappa() is not None else None
+    st.dataframe(vista, use_container_width=True, hide_index=True, column_config=config)
+    st.caption("Distanza in linea d'aria dal luogo in cui si doveva essere. La precisione del GPS di telefoni e computer varia: «Incerta» non significa un'irregolarità.")
+
+def render_installa_app():
+    """Istruzioni per mettere Timbra sulla schermata Home del telefono (apre il sito a schermo intero)."""
+    with st.expander("📲 Usa Timbra come un'app sul telefono"):
+        st.markdown(
+            "Non serve scaricare nulla dallo store: basta aggiungere il sito alla schermata Home.\n\n"
+            "**iPhone (Safari)**: apri Timbra, tocca il pulsante *Condividi* (il quadrato con la freccia) → *Aggiungi alla schermata Home* → *Aggiungi*.\n\n"
+            "**Android (Chrome)**: apri Timbra, tocca i tre puntini in alto a destra → *Aggiungi a schermata Home* (o *Installa app*) → *Aggiungi*.\n\n"
+            "Da quel momento hai l'icona di Timbra, che si apre a schermo intero. "
+            "Le notifiche si vedono nella campanella 🔔 in alto quando apri l'app (non arrivano come notifiche del telefono).")
+
+def _grafico_barre_doppie(dati, categoria, serie_a, serie_b, nome_a, nome_b, altezza=320):
+    """Barre orizzontali sovrapposte: la prima serie larga e chiara, la seconda stretta e scura."""
+    base = alt.Chart(dati).encode(y=alt.Y(f"{categoria}:N", sort=None, title=None))
+    larga = base.mark_bar(size=22, color="#9db6d6").encode(x=alt.X(f"{serie_a}:Q", title=None), tooltip=[alt.Tooltip(f"{categoria}:N"), alt.Tooltip(f"{serie_a}:Q", title=nome_a, format=",.0f")])
+    stretta = base.mark_bar(size=9, color="#0b2a4a").encode(x=alt.X(f"{serie_b}:Q"), tooltip=[alt.Tooltip(f"{categoria}:N"), alt.Tooltip(f"{serie_b}:Q", title=nome_b, format=",.0f")])
+    return (larga + stretta).properties(height=max(altezza, 36 * len(dati)))
+
+def _orario_su_giorno(giorno, testo):
+    """Timestamp del giorno indicato all'ora 'HH:MM', oppure None se il testo non è un orario."""
+    try:
+        ore, minuti = str(testo).split(":")[:2]
+        return pd.Timestamp(giorno) + pd.Timedelta(hours=int(ore), minutes=int(minuti))
+    except (ValueError, TypeError):
+        return None
+
+def gantt_traccia_commessa_dati(storico, modo="giorni", ora_attuale=None):
+    """Barre del Gantt 'chi ha lavorato sulla commessa', dalle sessioni di get_storico_attivita_commessa.
+    modo='giorni': una barra larga un giorno per ogni dipendente e giorno lavorato (fasi e ore del giorno
+    nel suggerimento); modo='ore': una barra per ogni sessione, dall'inizio alla fine (una sessione ancora
+    aperta arriva fino a ora). Restituisce [Dipendente, Area, Dal, Al, Ore, Fasi, Sessioni] in ordine di tempo."""
+    colonne = ["Dipendente", "Area", "Dal", "Al", "Ore", "Fasi", "Sessioni"]
+    if storico is None or storico.empty:
+        return pd.DataFrame(columns=colonne)
+    ora_attuale = ora_attuale or get_current_datetime()
+    righe = []
+    for _, r in storico.iterrows():
+        giorno = pd.Timestamp(r["Data"]).normalize()
+        ore = float(r["Ore"]) if pd.notna(r["Ore"]) else 0.0
+        if modo == "ore":
+            inizio = _orario_su_giorno(giorno, r["Inizio"])
+            if inizio is None:
+                continue
+            if str(r["Fine"]).startswith("("):
+                fine = max(pd.Timestamp(ora_attuale), inizio)
+            else:
+                fine = _orario_su_giorno(giorno, r["Fine"])
+                if fine is None:
+                    fine = inizio
+                elif fine <= inizio:
+                    fine += pd.Timedelta(days=1)                      # turno a cavallo della mezzanotte
+            fine = max(fine, inizio + pd.Timedelta(minutes=10))        # almeno 10 minuti, altrimenti la barra non si vede
+            righe.append({"Dipendente": r["Dipendente"], "Area": r["Area"], "Dal": inizio, "Al": fine, "Ore": ore, "Fasi": r["Fase"], "Sessioni": 1})
+        else:
+            righe.append({"Dipendente": r["Dipendente"], "Area": r["Area"], "Dal": giorno, "Al": giorno + pd.Timedelta(days=1), "Ore": ore, "Fasi": r["Fase"], "Sessioni": 1})
+    if not righe:
+        return pd.DataFrame(columns=colonne)
+    dati = pd.DataFrame(righe)
+    if modo != "ore":
+        dati = dati.groupby(["Dipendente", "Area", "Dal", "Al"], as_index=False).agg(
+            Ore=("Ore", "sum"), Fasi=("Fasi", lambda x: ", ".join(sorted(set(map(str, x))))), Sessioni=("Sessioni", "sum"))
+    dati["Ore"] = dati["Ore"].round(2)
+    return dati[colonne].sort_values(["Dal", "Dipendente"]).reset_index(drop=True)
+
+def colori_per_dipendenti(nomi):
+    """(dominio, colori) per Altair: il colore che ciascun dipendente ha scelto nel profilo (o impostato
+    dall'amministratore); #4fa8ff se non ne ha uno."""
+    mappa = get_users_colors_map()
+    nomi = list(nomi)
+    return nomi, [mappa.get(n) or "#4fa8ff" for n in nomi]
+
+def render_gantt_traccia_commessa(storico, key_prefix):
+    """Gantt degli operatori che hanno lavorato su una commessa nel tempo: una riga per operatore, barre
+    nel colore del suo profilo. 'Giorno per giorno' dà la visione d'insieme; 'Ora per ora' mostra le singole
+    sessioni di un periodo scelto."""
+    modo = st.radio("Dettaglio", ["📅 Giorno per giorno", "🕒 Ora per ora"], horizontal=True, key=f"{key_prefix}_gantt_modo")
+    per_ore = modo.startswith("🕒")
+    giorni_lavorati = pd.to_datetime(storico["Data"])
+    primo, ultimo = giorni_lavorati.min().date(), giorni_lavorati.max().date()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Operatori", int(storico["Dipendente"].nunique()))
+    c2.metric("Ore lavorate", f"{float(storico['Ore'].fillna(0).sum()):.1f}")
+    c3.metric("Dal – al", f"{primo:%d/%m/%y} – {ultimo:%d/%m/%y}")
+    if per_ore:
+        da_default = max(primo, ultimo - datetime.timedelta(days=6))
+        cc1, cc2 = st.columns(2)
+        da = cc1.date_input("Dal", value=da_default, key=f"{key_prefix}_gantt_da") or da_default
+        a = cc2.date_input("Al", value=ultimo, key=f"{key_prefix}_gantt_a") or ultimo
+        storico = storico[(giorni_lavorati.dt.date >= da) & (giorni_lavorati.dt.date <= a)]
+        if storico.empty:
+            st.info("Nessuna sessione in questo periodo.")
+            return
+    dati = gantt_traccia_commessa_dati(storico, "ore" if per_ore else "giorni")
+    if dati.empty:
+        st.info("Nessuna sessione con orari da mostrare.")
+        return
+    ordine = list(dati.groupby("Dipendente")["Dal"].min().sort_values().index)
+    dominio, colori = colori_per_dipendenti(ordine)
+    asse = alt.Axis(format="%d/%m %H:%M", labelAngle=-30) if per_ore else alt.Axis(format="%d/%m", labelAngle=-30)
+    grafico = alt.Chart(dati).mark_bar(cornerRadius=2, stroke="#0b2a4a", strokeWidth=0.4).encode(
+        x=alt.X("Dal:T", title=None, axis=asse), x2="Al:T",
+        y=alt.Y("Dipendente:N", sort=ordine, title=None),
+        color=alt.Color("Dipendente:N", scale=alt.Scale(domain=dominio, range=colori), legend=None),
+        tooltip=[alt.Tooltip("Dipendente:N"), alt.Tooltip("Area:N"), alt.Tooltip("Dal:T", format="%d/%m/%Y %H:%M" if per_ore else "%d/%m/%Y"),
+                 alt.Tooltip("Ore:Q", format=".2f"), alt.Tooltip("Fasi:N"), alt.Tooltip("Sessioni:Q")]
+    ).properties(height=max(120, 42 * len(ordine) + 50)).interactive(bind_y=False)
+    st.altair_chart(grafico, use_container_width=True)
+    st.caption("Il colore di ogni operatore è quello scelto nel suo Profilo. Passa il mouse su una barra per vedere fasi e ore." +
+               (" Ogni barra è una sessione." if per_ore else " Ogni barra è un giorno in cui ha lavorato su questa commessa."))
+
+def render_resoconto_commesse(df, key_prefix, area=None):
+    """Pagina 'Resoconto Commesse': ore per dipendente (con scelta di reparto e dipendente), ore stimate vs
+    effettive per fase, e traccia delle lavorazioni di una commessa con il Gantt degli operatori. 'area'
+    restringe tutto a un reparto (vista del responsabile); None = tutta l'azienda (amministratore e area Costi)."""
+    st.write("### 📊 Ore di Lavoro per Commessa" + (f" — Area {area}" if area else ""))
+    col_i, col_f = st.columns(2)
+    inizio = col_i.date_input("Inizio", value=datetime.date.today().replace(day=1), key=f"{key_prefix}_inizio") or datetime.date.today().replace(day=1)
+    fine = col_f.date_input("Fine", value=datetime.date.today(), key=f"{key_prefix}_fine") or datetime.date.today()
+
+    st.write("#### Per dipendente")
+    if area:
+        reparto = area
+    else:
+        reparto = st.selectbox("Reparto", get_area_names(), key=f"{key_prefix}_reparto")
+    membri = get_users_in_area(reparto)
+    scelta_dip = st.selectbox("Dipendente", ["Tutti i dipendenti"] + list(membri), key=f"{key_prefix}_dipendente_{reparto}")
+    ore_commesse = compute_hours_by_commessa(df, inizio, fine)
+    if not ore_commesse.empty:
+        ore_commesse = ore_commesse[ore_commesse["Dipendente"].isin([scelta_dip] if scelta_dip != "Tutti i dipendenti" else list(membri))]
+    if ore_commesse.empty:
+        st.info("Nessun dato sulle commesse per questa scelta nel periodo." if membri else "Nessun dipendente in questo reparto.")
+    else:
+        m1, m2 = st.columns(2)
+        m1.metric("Ore sulle commesse", f"{float(ore_commesse['Ore_lavorate'].sum()):.1f}")
+        m2.metric("Commesse", int(ore_commesse["Commessa"].nunique()))
+        st.dataframe(ore_commesse.sort_values(["Dipendente", "Ore_lavorate"], ascending=[True, False]), use_container_width=True, hide_index=True)
+        per_commessa = ore_commesse.groupby("Commessa", as_index=False)["Ore_lavorate"].sum().sort_values("Ore_lavorate", ascending=False)
+        st.altair_chart(alt.Chart(per_commessa).mark_bar().encode(
+            x=alt.X("Ore_lavorate:Q", title="Ore"), y=alt.Y("Commessa:N", sort="-x", title=None),
+            tooltip=["Commessa:N", alt.Tooltip("Ore_lavorate:Q", format=".2f")]).properties(height=max(120, 32 * len(per_commessa) + 40)), use_container_width=True)
+
+    st.markdown("---")
+    st.write("#### Per fase (ore stimate vs ore effettive)")
+    commessa_filtro, nomi_filtrati_fase = selettore_commessa_filtrato(
+        f"{key_prefix}_fase", key_commessa=f"{key_prefix}_commessa_filtro", etichetta="Commessa",
+        opzioni_extra=("Tutte le commesse",), restituisci_nomi=True)
+    produttivita_dettaglio, filtrata_fase = produttivita_commesse_filtrata(df, inizio, fine, area, commessa_filtro, nomi_filtrati_fase)
+    if produttivita_dettaglio.empty:
+        if filtrata_fase:
+            st.info("Nessuna fase da mostrare per le commesse che corrispondono ai filtri.")
+        else:
+            st.info("Nessuna fase con ore stimate configurata" + (" per il tuo reparto" if area else "") + ". Vai su 'Gestione Commesse' per crearle.")
+    else:
+        st.dataframe(produttivita_dettaglio, use_container_width=True)
+        chart_data = produttivita_dettaglio.melt(id_vars=["Commessa", "Fase", "Area"], value_vars=["Ore_stimate", "Ore_effettive"], var_name="Tipo", value_name="Ore")
+        st.altair_chart(alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X("Ore:Q"), y=alt.Y("Fase:N", sort="-x"), color=alt.Color("Tipo:N"), row=alt.Row("Commessa:N"),
+            tooltip=["Commessa:N", "Fase:N", "Area:N", "Tipo:N", "Ore:Q"]).properties(height=30 * len(produttivita_dettaglio) + 60), use_container_width=True)
+
+    st.markdown("---")
+    st.write("#### 🔎 Traccia lavorazioni di una commessa (chi ha fatto cosa)")
+    st.caption("Ogni sessione Inizio fase → Fine fase su questa commessa, per avere traccia di tutto il processo produttivo (non limitata al periodo scelto sopra)."
+               + (" Qui vedi solo il lavoro del tuo reparto." if area else ""))
+    if not get_commesse_names():
+        st.info("Nessuna commessa configurata.")
+        return
+    commessa_traccia = selettore_commessa_filtrato(f"{key_prefix}_traccia", key_commessa=f"{key_prefix}_commessa_traccia", etichetta="Commessa")
+    if commessa_traccia is None:
+        return
+    mostra_info_commessa(commessa_traccia)
+    storico = get_storico_attivita_commessa(commessa_traccia, df)
+    if area and not storico.empty:
+        storico = storico[storico["Dipendente"].isin(get_users_in_area(area))]
+    if storico.empty:
+        st.info("Nessuna lavorazione registrata finora su questa commessa.")
+        return
+    st.markdown("**Gantt degli operatori**")
+    render_gantt_traccia_commessa(storico, key_prefix)
+    with st.expander("📋 Elenco delle sessioni", expanded=False):
+        st.dataframe(storico, use_container_width=True, hide_index=True)
+
+def render_colore_profilo(username, nome, key_prefix):
+    """Scelta del proprio colore nel Profilo: è il colore con cui si compare nei Gantt e nei report."""
+    attuale = get_user_color(nome) or "#4fa8ff"
+    nuovo = st.color_picker("🎨 Il mio colore", value=attuale, key=f"{key_prefix}_colore_profilo",
+                            help="È il colore delle tue barre nei Gantt (per esempio nella traccia delle lavorazioni di una commessa) e nei report.")
+    if st.button("Salva il colore", key=f"{key_prefix}_colore_salva") and nuovo:
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(nuovo)):
+            st.error("Colore non valido.")
+        else:
+            with db_connect() as conn:
+                c = conn.cursor()
+                c.execute("UPDATE utenti SET colore=? WHERE username=?", (str(nuovo), username))
+                conn.commit()
+            notifica_e_ricarica("Colore salvato.")
+
+def render_bi_commesse(df, key_prefix):
+    """Pagina 'Margini e produttività': marginalità delle commesse (valore - costo reale) e produttività
+    dei reparti (ore stimate vs effettive, anche come trend mensile). Riservata ad amministratore e area Costi."""
+    st.subheader("📈 Marginalità e produttività")
+    vista = st.radio("Cosa vuoi vedere?", ["💶 Marginalità delle commesse", "⏱️ Produttività dei reparti"], horizontal=True, key=f"{key_prefix}_vista")
+    if vista.startswith("💶"):
+        valori = get_valori_commesse()
+        marg = calcola_marginalita_commesse(get_riepilogo_costi_commesse(df), valori)
+        with st.expander("✏️ Imposta il valore (€) di una commessa", expanded=not valori):
+            st.caption("Il valore è quanto la commessa è stata venduta: serve a calcolare il margine. È facoltativo e lo vedono solo amministratore e area Costi.")
+            nomi = get_commesse_names()
+            if nomi:
+                scelta = st.selectbox("Commessa", nomi, key=f"{key_prefix}_valore_commessa")
+                attuale = valori.get(scelta)
+                col1, col2 = st.columns([3, 1])
+                nuovo = col1.number_input("Valore della commessa (€)", min_value=0.0, step=1000.0, value=float(attuale or 0.0), key=f"{key_prefix}_valore_{scelta}")
+                togli = col2.checkbox("Nessun valore", value=attuale is None, key=f"{key_prefix}_valore_nessuno_{scelta}")
+                if st.button("💾 Salva valore", key=f"{key_prefix}_valore_salva"):
+                    ok, errore = imposta_valore_commessa(scelta, None if togli else float(nuovo or 0.0))
+                    if ok:
+                        notifica_e_ricarica(f"Valore di {scelta} salvato.")
+                    else:
+                        st.error(errore)
+        if marg.empty:
+            st.info("Nessuna commessa configurata.")
+            return
+        con_valore = marg[marg["Valore"].notna() & (marg["Valore"] > 0)]
+        if con_valore.empty:
+            st.info("Nessuna commessa ha ancora il valore: impostalo qui sopra per vedere i margini.")
+            st.dataframe(marg[["Commessa", "Cliente", "Costo_personale", "Costo_trasferte", "Costo_totale"]], use_container_width=True, hide_index=True)
+            return
+        valore_tot, costo_tot = float(con_valore["Valore"].sum()), float(con_valore["Costo_totale"].sum())
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Valore commesse", f"{valore_tot:,.0f} €".replace(",", "."))
+        c2.metric("Costo reale", f"{costo_tot:,.0f} €".replace(",", "."))
+        c3.metric("Margine", f"{valore_tot - costo_tot:,.0f} €".replace(",", "."))
+        c4.metric("Margine %", f"{(valore_tot - costo_tot) / valore_tot * 100:.1f}%")
+        senza = len(marg) - len(con_valore)
+        if senza:
+            st.caption(f"{senza} commesse senza valore non compaiono nei grafici e nei totali.")
+        st.markdown("**Margine % per commessa**")
+        dati_m = con_valore.assign(Segno=lambda d: d["Margine_%"].apply(lambda x: "Positivo" if x >= 0 else "Negativo"))
+        st.altair_chart(alt.Chart(dati_m).mark_bar().encode(
+            y=alt.Y("Commessa:N", sort=None, title=None), x=alt.X("Margine_%:Q", title="Margine %"),
+            color=alt.Color("Segno:N", scale=alt.Scale(domain=["Positivo", "Negativo"], range=["#16a34a", "#dc2626"]), legend=None),
+            tooltip=[alt.Tooltip("Commessa:N"), alt.Tooltip("Margine_%:Q", title="Margine %"), alt.Tooltip("Margine:Q", format=",.0f", title="Margine €")]
+        ).properties(height=max(240, 30 * len(dati_m))), use_container_width=True)
+        st.markdown("**Valore (barra larga chiara) e costo reale (barra stretta scura)**")
+        st.altair_chart(_grafico_barre_doppie(con_valore, "Commessa", "Valore", "Costo_totale", "Valore €", "Costo reale €"), use_container_width=True)
+        st.dataframe(con_valore, use_container_width=True, hide_index=True)
+        st.caption("Costo reale = ore timbrate sulle fasi × costo orario del livello + costi delle trasferte. Non comprende materiali, acquisti e costi generali: "
+                   "il margine è quindi una stima per eccesso. «Margine previsto» usa le ore stimate delle fasi (preventivo).")
+    else:
+        fasi_costi = compute_costi_fasi_commessa(df)
+        if fasi_costi.empty:
+            st.info("Nessuna fase configurata.")
+            return
+        solo_complete = st.checkbox("Confronta solo le fasi completate", value=True, key=f"{key_prefix}_solo_complete",
+                                    help="Una fase ancora aperta ha meno ore effettive di quelle che avrà: confrontarla con le ore stimate la farebbe sembrare troppo veloce.")
+        base = fasi_costi[(fasi_costi["Ore_stimate"] > 0)]
+        if solo_complete:
+            base = base[base["Stato"] == "Completata"]
+        per_area = base.groupby("Area", as_index=False).agg(Ore_stimate=("Ore_stimate", "sum"), Ore_effettive=("Ore_effettive", "sum"), Fasi=("Fase", "count"))
+        if per_area.empty:
+            st.info("Nessuna fase completata con ore stimate: appena ce ne sono compare il confronto.")
+        else:
+            per_area["Indice"] = (per_area["Ore_stimate"] / per_area["Ore_effettive"].where(per_area["Ore_effettive"] > 0)).round(2)
+            st.markdown("**Ore stimate (barra larga chiara) e ore effettive (barra stretta scura) per reparto**")
+            st.altair_chart(_grafico_barre_doppie(per_area, "Area", "Ore_stimate", "Ore_effettive", "Ore stimate", "Ore effettive"), use_container_width=True)
+            st.dataframe(per_area.round(1), use_container_width=True, hide_index=True)
+        sessioni = compute_sessioni_fasi(df)
+        trend = compute_trend_produttivita(fasi_costi, sessioni)
+        st.markdown("**Trend mensile dell'indice di produttività** (ore stimate ÷ ore effettive delle fasi completate: sopra 1 = più veloci del previsto)")
+        if trend.empty:
+            st.info("Il trend compare quando ci sono fasi completate con ore stimate e ore timbrate.")
+        else:
+            linee = alt.Chart(trend).mark_line(point=True).encode(x=alt.X("Mese:N", title=None), y=alt.Y("Indice:Q"), color="Area:N",
+                                                                   tooltip=["Mese", "Area", "Ore_stimate", "Ore_effettive", "Indice", "Fasi"])
+            riferimento = alt.Chart(pd.DataFrame({"y": [1.0]})).mark_rule(strokeDash=[4, 4], color="#6b7280").encode(y="y:Q")
+            st.altair_chart((linee + riferimento).properties(height=300), use_container_width=True)
+            st.dataframe(trend, use_container_width=True, hide_index=True)
+        if not sessioni.empty:
+            st.markdown("**Ore lavorate sulle fasi, per mese e reparto**")
+            mensili = sessioni.assign(Mese=pd.to_datetime(sessioni["Inizio"]).dt.strftime("%Y-%m")).groupby(["Mese", "Area"], as_index=False)["Ore"].sum()
+            st.altair_chart(alt.Chart(mensili).mark_bar().encode(x=alt.X("Mese:N", title=None), y=alt.Y("Ore:Q"), color="Area:N",
+                                                                 tooltip=["Mese", "Area", alt.Tooltip("Ore:Q", format=".1f")]).properties(height=280), use_container_width=True)
+        st.caption("Il mese di una fase completata è quello della sua ultima sessione di lavoro. Le ore effettive sono quelle timbrate con Inizio/Fine fase, nette della pausa pranzo.")
 
 def generate_pdf_report(employee_name, period_start, period_end, df_timbrature, _df_requests=None, df_ore_fasi_commessa=None):
     """Genera un rapporto PDF professionale. df_ore_fasi_commessa (facoltativo, da
@@ -3405,6 +4232,8 @@ def registra_orario(nome_dipendente, tipo_azione, luogo_lavoro, dettaglio, comme
     if tipo_azione not in ["Inizio fase", "Fine fase"]:
         commessa = ""; fase = ""; dettaglio_fase = ""
 
+    # Posizione GPS (solo Ingresso/Uscita e solo se la verifica è attiva): non blocca mai la timbratura.
+    posizione = prepara_posizione_timbratura(nome_dipendente, tipo_azione, luogo_lavoro, data_str, posizione_in_corso())
     with db_connect() as conn:
         c = conn.cursor()
         if fase_da_chiudere:
@@ -3415,7 +4244,27 @@ def registra_orario(nome_dipendente, tipo_azione, luogo_lavoro, dettaglio, comme
         c.execute('''INSERT INTO timbrature (Data, Dipendente, Ora, Azione, Luogo, Dettaglio_Trasferta, Commessa, Fase, Dettaglio_Fase, Ruolo, Stato)
                      VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
                   (data_str, nome_dipendente, ora_str, tipo_azione, luogo_lavoro, dettaglio, commessa, fase, dettaglio_fase, ruolo, stato))
+        id_timbratura = c.lastrowid
+        if posizione:
+            try:
+                c.execute('''INSERT INTO posizioni_timbrature (timbratura_id, dipendente, data, ora, azione, luogo, lat, lon, accuratezza_m, riferimento, raggio_m, distanza_m, esito)
+                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                          (id_timbratura, nome_dipendente, data_str, ora_str, tipo_azione, luogo_lavoro, posizione["lat"], posizione["lon"], posizione["acc"],
+                           posizione["riferimento"], posizione["raggio"], posizione["distanza"], posizione["esito"]))
+            except Exception:
+                posizione = None
         conn.commit()
+    if tipo_azione in AZIONI_CON_POSIZIONE:
+        st.session_state.pop("_posizione_gps", None)
+        st.session_state["_geo_n"] = st.session_state.get("_geo_n", 0) + 1    # il prossimo rilevamento riparte da zero
+    if posizione and posizione["esito"] == "Fuori zona":
+        crea_notifiche_app(get_destinatari_responsabili_area(get_area_utente(nome_dipendente), escludi_nome=nome_dipendente),
+                           f"📍 {nome_dipendente}: {tipo_azione.lower()} fuori zona",
+                           f"{posizione['distanza']:.0f} m da: {posizione['riferimento']} (raggio {posizione['raggio']:.0f} m)", "Posizione timbrature", "geo")
+    if posizione and posizione["esito"] != "Dentro":
+        notifica({"Fuori zona": "📍 La posizione risulta lontana dal luogo di lavoro: la timbratura è registrata e viene segnalata al responsabile.",
+                  "Incerta": "📍 Posizione poco precisa: la timbratura è registrata.",
+                  "Senza posizione": "📍 Timbratura registrata senza posizione (la prossima volta premi «Rileva posizione»)."}[posizione["esito"]], "warning")
     carica_dati_db.clear()  # la nuova timbratura deve essere visibile subito, non solo dopo la cache
     _svuota_stato_timbratura()
 
@@ -3480,7 +4329,8 @@ Per approvarla o rifiutarla apri Timbra e vai su Risorse umane → Ferie e perme
 Cordiali saluti,
 Sistema Timbrature
 """
-    invia_email_a(get_destinatari_risorse_umane(escludi_nome=dipendente), f"📋 Nuova richiesta di {tipo.lower()} da {dipendente}", corpo_hr)
+    invia_email_a(get_destinatari_risorse_umane(escludi_nome=dipendente), f"📋 Nuova richiesta di {tipo.lower()} da {dipendente}", corpo_hr,
+                  in_app=(f"Nuova richiesta di {tipo.lower()} da {dipendente}", _descrizione_richiesta(tipo, data_inizio, data_fine, ore_permesso), "Richieste ferie/permessi", "richiesta"))
     # 2) email di conferma di ricezione al richiedente
     corpo_dip = f"""Ciao {dipendente},
 
@@ -3522,7 +4372,8 @@ Dettagli:
 Cordiali saluti,
 Risorse Umane - Sistema Timbrature
 """
-        invia_email_a([get_email_utente(dipendente)], f"{emoji} {tipo_richiesta}: richiesta {esito}", corpo)
+        invia_email_a([get_email_utente(dipendente)], f"{emoji} {tipo_richiesta}: richiesta {esito}", corpo,
+                      in_app=(f"{emoji} La tua richiesta di {str(tipo_richiesta).lower()} è stata {esito}", periodo, "Richiesta ferie/permessi", "esito"))
 
 # --- FUNZIONI RETTIFICHE TIMBRATURE ---
 # Le correzioni di timbratura le approva il responsabile del reparto del dipendente (se il
@@ -3603,7 +4454,8 @@ Per approvarla o rifiutarla apri Timbra → Il mio team → Presenze team → Co
 Cordiali saluti,
 Sistema Timbrature
 """
-    invia_email_a(destinatari, f"📝 Richiesta di correzione timbratura da {dipendente}", corpo_resp)
+    invia_email_a(destinatari, f"📝 Richiesta di correzione timbratura da {dipendente}", corpo_resp,
+                  in_app=(f"Correzione di timbratura da approvare: {dipendente}", f"{azione} del {data_prevista.isoformat()} alle {ora_prevista}", "Rettifiche timbrature", "richiesta"))
     corpo_dip = f"""Ciao {dipendente},
 
 abbiamo ricevuto la tua richiesta di correzione: {azione}{f" ({commessa} → {fase})" if commessa else ""} del {data_prevista.isoformat()} alle {ora_prevista}.
@@ -3681,7 +4533,8 @@ La timbratura è stata registrata nel sistema.
 Cordiali saluti,
 Sistema Timbrature
 """
-    invia_email_a([get_email_utente(dipendente)], "✅ Correzione timbratura approvata", corpo)
+    invia_email_a([get_email_utente(dipendente)], "✅ Correzione timbratura approvata", corpo,
+                  in_app=("✅ Correzione timbratura approvata", f"{azione} del {data_prevista} alle {ora_prevista}", "", "esito"))
     notifica("✅ Correzione approvata e timbratura registrata.")
     return True
 
@@ -3716,7 +4569,8 @@ Per chiarimenti parla con il tuo responsabile.
 Cordiali saluti,
 Sistema Timbrature
 """
-        invia_email_a([get_email_utente(dipendente)], "❌ Correzione timbratura rifiutata", corpo)
+        invia_email_a([get_email_utente(dipendente)], "❌ Correzione timbratura rifiutata", corpo,
+                      in_app=("❌ Correzione timbratura rifiutata", f"{azione} del {data_prevista} alle {ora_prevista}", "", "esito"))
     notifica("❌ Correzione rifiutata.")
 
 # --- FUNZIONI TRASFERTE SERVICE E REPORT INTERVENTI ---
@@ -3995,6 +4849,7 @@ def render_selettore_luogo(nome_dipendente, key_prefix):
         st.session_state[k_firma] = firma
     luogo = st.radio("Modalità di lavoro:", LUOGHI_LAVORO, horizontal=True, key=k_luogo)
     dove = st.text_input("📍 Dove?", key=k_dove) if luogo == "Trasferta" else ""
+    render_rilevamento_posizione(luogo)
     return luogo, dove
 
 def render_sezione_fase_lavorativa(dipendente_scelto, user_info, luogo_scelto, dove_trasferta, key_prefix):
@@ -6041,6 +6896,8 @@ PAGINA_SITUAZIONE_SERVICE = "📍 Situazione dipendenti"
 PAGINA_NUOVA_TRASFERTA = "Programmazione nuova Trasferta"
 PAGINA_TRASFERTE_PROGRAMMATE = "Trasferte programmate"            # quelle ancora da fare (in programma o in corso)
 PAGINA_TRASFERTE_EFFETTUATE = "Trasferte effettuate"              # quelle concluse
+PAGINA_POSIZIONI = "📍 Posizione timbrature"                      # dove sono state fatte le timbrature (GPS), per responsabile e admin
+PAGINA_BI = "📈 Marginalità e produttività"                      # grafici di marginalità delle commesse e produttività dei reparti
 PAGINA_STATISTICHE_ASSISTENZA = "🛠️ Statistiche Assistenza"
 PAGINA_REPORT_RICEVUTI = "Report interventi ricevuti"            # tutti i report inviati dai dipendenti
 PAGINA_REPORT_INTERVENTO = "📷 Compila Report Intervento"        # il report che compila il dipendente per la propria trasferta
@@ -9460,7 +10317,7 @@ PAGINA_HOME = "🏠 Oggi"
 # Pagine dell'amministratore che NON usano lo storico completo delle timbrature (la
 # lettura più pesante dell'app): per queste non viene caricato.
 PAGINE_ADMIN_SENZA_STORICO = {
-    PAGINA_HOME, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI,
+    PAGINA_HOME, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI, PAGINA_POSIZIONI,
     PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI, PAGINA_MAPPA_IMPIANTI_VISTA, PAGINA_SITUAZIONE_SERVICE,
     "Richieste ferie/permessi", "Rettifiche timbrature", "Gestione Commesse", "Gestione Utenti DB",
 }
@@ -9494,6 +10351,8 @@ ETICHETTE_MENU = {
     PAGINA_NUOVA_TRASFERTA: "➕ Programma una trasferta",
     PAGINA_TRASFERTE_PROGRAMMATE: "📅 Trasferte da fare",
     PAGINA_TRASFERTE_EFFETTUATE: "✅ Trasferte effettuate",
+    PAGINA_POSIZIONI: "📍 Dove si è timbrato",
+    PAGINA_BI: "📈 Margini e produttività",
     PAGINA_STATISTICHE_ASSISTENZA: "🛠️ Statistiche assistenza",
     PAGINA_REPORT_RICEVUTI: "📥 Rapporti ricevuti",
     PAGINA_REPORT_INTERVENTO: "📷 Rapporto di intervento",
@@ -9834,13 +10693,19 @@ else:
     if pagina_abilitata_per_autorefresh(st.session_state.get("_ultima_pagina_vista")):
         st_autorefresh(interval=60000, key="datarefresh")
     user_info = get_user_info()
+    # Promemoria "uscita dimenticata": il controllo vero e proprio gira al massimo ogni 15 minuti per tutti.
+    _adesso_controllo = get_current_datetime()
+    if (_adesso_controllo - st.session_state.get("_controllo_uscite_ts", datetime.datetime.min)).total_seconds() > 300:
+        st.session_state["_controllo_uscite_ts"] = _adesso_controllo
+        controlla_uscite_dimenticate(_adesso_controllo)
     _render_logo_header(container=st.sidebar)
     st.sidebar.markdown("---")
     _ruolo_visibile = {"admin": "Amministratore", "responsabile": "Responsabile"}.get(user_info["role"], "Operatore")
     st.sidebar.markdown(f"**{user_info['name']}**  \n{_ruolo_visibile}" + (f" · {user_info['area']}" if user_info.get("area") and user_info["area"] != "All" else ""))
     st.sidebar.button("Esci", on_click=logout)
-    col_saluto, col_esci = st.columns([4, 1])
+    col_saluto, col_campanella, col_esci = st.columns([4, 1, 1])
     col_saluto.markdown(f"#### Ciao, {user_info['name']}!")
+    render_campanella(user_info["name"], col_campanella)
     col_esci.button("Esci", on_click=logout, key="logout_principale", use_container_width=True)
     mostra_notifiche()
 
@@ -9857,11 +10722,11 @@ else:
 
         admin_page = render_menu_a_categorie([
             ("🏠 Oggi", [PAGINA_HOME]),
-            ("🕒 Presenze", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Cartellini dipendenti"]),
+            ("🕒 Presenze", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Cartellini dipendenti", PAGINA_POSIZIONI]),
             ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI]),
             ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
             ("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]),
-            ("📈 Statistiche e costi", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "💰 Costi commesse"]),
+            ("📈 Statistiche e costi", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "💰 Costi commesse", PAGINA_BI]),
             ("⚙️ Utenti", ["Gestione Utenti DB"]),
         ], key_prefix="admin_menu", titolo_categoria="Sezione")
         st.session_state["_ultima_pagina_vista"] = admin_page
@@ -9965,68 +10830,19 @@ else:
             render_gestione_template_fasi(scope_area=None, attore=st.session_state.username)
 
         elif admin_page == "Resoconto Commesse":
-            st.write("### 📊 Ore di Lavoro per Commessa")
-            commessa_start = st.date_input("Inizio", value=datetime.date.today().replace(day=1))
-            commessa_end = st.date_input("Fine", value=datetime.date.today())
-
-            st.write("#### Per dipendente")
-            hours_by_commessa = compute_hours_by_commessa(df, commessa_start, commessa_end)
-            if hours_by_commessa.empty:
-                st.info("Nessun dato sulle commesse disponibile.")
-            else:
-                st.dataframe(hours_by_commessa, use_container_width=True)
-
-            st.markdown("---")
-            st.write("#### Per fase (ore stimate vs ore effettive)")
-            commessa_filtro, nomi_filtrati_fase = selettore_commessa_filtrato(
-                "resoconto_fase", key_commessa="resoconto_commessa_filtro", etichetta="Commessa",
-                opzioni_extra=("Tutte le commesse",), restituisci_nomi=True)
-            produttivita_dettaglio, filtrata_fase = produttivita_commesse_filtrata(
-                df, commessa_start, commessa_end, None, commessa_filtro, nomi_filtrati_fase)
-            if produttivita_dettaglio.empty:
-                if filtrata_fase:
-                    st.info("Nessuna fase da mostrare per le commesse che corrispondono ai filtri.")
-                else:
-                    st.info("Nessuna fase con ore stimate configurata. Vai su 'Gestione Commesse' per crearle.")
-            else:
-                st.dataframe(produttivita_dettaglio, use_container_width=True)
-                chart_data = produttivita_dettaglio.melt(
-                    id_vars=["Commessa", "Fase", "Area"], value_vars=["Ore_stimate", "Ore_effettive"],
-                    var_name="Tipo", value_name="Ore"
-                )
-                bar_stima_effettiva = alt.Chart(chart_data).mark_bar().encode(
-                    x=alt.X("Ore:Q"), y=alt.Y("Fase:N", sort="-x"),
-                    color=alt.Color("Tipo:N"), row=alt.Row("Commessa:N"),
-                    tooltip=["Commessa:N", "Fase:N", "Area:N", "Tipo:N", "Ore:Q"]
-                ).properties(height=30 * len(produttivita_dettaglio) + 60)
-                st.altair_chart(bar_stima_effettiva, use_container_width=True)
-
-            st.markdown("---")
-            st.write("#### 🔎 Traccia lavorazioni di una commessa (chi ha fatto cosa)")
-            st.caption("Elenco cronologico di ogni sessione Inizio fase → Fine fase su questa commessa, per avere traccia di tutto il processo produttivo passo per passo (non limitato al periodo scelto sopra).")
-            commesse_per_traccia = get_commesse_names()
-            if not commesse_per_traccia:
-                st.info("Nessuna commessa configurata.")
-            else:
-                commessa_traccia = selettore_commessa_filtrato(
-                    "resoconto_traccia", key_commessa="resoconto_commessa_traccia", etichetta="Commessa")
-                if commessa_traccia is None:
-                    storico_commessa = None
-                else:
-                    mostra_info_commessa(commessa_traccia)
-                    storico_commessa = get_storico_attivita_commessa(commessa_traccia, df)
-                if storico_commessa is None:
-                    pass
-                elif storico_commessa.empty:
-                    st.info("Nessuna lavorazione registrata finora su questa commessa.")
-                else:
-                    st.dataframe(storico_commessa, use_container_width=True)
+            render_resoconto_commesse(df, key_prefix="admin_resoconto")
 
         elif admin_page == "📅 Pianificazione":
             render_pianificazione_commessa(df, key_prefix="admin_pianificazione", puo_modificare=True)
 
         elif admin_page == "💰 Costi commesse":
             render_gestione_costi(df, key_prefix="admin_costi")
+
+        elif admin_page == PAGINA_BI:
+            render_bi_commesse(df, key_prefix="admin_bi")
+
+        elif admin_page == PAGINA_POSIZIONI:
+            render_posizioni_timbrature(user_info, key_prefix="admin_geo")
 
         elif admin_page == "Grafici e Classifiche":
             render_grafici_classifiche(df, key_prefix="admin_grafici")
@@ -10273,6 +11089,8 @@ else:
                 st.write(f"**Area:** {user_info['area']}")
                 st.write(f"**Ruolo:** {user_info['role']}")
                 render_email_profilo(st.session_state.username, dipendente_scelto, "resp")
+                render_colore_profilo(st.session_state.username, dipendente_scelto, "resp")
+                render_installa_app()
                 st.markdown("---")
                 with st.form("change_password_form_resp"):
                     new_pw = st.text_input("Nuova password", type="password")
@@ -10416,13 +11234,13 @@ else:
             dipendenti_area = get_users_in_area(area_responsabile)
 
             resp_page = render_menu_a_categorie([
-                ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature"]),
+                ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature", PAGINA_POSIZIONI]),
                 ("🏭 Commesse e statistiche", ["Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione", "🗂️ Attività di reparto",
                                               "Statistiche area", PAGINA_MAPPA_IMPIANTI_VISTA]),
                 ("📍 Chi è dove", [PAGINA_MIO_REPARTO, PAGINA_DISPONIBILITA_TEAM]),
             ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
             st.session_state["_ultima_pagina_vista"] = resp_page
-            if resp_page not in (PAGINA_MIO_REPARTO, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA, "Richieste ferie/permessi"):
+            if resp_page not in (PAGINA_MIO_REPARTO, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA, "Richieste ferie/permessi", PAGINA_POSIZIONI):
                 df = carica_dati_db()
 
             if resp_page == "Timbrature del team":
@@ -10437,6 +11255,9 @@ else:
                 else:
                     st.info("Nessun dato disponibile.")
             
+            elif resp_page == PAGINA_POSIZIONI:
+                render_posizioni_timbrature(user_info, key_prefix="resp_geo")
+
             elif resp_page == "Richieste ferie/permessi":
                 st.subheader("🌴 Ferie e permessi del team")
                 st.info("Le richieste di ferie e permessi vengono approvate da Risorse Umane (il richiedente riceve l'esito per email). Qui vedi cosa ha chiesto il tuo team.")
@@ -10500,29 +11321,7 @@ else:
                 render_gestione_template_fasi(scope_area=area_responsabile, attore=st.session_state.username)
 
             elif resp_page == "Resoconto Commesse":
-                st.write(f"### 📊 Ore di Lavoro per Commessa — Area {area_responsabile}")
-                resp_commessa_start = st.date_input("Inizio", value=datetime.date.today().replace(day=1), key="resp_commessa_start")
-                resp_commessa_end = st.date_input("Fine", value=datetime.date.today(), key="resp_commessa_end")
-
-                commessa_filtro_resp, nomi_filtrati_resp = selettore_commessa_filtrato(
-                    "resp_resoconto_fase", key_commessa="resp_commessa_filtro", etichetta="Commessa",
-                    opzioni_extra=("Tutte le commesse",), restituisci_nomi=True)
-                produttivita_resp, _ = produttivita_commesse_filtrata(
-                    df, resp_commessa_start, resp_commessa_end, area_responsabile, commessa_filtro_resp, nomi_filtrati_resp)
-                if produttivita_resp.empty:
-                    st.info("Nessuna fase con ore stimate configurata per il tuo reparto. Vai su 'Gestione fasi commessa' per crearle.")
-                else:
-                    st.dataframe(produttivita_resp, use_container_width=True)
-                    chart_data_resp = produttivita_resp.melt(
-                        id_vars=["Commessa", "Fase", "Area"], value_vars=["Ore_stimate", "Ore_effettive"],
-                        var_name="Tipo", value_name="Ore"
-                    )
-                    bar_resp = alt.Chart(chart_data_resp).mark_bar().encode(
-                        x=alt.X("Ore:Q"), y=alt.Y("Fase:N", sort="-x"),
-                        color=alt.Color("Tipo:N"), row=alt.Row("Commessa:N"),
-                        tooltip=["Commessa:N", "Fase:N", "Tipo:N", "Ore:Q"]
-                    ).properties(height=30 * len(produttivita_resp) + 60)
-                    st.altair_chart(bar_resp, use_container_width=True)
+                render_resoconto_commesse(df, key_prefix="resp_resoconto", area=area_responsabile)
 
             elif resp_page == "Statistiche area":
                 st.subheader(f"📊 Statistiche - Area {area_responsabile}")
@@ -10619,8 +11418,8 @@ else:
 
         elif modalita == "💰 Gestione Costi":
             costi_page = render_menu_a_categorie([
-                ("💰 Costi", ["💰 Costi commesse"]),
-                ("📈 Statistiche", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]),
+                ("💰 Costi", ["💰 Costi commesse", "Resoconto Commesse"]),
+                ("📈 Statistiche", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", PAGINA_BI]),
             ], key_prefix="resp_costi_menu", titolo_categoria="Sezione Costi")
             st.session_state["_ultima_pagina_vista"] = costi_page
             df = carica_dati_db()
@@ -10628,8 +11427,14 @@ else:
             if costi_page == "💰 Costi commesse":
                 render_gestione_costi(df, key_prefix="resp_costi")
 
+            elif costi_page == "Resoconto Commesse":
+                render_resoconto_commesse(df, key_prefix="resp_costi_resoconto")
+
             elif costi_page == "Grafici e Classifiche":
                 render_grafici_classifiche(df, key_prefix="resp_grafici")
+
+            elif costi_page == PAGINA_BI:
+                render_bi_commesse(df, key_prefix="resp_bi")
 
             elif costi_page == "🌱 Sostenibilità (Smart Working)":
                 render_sostenibilita(df, key_prefix="resp_sostenibilita")
@@ -10660,7 +11465,7 @@ else:
         if is_area_amministrazione(user_info["area"]):
             categorie_utente.append(("🧾 Risorse umane", ["Richieste ferie/permessi", "Cartellini dipendenti"]))
         if is_area_costi(user_info["area"]):
-            categorie_utente.append(("💰 Costi e statistiche", ["💰 Costi commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)"]))
+            categorie_utente.append(("💰 Costi e statistiche", ["💰 Costi commesse", "Resoconto Commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", PAGINA_BI]))
         pagina_utente = render_menu_a_categorie(
             categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
@@ -10692,6 +11497,8 @@ else:
             st.write(f"**Area:** {user_info['area']}")
             st.write(f"**Ruolo:** {user_info['role']}")
             render_email_profilo(st.session_state.username, dipendente_scelto, "user")
+            render_colore_profilo(st.session_state.username, dipendente_scelto, "user")
+            render_installa_app()
             st.markdown("---")
             with st.form("change_password_form"):
                 new_pw = st.text_input("Nuova password", type="password")
@@ -10870,6 +11677,12 @@ else:
 
         elif pagina_utente == "💰 Costi commesse":
             render_gestione_costi(df, key_prefix="user_costi")
+
+        elif pagina_utente == "Resoconto Commesse":
+            render_resoconto_commesse(df, key_prefix="user_costi_resoconto")
+
+        elif pagina_utente == PAGINA_BI:
+            render_bi_commesse(df, key_prefix="user_bi")
 
         elif pagina_utente == "Grafici e Classifiche":
             render_grafici_classifiche(df, key_prefix="user_grafici")
