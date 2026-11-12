@@ -2412,17 +2412,28 @@ def _inject_stile_vimek():
         font-weight: 600;
     }}
 
-    /* Menu di navigazione nella barra laterale: riquadri apribili come quello delle notifiche,
-       pagine come pulsanti a sinistra, voce attiva in bianco. */
+    /* Menu di navigazione nella barra laterale, classico e tutto aperto: titoli di gruppo piccoli,
+       una voce per riga, voce attiva in bianco. */
+    section[data-testid="stSidebar"] .navv-titolo {{
+        color: #8fa8c8 !important;
+        font-size: .72rem;
+        font-weight: 700;
+        letter-spacing: .1em;
+        text-transform: uppercase;
+        margin: .9rem 0 .1rem .3rem;
+    }}
+    section[data-testid="stSidebar"] [class*="st-key-navv_"] {{
+        margin-bottom: -.55rem;
+    }}
     section[data-testid="stSidebar"] [class*="st-key-navv_"] button {{
         justify-content: flex-start;
         text-align: left;
         background-color: transparent;
-        border: 1px solid rgba(255,255,255,.18);
+        border: none;
         font-weight: 400;
-    }}
-    section[data-testid="stSidebar"] [data-testid="stExpander"] [class*="st-key-navv_"] button {{
-        border-color: transparent;
+        font-size: 1rem;
+        min-height: 2.4rem;
+        padding: .3rem .7rem;
     }}
     section[data-testid="stSidebar"] [class*="st-key-navv_"] button:hover {{
         background-color: rgba(255,255,255,.14);
@@ -2430,16 +2441,13 @@ def _inject_stile_vimek():
     section[data-testid="stSidebar"] .stButton>button[kind="primary"],
     section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] {{
         background-color: #ffffff;
-        border-color: #ffffff;
+        border: none;
         justify-content: flex-start;
     }}
     section[data-testid="stSidebar"] .stButton>button[kind="primary"] *,
     section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] * {{
         color: {VIMEK_NAVY} !important;
         font-weight: 700;
-    }}
-    section[data-testid="stSidebar"] [data-testid="stExpander"] details[open] > summary {{
-        font-weight: 600;
     }}
 
     /* Telefono: margini ridotti, pulsanti e campi comodi da toccare col dito */
@@ -10476,28 +10484,31 @@ def _voce_menu_laterale(testo, chiave, attiva, on_click, args):
     st.sidebar.button(testo, key=f"navv_{chiave}", use_container_width=True,
               type="primary" if attiva else "secondary", on_click=on_click, args=args)
 
+def _titolo_menu_laterale(testo):
+    """Titolo di gruppo del menu laterale (piccolo, maiuscolo, grigio-azzurro)."""
+    st.sidebar.markdown(f'<div class="navv-titolo">{etichetta_menu(testo)}</div>', unsafe_allow_html=True)
+
 def render_selettore_area(opzioni, chiave):
-    """Scelta dell'area di lavoro del responsabile (Io / Il mio team / Trasferte / ...), nella barra
-    laterale come riquadro apribile, uguale a quello delle notifiche. Restituisce l'area attiva."""
+    """Scelta dell'area di lavoro del responsabile (Io / Il mio team / Trasferte / ...), in cima al
+    menu laterale come gruppo di voci. Restituisce l'area attiva."""
     opzioni = list(opzioni)
     if st.session_state.get(chiave) not in opzioni:
         st.session_state[chiave] = opzioni[0]
     corrente = st.session_state[chiave]
-    st.sidebar.markdown("**Area di lavoro**")
-    with st.sidebar.expander(f"🧭 {etichetta_menu(corrente)}", expanded=False):
-        for o in opzioni:
-            _voce_menu_laterale(etichetta_menu(o), f"{chiave}_{o}", o == corrente, _scegli_area_lavoro, (chiave, o))
+    _titolo_menu_laterale("Area di lavoro")
+    for o in opzioni:
+        _voce_menu_laterale(etichetta_menu(o), f"{chiave}_{o}", o == corrente, _scegli_area_lavoro, (chiave, o))
+    st.sidebar.markdown("---")
     return corrente
 
 def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
-    """Menu di navigazione nella barra laterale (blu), a due livelli: ogni sezione è un riquadro
-    apribile come quello delle notifiche, con dentro le sue pagine come pulsanti; la sezione e la
-    pagina attive sono evidenziate (la sezione attiva è già aperta). Una sezione con una sola
-    pagina è un pulsante diretto. 'categorie' è una lista di tuple (nome_sezione, [pagine]).
-    Restituisce il nome interno della pagina scelta, come prima: il resto del codice che lo
-    confronta con le singole pagine non cambia (i testi mostrati vengono da ETICHETTE_MENU).
-    Sul telefono la barra laterale è chiusa: in alto resta il percorso 'Sezione > Pagina' e la
-    pagina 'Oggi' ha i pulsanti grandi per le azioni più frequenti."""
+    """Menu di navigazione nella barra laterale (blu), classico e tutto aperto: ogni sezione ha un
+    piccolo titolo di gruppo e sotto le sue pagine, una per riga; la pagina attiva è in bianco.
+    Una sezione con una sola pagina è direttamente una voce, senza titolo. 'categorie' è una lista
+    di tuple (nome_sezione, [pagine]). Restituisce il nome interno della pagina scelta, come prima:
+    il resto del codice che lo confronta con le singole pagine non cambia (i testi mostrati
+    vengono da ETICHETTE_MENU). Sul telefono la barra laterale è chiusa (si apre con le tre
+    lineette): in alto resta il percorso 'Sezione > Pagina' e la pagina 'Oggi' ha i pulsanti grandi."""
     st.session_state["_menu_attivo"] = key_prefix
     mappa_pagine_per_categoria = dict(categorie)
     nomi_categorie = list(mappa_pagine_per_categoria.keys())
@@ -10512,24 +10523,20 @@ def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
     pagine_attive = mappa_pagine_per_categoria[categoria_attiva]
     pagina_attiva = pagine_attive[0] if len(pagine_attive) == 1 else st.session_state[f"{key_prefix}_pagina_{categoria_attiva}"]
 
-    st.sidebar.markdown("**Menu**")
     for nome_categoria in nomi_categorie:
         pagine = mappa_pagine_per_categoria[nome_categoria]
         e_attiva = nome_categoria == categoria_attiva
         if len(pagine) == 1:
             _voce_menu_laterale(etichetta_menu(nome_categoria), f"{key_prefix}_{nome_categoria}", e_attiva,
                                 _scegli_voce_menu, (key_prefix, nome_categoria, None))
-        elif len(nomi_categorie) == 1:
-            for pagina in pagine:
-                _voce_menu_laterale(etichetta_menu(pagina), f"{key_prefix}_{nome_categoria}_{pagina}", pagina == pagina_attiva,
-                                    _scegli_voce_menu, (key_prefix, nome_categoria, pagina))
-        else:
-            with st.sidebar.expander(etichetta_menu(nome_categoria), expanded=e_attiva):
-                for pagina in pagine:
-                    _voce_menu_laterale(etichetta_menu(pagina), f"{key_prefix}_{nome_categoria}_{pagina}",
-                                        e_attiva and pagina == pagina_attiva,
-                                        _scegli_voce_menu, (key_prefix, nome_categoria, pagina))
-    if len(nomi_categorie) > 1 and len(pagine_attive) > 1:
+            continue
+        if len(nomi_categorie) > 1:
+            _titolo_menu_laterale(nome_categoria)
+        for pagina in pagine:
+            _voce_menu_laterale(etichetta_menu(pagina), f"{key_prefix}_{nome_categoria}_{pagina}",
+                                e_attiva and pagina == pagina_attiva,
+                                _scegli_voce_menu, (key_prefix, nome_categoria, pagina))
+    if len(pagine_attive) > 1:
         st.caption(f"📍 {etichetta_menu(categoria_attiva)}  ›  {etichetta_menu(pagina_attiva)}")
     return pagina_attiva
 
