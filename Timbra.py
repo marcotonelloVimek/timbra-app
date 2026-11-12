@@ -2412,6 +2412,36 @@ def _inject_stile_vimek():
         font-weight: 600;
     }}
 
+    /* Menu di navigazione nella barra laterale: riquadri apribili come quello delle notifiche,
+       pagine come pulsanti a sinistra, voce attiva in bianco. */
+    section[data-testid="stSidebar"] [class*="st-key-navv_"] button {{
+        justify-content: flex-start;
+        text-align: left;
+        background-color: transparent;
+        border: 1px solid rgba(255,255,255,.18);
+        font-weight: 400;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stExpander"] [class*="st-key-navv_"] button {{
+        border-color: transparent;
+    }}
+    section[data-testid="stSidebar"] [class*="st-key-navv_"] button:hover {{
+        background-color: rgba(255,255,255,.14);
+    }}
+    section[data-testid="stSidebar"] .stButton>button[kind="primary"],
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] {{
+        background-color: #ffffff;
+        border-color: #ffffff;
+        justify-content: flex-start;
+    }}
+    section[data-testid="stSidebar"] .stButton>button[kind="primary"] *,
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] * {{
+        color: {VIMEK_NAVY} !important;
+        font-weight: 700;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stExpander"] details[open] > summary {{
+        font-weight: 600;
+    }}
+
     /* Telefono: margini ridotti, pulsanti e campi comodi da toccare col dito */
     @media (max-width: 640px) {{
         div[data-testid="stMainBlockContainer"], .block-container {{
@@ -10434,25 +10464,74 @@ def scelta_a_pulsanti(etichetta, opzioni, chiave, classe_css="navmenu"):
     return st.radio(etichetta, opzioni, key=chiave, horizontal=True, label_visibility="collapsed", format_func=etichetta_menu)
 
 
+def _scegli_voce_menu(prefisso_menu, categoria, pagina=None):
+    """Callback dei pulsanti del menu laterale: memorizza sezione e pagina scelte (le stesse
+    chiavi di sessione che usa vai_a_pagina, così i pulsanti della pagina 'Oggi' continuano a funzionare)."""
+    vai_a_pagina(prefisso_menu, categoria, pagina)
+
+def _scegli_area_lavoro(chiave, valore):
+    st.session_state[chiave] = valore
+
+def _voce_menu_laterale(testo, chiave, attiva, on_click, args):
+    st.button(testo, key=f"navv_{chiave}", use_container_width=True,
+              type="primary" if attiva else "secondary", on_click=on_click, args=args)
+
+def render_selettore_area(opzioni, chiave):
+    """Scelta dell'area di lavoro del responsabile (Io / Il mio team / Trasferte / ...), nella barra
+    laterale come riquadro apribile, uguale a quello delle notifiche. Restituisce l'area attiva."""
+    opzioni = list(opzioni)
+    if st.session_state.get(chiave) not in opzioni:
+        st.session_state[chiave] = opzioni[0]
+    corrente = st.session_state[chiave]
+    st.sidebar.markdown("**Area di lavoro**")
+    with st.sidebar.expander(f"🧭 {etichetta_menu(corrente)}", expanded=False):
+        for o in opzioni:
+            _voce_menu_laterale(etichetta_menu(o), f"{chiave}_{o}", o == corrente, _scegli_area_lavoro, (chiave, o))
+    return corrente
+
 def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
-    """Menu di navigazione in alto, a due livelli: prima la sezione (poche voci), poi la
-    pagina di quella sezione, entrambe come file di pulsanti (vedi scelta_a_pulsanti).
-    Sta nell'area principale e non nel menu laterale perché sul telefono il menu laterale
-    è nascosto e va aperto a mano. 'categorie' è una lista di tuple (nome_sezione,
-    [pagine]). Restituisce il nome interno della pagina scelta, come prima: il resto del
-    codice che lo confronta con le singole pagine non cambia (i testi mostrati vengono
-    da ETICHETTE_MENU)."""
+    """Menu di navigazione nella barra laterale (blu), a due livelli: ogni sezione è un riquadro
+    apribile come quello delle notifiche, con dentro le sue pagine come pulsanti; la sezione e la
+    pagina attive sono evidenziate (la sezione attiva è già aperta). Una sezione con una sola
+    pagina è un pulsante diretto. 'categorie' è una lista di tuple (nome_sezione, [pagine]).
+    Restituisce il nome interno della pagina scelta, come prima: il resto del codice che lo
+    confronta con le singole pagine non cambia (i testi mostrati vengono da ETICHETTE_MENU).
+    Sul telefono la barra laterale è chiusa: in alto resta il percorso 'Sezione > Pagina' e la
+    pagina 'Oggi' ha i pulsanti grandi per le azioni più frequenti."""
     st.session_state["_menu_attivo"] = key_prefix
     mappa_pagine_per_categoria = dict(categorie)
     nomi_categorie = list(mappa_pagine_per_categoria.keys())
-    if len(nomi_categorie) > 1:
-        categoria_scelta = scelta_a_pulsanti(titolo_categoria, nomi_categorie, f"{key_prefix}_categoria", "navsezioni")
-    else:
-        categoria_scelta = nomi_categorie[0]
-    pagine_categoria = mappa_pagine_per_categoria[categoria_scelta]
-    if len(pagine_categoria) == 1:
-        return pagine_categoria[0]            # una sola pagina: niente seconda scelta
-    return scelta_a_pulsanti(categoria_scelta, pagine_categoria, f"{key_prefix}_pagina_{categoria_scelta}", "navpagine")
+    chiave_categoria = f"{key_prefix}_categoria"
+    if st.session_state.get(chiave_categoria) not in nomi_categorie:
+        st.session_state[chiave_categoria] = nomi_categorie[0]
+    categoria_attiva = st.session_state[chiave_categoria]
+    for nome_categoria, pagine in mappa_pagine_per_categoria.items():
+        chiave_pagina = f"{key_prefix}_pagina_{nome_categoria}"
+        if len(pagine) > 1 and st.session_state.get(chiave_pagina) not in pagine:
+            st.session_state[chiave_pagina] = pagine[0]
+    pagine_attive = mappa_pagine_per_categoria[categoria_attiva]
+    pagina_attiva = pagine_attive[0] if len(pagine_attive) == 1 else st.session_state[f"{key_prefix}_pagina_{categoria_attiva}"]
+
+    st.sidebar.markdown("**Menu**")
+    for nome_categoria in nomi_categorie:
+        pagine = mappa_pagine_per_categoria[nome_categoria]
+        e_attiva = nome_categoria == categoria_attiva
+        if len(pagine) == 1:
+            _voce_menu_laterale(etichetta_menu(nome_categoria), f"{key_prefix}_{nome_categoria}", e_attiva,
+                                _scegli_voce_menu, (key_prefix, nome_categoria, None))
+        elif len(nomi_categorie) == 1:
+            for pagina in pagine:
+                _voce_menu_laterale(etichetta_menu(pagina), f"{key_prefix}_{nome_categoria}_{pagina}", pagina == pagina_attiva,
+                                    _scegli_voce_menu, (key_prefix, nome_categoria, pagina))
+        else:
+            with st.sidebar.expander(etichetta_menu(nome_categoria), expanded=e_attiva):
+                for pagina in pagine:
+                    _voce_menu_laterale(etichetta_menu(pagina), f"{key_prefix}_{nome_categoria}_{pagina}",
+                                        e_attiva and pagina == pagina_attiva,
+                                        _scegli_voce_menu, (key_prefix, nome_categoria, pagina))
+    if len(nomi_categorie) > 1 and len(pagine_attive) > 1:
+        st.caption(f"📍 {etichetta_menu(categoria_attiva)}  ›  {etichetta_menu(pagina_attiva)}")
+    return pagina_attiva
 
 
 def render_email_profilo(username, nome, key_prefix):
@@ -11042,7 +11121,7 @@ else:
         if is_area_amministrazione(user_info["area"]):
             opzioni_modalita.append("👥 Risorse Umane")
         if len(opzioni_modalita) > 1:
-            modalita = scelta_a_pulsanti("Area di lavoro", opzioni_modalita, "resp_modalita", "navsezioni")
+            modalita = render_selettore_area(opzioni_modalita, "resp_modalita")
         else:
             modalita = opzioni_modalita[0]
 
