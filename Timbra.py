@@ -2412,37 +2412,40 @@ def _inject_stile_vimek():
         font-weight: 600;
     }}
 
-    /* Menu di navigazione nella barra laterale, classico e tutto aperto: titoli di gruppo piccoli,
-       una voce per riga, voce attiva in bianco. */
+    /* Menu laterale: riquadri a scomparsa come quello delle Notifiche, pagine come pulsanti con il
+       testo allineato a sinistra, pagina attiva in bianco. Titoli di gruppo piccoli e maiuscoli. */
+    section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {{
+        gap: .4rem;
+    }}
     section[data-testid="stSidebar"] .navv-titolo {{
         color: #8fa8c8 !important;
         font-size: .72rem;
         font-weight: 700;
         letter-spacing: .1em;
         text-transform: uppercase;
-        margin: .9rem 0 .1rem .3rem;
+        margin: .7rem 0 0 .2rem;
     }}
-    section[data-testid="stSidebar"] [class*="st-key-navv_"] {{
-        margin-bottom: -.55rem;
+    section[data-testid="stSidebar"] .stButton>button,
+    section[data-testid="stSidebar"] .stButton>button > div,
+    section[data-testid="stSidebar"] .stButton>button p {{
+        justify-content: flex-start !important;
+        text-align: left !important;
     }}
-    section[data-testid="stSidebar"] [class*="st-key-navv_"] button {{
-        justify-content: flex-start;
-        text-align: left;
+    section[data-testid="stSidebar"] .stButton>button > div {{
+        width: 100%;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stExpander"] .stButton>button {{
         background-color: transparent;
-        border: none;
-        font-weight: 400;
-        font-size: 1rem;
-        min-height: 2.4rem;
-        padding: .3rem .7rem;
+        border-color: transparent;
     }}
-    section[data-testid="stSidebar"] [class*="st-key-navv_"] button:hover {{
+    section[data-testid="stSidebar"] [data-testid="stExpander"] .stButton>button:hover {{
         background-color: rgba(255,255,255,.14);
     }}
     section[data-testid="stSidebar"] .stButton>button[kind="primary"],
-    section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] {{
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"],
+    section[data-testid="stSidebar"] [data-testid="stExpander"] .stButton>button[kind="primary"] {{
         background-color: #ffffff;
-        border: none;
-        justify-content: flex-start;
+        border-color: #ffffff;
     }}
     section[data-testid="stSidebar"] .stButton>button[kind="primary"] *,
     section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] * {{
@@ -10472,73 +10475,178 @@ def scelta_a_pulsanti(etichetta, opzioni, chiave, classe_css="navmenu"):
     return st.radio(etichetta, opzioni, key=chiave, horizontal=True, label_visibility="collapsed", format_func=etichetta_menu)
 
 
-def _scegli_voce_menu(prefisso_menu, categoria, pagina=None):
-    """Callback dei pulsanti del menu laterale: memorizza sezione e pagina scelte (le stesse
-    chiavi di sessione che usa vai_a_pagina, così i pulsanti della pagina 'Oggi' continuano a funzionare)."""
-    vai_a_pagina(prefisso_menu, categoria, pagina)
+def _scegli_voce_menu(prefisso_menu, categoria, pagina=None, modalita=None):
+    """Callback dei pulsanti del menu laterale: memorizza area (per i responsabili), sezione e pagina
+    scelte (le stesse chiavi di sessione che usa vai_a_pagina, così i pulsanti di 'Oggi' funzionano)."""
+    vai_a_pagina(prefisso_menu, categoria, pagina, modalita)
 
-def _scegli_area_lavoro(chiave, valore):
-    st.session_state[chiave] = valore
+def _voce_menu_laterale(contenitore, testo, chiave, attiva, args):
+    contenitore.button(testo, key=f"navv_{chiave}", use_container_width=True,
+                       type="primary" if attiva else "secondary", on_click=_scegli_voce_menu, args=args)
 
-def _voce_menu_laterale(testo, chiave, attiva, on_click, args):
-    st.sidebar.button(testo, key=f"navv_{chiave}", use_container_width=True,
-              type="primary" if attiva else "secondary", on_click=on_click, args=args)
+def _titolo_menu_laterale(contenitore, testo):
+    """Titolo piccolo, maiuscolo, grigio-azzurro: separa 'La mia area' da 'Il mio gruppo' o le sezioni di un riquadro."""
+    contenitore.markdown(f'<div class="navv-titolo">{testo}</div>', unsafe_allow_html=True)
 
-def _titolo_menu_laterale(testo):
-    """Titolo di gruppo del menu laterale (piccolo, maiuscolo, grigio-azzurro)."""
-    st.sidebar.markdown(f'<div class="navv-titolo">{etichetta_menu(testo)}</div>', unsafe_allow_html=True)
+def _stato_menu(categorie, key_prefix):
+    """(sezione attiva, pagina attiva) del menu 'key_prefix', correggendo i valori di sessione non
+    più validi (si riparte dalla prima voce)."""
+    mappa = dict(categorie)
+    nomi = list(mappa.keys())
+    if st.session_state.get(f"{key_prefix}_categoria") not in nomi:
+        st.session_state[f"{key_prefix}_categoria"] = nomi[0]
+    categoria = st.session_state[f"{key_prefix}_categoria"]
+    pagine = mappa[categoria]
+    if len(pagine) == 1:
+        return categoria, pagine[0]
+    chiave_pagina = f"{key_prefix}_pagina_{categoria}"
+    if st.session_state.get(chiave_pagina) not in pagine:
+        st.session_state[chiave_pagina] = pagine[0]
+    return categoria, st.session_state[chiave_pagina]
 
-def render_selettore_area(opzioni, chiave):
-    """Scelta dell'area di lavoro del responsabile (Io / Il mio team / Trasferte / ...), in cima al
-    menu laterale come gruppo di voci. Restituisce l'area attiva."""
-    opzioni = list(opzioni)
-    if st.session_state.get(chiave) not in opzioni:
-        st.session_state[chiave] = opzioni[0]
-    corrente = st.session_state[chiave]
-    _titolo_menu_laterale("Area di lavoro")
-    for o in opzioni:
-        _voce_menu_laterale(etichetta_menu(o), f"{chiave}_{o}", o == corrente, _scegli_area_lavoro, (chiave, o))
-    st.sidebar.markdown("---")
-    return corrente
+def modalita_responsabile(user_info):
+    """Aree di lavoro del responsabile: sempre 'Mie funzioni personali' e 'Gestione Team', più
+    Trasferte (area Service), Costi e Risorse umane secondo l'area."""
+    opzioni = ["Mie funzioni personali", "Gestione Team"]
+    if is_area_service(user_info["area"]):
+        opzioni.append("🧳 Trasferte Service")
+    if is_area_costi(user_info["area"]):
+        opzioni.append("💰 Gestione Costi")
+    if is_area_amministrazione(user_info["area"]):
+        opzioni.append("👥 Risorse Umane")
+    return opzioni
+
+PERSONALE = "👤 LA MIA AREA"
+GRUPPO = "👥 IL MIO GRUPPO"
+
+def menu_per_utente(user_info):
+    """Tutte le voci del menu laterale per questo utente, in un posto solo. Restituisce
+    (blocchi, categorie_per_prefisso). Ogni blocco è un riquadro apribile (o un pulsante diretto se
+    ha una sola pagina): {'titolo', 'prefisso', 'modalita' (solo responsabili), 'gruppo', 'categorie'}.
+    Idea: nell'AREA PERSONALE c'è tutto ciò che riguarda me (timbrare, ore, ferie, commesse mie,
+    profilo); nel GRUPPO tutto ciò che riguarda il reparto/team e la gestione."""
+    ruolo = user_info["role"]
+    area = user_info["area"]
+    blocchi = []
+    if ruolo == "admin":
+        categorie = [
+            ("🏠 Oggi", [PAGINA_HOME]),
+            ("🕒 Presenze", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Cartellini dipendenti", PAGINA_POSIZIONI]),
+            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI]),
+            ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
+            ("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]),
+            ("📈 Statistiche e costi", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "💰 Costi commesse", PAGINA_BI]),
+            ("⚙️ Utenti", ["Gestione Utenti DB"]),
+        ]
+        for c in categorie:
+            blocchi.append({"titolo": c[0], "prefisso": "admin_menu", "modalita": None, "gruppo": None, "categorie": [c]})
+        return blocchi, {"admin_menu": categorie}
+
+    sono_service = is_area_service(area)
+    if ruolo == "responsabile":
+        personale = ["Timbrature", "Riepilogo personale", "Report mensile", "Richiesta ferie/permessi", "Richiesta rettifica", "Le mie Commesse"]
+        if not sono_service:
+            personale.append(PAGINA_REPORT_INTERVENTO)
+        personale.append("Profilo")
+        cat_personale = [("🏠 Oggi", [PAGINA_HOME]), ("👤 Area personale", personale)]
+        cat_team = [
+            ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature", PAGINA_POSIZIONI]),
+            ("🏭 Commesse e statistiche", ["Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione", "🗂️ Attività di reparto",
+                                          "Statistiche area", PAGINA_MAPPA_IMPIANTI_VISTA]),
+            ("📍 Chi è dove", [PAGINA_MIO_REPARTO, PAGINA_DISPONIBILITA_TEAM]),
+        ]
+        cat_hr = [("🧾 Risorse umane", ["Richieste ferie/permessi", "Cartellini dipendenti"])]
+        cat_costi = [("💰 Costi", ["💰 Costi commesse", "Resoconto Commesse"]),
+                     ("📈 Statistiche", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", PAGINA_BI])]
+        mappa = {"resp_personale_menu": cat_personale, "resp_team_menu": cat_team, "resp_trasferte_menu": categorie_trasferte_service(),
+                 "resp_hr_menu": cat_hr, "resp_costi_menu": cat_costi}
+        blocchi.append({"titolo": "🏠 Oggi", "prefisso": "resp_personale_menu", "modalita": "Mie funzioni personali", "gruppo": None, "categorie": [cat_personale[0]]})
+        blocchi.append({"titolo": "👤 Area personale", "prefisso": "resp_personale_menu", "modalita": "Mie funzioni personali", "gruppo": PERSONALE, "categorie": [cat_personale[1]]})
+        blocchi.append({"titolo": "👥 Il mio team", "prefisso": "resp_team_menu", "modalita": "Gestione Team", "gruppo": GRUPPO, "categorie": cat_team})
+        if sono_service:
+            blocchi.append({"titolo": "🧳 Trasferte", "prefisso": "resp_trasferte_menu", "modalita": "🧳 Trasferte Service", "gruppo": GRUPPO, "categorie": mappa["resp_trasferte_menu"]})
+        if is_area_amministrazione(area):
+            blocchi.append({"titolo": "🧾 Risorse umane", "prefisso": "resp_hr_menu", "modalita": "👥 Risorse Umane", "gruppo": GRUPPO, "categorie": cat_hr})
+        if is_area_costi(area):
+            blocchi.append({"titolo": "💰 Costi e statistiche", "prefisso": "resp_costi_menu", "modalita": "💰 Gestione Costi", "gruppo": GRUPPO, "categorie": cat_costi})
+        return blocchi, mappa
+
+    # Operatore
+    personale = ["Timbrature", "Riepilogo personale", "Report mensile", "Richiesta ferie/permessi", "Richiesta rettifica", "Le mie Commesse"]
+    if sono_service or ha_trasferte(user_info["name"]):
+        personale.append(PAGINA_REPORT_INTERVENTO)
+    personale.append("Profilo")
+    categorie = [("🏠 Oggi", [PAGINA_HOME]), ("👤 Area personale", personale)]
+    blocchi.append({"titolo": "🏠 Oggi", "prefisso": "user_menu", "modalita": None, "gruppo": None, "categorie": [categorie[0]]})
+    blocchi.append({"titolo": "👤 Area personale", "prefisso": "user_menu", "modalita": None, "gruppo": PERSONALE, "categorie": [categorie[1]]})
+    if sono_service:
+        cat_gruppo = [
+            ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
+            ("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]),
+            ("🏭 Commesse", ["📅 Pianificazione", PAGINA_MAPPA_IMPIANTI]),
+        ]
+        titolo_gruppo = "🧳 Trasferte e gruppo"
+    else:
+        cat_gruppo = [("👥 Il mio reparto", [PAGINA_MIO_REPARTO, "📅 Pianificazione", PAGINA_MAPPA_IMPIANTI_VISTA])]
+        titolo_gruppo = "👥 Il mio reparto"
+    categorie += cat_gruppo
+    blocchi.append({"titolo": titolo_gruppo, "prefisso": "user_menu", "modalita": None, "gruppo": GRUPPO, "categorie": cat_gruppo})
+    if is_area_amministrazione(area):
+        c = ("🧾 Risorse umane", ["Richieste ferie/permessi", "Cartellini dipendenti"])
+        categorie.append(c)
+        blocchi.append({"titolo": c[0], "prefisso": "user_menu", "modalita": None, "gruppo": GRUPPO, "categorie": [c]})
+    if is_area_costi(area):
+        c = ("💰 Costi e statistiche", ["💰 Costi commesse", "Resoconto Commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", PAGINA_BI])
+        categorie.append(c)
+        blocchi.append({"titolo": c[0], "prefisso": "user_menu", "modalita": None, "gruppo": GRUPPO, "categorie": [c]})
+    return blocchi, {"user_menu": categorie}
+
+def disegna_menu_laterale(blocchi, mappa_categorie, modalita_attiva=None):
+    """Disegna il menu nella barra laterale blu: ogni blocco è un riquadro a scomparsa come quello
+    delle Notifiche (aperto quello in cui ci si trova), con le pagine come pulsanti allineati a
+    sinistra; la pagina attiva è in bianco. Un blocco con una sola pagina è un pulsante diretto.
+    Se ci sono sia voci personali sia di gruppo, due titoli le separano."""
+    stati = {}
+    for prefisso, categorie in mappa_categorie.items():
+        if modalita_attiva is None or any(b["prefisso"] == prefisso and b["modalita"] == modalita_attiva for b in blocchi):
+            stati[prefisso] = _stato_menu(categorie, prefisso)
+    gruppi = {b["gruppo"] for b in blocchi if b["gruppo"]}
+    titoli_visti = set()
+    for b in blocchi:
+        if len(gruppi) > 1 and b["gruppo"] and b["gruppo"] not in titoli_visti:
+            titoli_visti.add(b["gruppo"])
+            _titolo_menu_laterale(st.sidebar, b["gruppo"])
+        prefisso, modalita = b["prefisso"], b["modalita"]
+        attivo_blocco = (modalita is None or modalita == modalita_attiva) and prefisso in stati
+        cat_att, pag_att = stati.get(prefisso, (None, None))
+        categorie = b["categorie"]
+        n_pagine = sum(len(pagine) for _, pagine in categorie)
+        if n_pagine == 1:
+            nome_categoria = categorie[0][0]
+            _voce_menu_laterale(st.sidebar, b["titolo"], f"{prefisso}_{nome_categoria}", attivo_blocco and cat_att == nome_categoria,
+                                (prefisso, nome_categoria, None, modalita))
+            continue
+        aperto = attivo_blocco and cat_att in [c for c, _ in categorie]
+        riquadro = st.sidebar.expander(b["titolo"], expanded=aperto)
+        con_titoli = len(categorie) > 1
+        for nome_categoria, pagine in categorie:
+            if con_titoli:
+                _titolo_menu_laterale(riquadro, nome_categoria)
+            for pagina in pagine:
+                _voce_menu_laterale(riquadro, etichetta_menu(pagina), f"{prefisso}_{nome_categoria}_{pagina}",
+                                    attivo_blocco and nome_categoria == cat_att and pagina == pag_att,
+                                    (prefisso, nome_categoria, pagina, modalita))
 
 def render_menu_a_categorie(categorie, key_prefix, titolo_categoria="Sezione"):
-    """Menu di navigazione nella barra laterale (blu), classico e tutto aperto: ogni sezione ha un
-    piccolo titolo di gruppo e sotto le sue pagine, una per riga; la pagina attiva è in bianco.
-    Una sezione con una sola pagina è direttamente una voce, senza titolo. 'categorie' è una lista
-    di tuple (nome_sezione, [pagine]). Restituisce il nome interno della pagina scelta, come prima:
-    il resto del codice che lo confronta con le singole pagine non cambia (i testi mostrati
-    vengono da ETICHETTE_MENU). Sul telefono la barra laterale è chiusa (si apre con le tre
-    lineette): in alto resta il percorso 'Sezione > Pagina' e la pagina 'Oggi' ha i pulsanti grandi."""
+    """Restituisce il nome interno della pagina scelta nel menu 'key_prefix' (il menu vero e proprio è
+    già stato disegnato da disegna_menu_laterale): il resto del codice che lo confronta con le singole
+    pagine non cambia. Sopra la pagina mette il percorso 'Sezione > Pagina', utile da telefono dove la
+    barra laterale è chiusa."""
     st.session_state["_menu_attivo"] = key_prefix
-    mappa_pagine_per_categoria = dict(categorie)
-    nomi_categorie = list(mappa_pagine_per_categoria.keys())
-    chiave_categoria = f"{key_prefix}_categoria"
-    if st.session_state.get(chiave_categoria) not in nomi_categorie:
-        st.session_state[chiave_categoria] = nomi_categorie[0]
-    categoria_attiva = st.session_state[chiave_categoria]
-    for nome_categoria, pagine in mappa_pagine_per_categoria.items():
-        chiave_pagina = f"{key_prefix}_pagina_{nome_categoria}"
-        if len(pagine) > 1 and st.session_state.get(chiave_pagina) not in pagine:
-            st.session_state[chiave_pagina] = pagine[0]
-    pagine_attive = mappa_pagine_per_categoria[categoria_attiva]
-    pagina_attiva = pagine_attive[0] if len(pagine_attive) == 1 else st.session_state[f"{key_prefix}_pagina_{categoria_attiva}"]
-
-    for nome_categoria in nomi_categorie:
-        pagine = mappa_pagine_per_categoria[nome_categoria]
-        e_attiva = nome_categoria == categoria_attiva
-        if len(pagine) == 1:
-            _voce_menu_laterale(etichetta_menu(nome_categoria), f"{key_prefix}_{nome_categoria}", e_attiva,
-                                _scegli_voce_menu, (key_prefix, nome_categoria, None))
-            continue
-        if len(nomi_categorie) > 1:
-            _titolo_menu_laterale(nome_categoria)
-        for pagina in pagine:
-            _voce_menu_laterale(etichetta_menu(pagina), f"{key_prefix}_{nome_categoria}_{pagina}",
-                                e_attiva and pagina == pagina_attiva,
-                                _scegli_voce_menu, (key_prefix, nome_categoria, pagina))
-    if len(pagine_attive) > 1:
-        st.caption(f"📍 {etichetta_menu(categoria_attiva)}  ›  {etichetta_menu(pagina_attiva)}")
-    return pagina_attiva
+    categoria, pagina = _stato_menu(categorie, key_prefix)
+    if len(dict(categorie)[categoria]) > 1:
+        st.caption(f"📍 {etichetta_menu(categoria)}  ›  {etichetta_menu(pagina)}")
+    return pagina
 
 
 def render_email_profilo(username, nome, key_prefix):
@@ -10794,6 +10902,14 @@ else:
     render_campanella(user_info["name"], col_campanella)
     col_esci.button("Esci", on_click=logout, key="logout_principale", use_container_width=True)
     mostra_notifiche()
+    _blocchi_menu, menu_cat = menu_per_utente(user_info)
+    if user_info["role"] == "responsabile":
+        _opzioni_modalita = modalita_responsabile(user_info)
+        if st.session_state.get("resp_modalita") not in _opzioni_modalita:
+            st.session_state["resp_modalita"] = _opzioni_modalita[0]
+        disegna_menu_laterale(_blocchi_menu, menu_cat, st.session_state["resp_modalita"])
+    else:
+        disegna_menu_laterale(_blocchi_menu, menu_cat)
 
     # Le timbrature di tutti NON si caricano più qui, a ogni clic e per ogni pagina: la
     # pagina "Timbrature" personale non le usa (le sue servono solo quelle di oggi, vedi
@@ -10806,15 +10922,7 @@ else:
 
     if user_info["role"] == "admin":
 
-        admin_page = render_menu_a_categorie([
-            ("🏠 Oggi", [PAGINA_HOME]),
-            ("🕒 Presenze", ["Dati e Presenze", "Richieste ferie/permessi", "Rettifiche timbrature", "Cartellini dipendenti", PAGINA_POSIZIONI]),
-            ("🏭 Commesse", ["Gestione Commesse", "Resoconto Commesse", "📅 Pianificazione", "🗂️ Attività di reparto", PAGINA_MAPPA_IMPIANTI]),
-            ("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI, PAGINA_STATISTICHE_ASSISTENZA]),
-            ("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]),
-            ("📈 Statistiche e costi", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", "💰 Costi commesse", PAGINA_BI]),
-            ("⚙️ Utenti", ["Gestione Utenti DB"]),
-        ], key_prefix="admin_menu", titolo_categoria="Sezione")
+        admin_page = render_menu_a_categorie(menu_cat["admin_menu"], key_prefix="admin_menu", titolo_categoria="Sezione")
         st.session_state["_ultima_pagina_vista"] = admin_page
         # Lo storico completo delle timbrature serve solo alle pagine che lo usano: le altre
         # (home, trasferte, mappe, chi è dove) non lo caricano affatto.
@@ -11120,35 +11228,15 @@ else:
 
         # Selettore principale: Mie funzioni vs Gestione Team (più Trasferte Service
         # se il responsabile fa parte dell'area Service)
-        opzioni_modalita = ["Mie funzioni personali", "Gestione Team"]
-        if is_area_service(user_info["area"]):
-            opzioni_modalita.append("🧳 Trasferte Service")
-        if is_area_costi(user_info["area"]):
-            opzioni_modalita.append("💰 Gestione Costi")
-        if is_area_amministrazione(user_info["area"]):
-            opzioni_modalita.append("👥 Risorse Umane")
-        if len(opzioni_modalita) > 1:
-            modalita = render_selettore_area(opzioni_modalita, "resp_modalita")
-        else:
-            modalita = opzioni_modalita[0]
+        modalita = st.session_state["resp_modalita"]
 
         if modalita == "Mie funzioni personali":
             # *** REPLICA DELLA SEZIONE UTENTE PER IL RESPONSABILE ***
             dipendente_scelto = user_info["name"]
             # Chi è nell'area Service ha tutto ciò che riguarda le trasferte (anche il
             # proprio report intervento) nel menu unico della modalità "Trasferte Service".
-            categorie_resp_personale = [
-                ("🏠 Oggi", [PAGINA_HOME]),
-                ("🕒 Timbra e ore", ["Timbrature", "Riepilogo personale", "Report mensile"]),
-                ("🏭 Commesse", ["Le mie Commesse", PAGINA_MAPPA_IMPIANTI_VISTA]),
-                ("👥 Il mio reparto", [PAGINA_MIO_REPARTO]),
-                ("🌴 Ferie e correzioni", ["Richiesta ferie/permessi", "Richiesta rettifica"]),
-                ("👤 Il mio profilo", ["Profilo"]),
-            ]
-            if not is_area_service(user_info["area"]):
-                categorie_resp_personale.insert(4, ("📷 Rapporto di intervento", [PAGINA_REPORT_INTERVENTO]))
             pagina_utente = render_menu_a_categorie(
-                categorie_resp_personale, key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
+                menu_cat["resp_personale_menu"], key_prefix="resp_personale_menu", titolo_categoria="Funzione personale")
             st.session_state["_ultima_pagina_vista"] = pagina_utente
             if pagina_utente not in ("Timbrature", PAGINA_HOME, PAGINA_MIO_REPARTO, PAGINA_SITUAZIONE_SERVICE, PAGINA_MAPPA_IMPIANTI_VISTA,
                                      "Profilo", "Richiesta ferie/permessi", "Richiesta rettifica"):
@@ -11156,15 +11244,15 @@ else:
 
             if pagina_utente == PAGINA_HOME:
                 azioni_resp = [
-                    ("🕒 Timbra", "🕒 Timbra e ore", "Timbrature"),
+                    ("🕒 Timbra", "👤 Area personale", "Timbrature"),
                     ("✏️ Correzioni da approvare", "🕒 Presenze team", "Rettifiche timbrature", "Gestione Team", "resp_team_menu"),
-                    ("👥 Il mio reparto", "👥 Il mio reparto", PAGINA_MIO_REPARTO),
-                    ("🌴 Chiedi ferie o permessi", "🌴 Ferie e correzioni", "Richiesta ferie/permessi"),
+                    ("👥 Il mio reparto", "📍 Chi è dove", PAGINA_MIO_REPARTO, "Gestione Team", "resp_team_menu"),
+                    ("🌴 Chiedi ferie o permessi", "👤 Area personale", "Richiesta ferie/permessi"),
                 ]
                 if is_area_amministrazione(user_info["area"]):
                     azioni_resp.insert(1, ("✅ Ferie e permessi da approvare", "🧾 Risorse umane", "Richieste ferie/permessi", "👥 Risorse Umane", "resp_hr_menu"))
                 render_home(user_info, "resp_personale_menu", azioni_resp, approvazioni=True,
-                            profilo=("resp_personale_menu", "👤 Il mio profilo", "Profilo"))
+                            profilo=("resp_personale_menu", "👤 Area personale", "Profilo"))
 
             elif pagina_utente == PAGINA_MIO_REPARTO:
                 render_mio_reparto(user_info["area"], user_info["name"], key_prefix="resp_reparto")
@@ -11319,12 +11407,7 @@ else:
             area_responsabile = user_info["area"]
             dipendenti_area = get_users_in_area(area_responsabile)
 
-            resp_page = render_menu_a_categorie([
-                ("🕒 Presenze team", ["Timbrature del team", "Richieste ferie/permessi", "Rettifiche timbrature", PAGINA_POSIZIONI]),
-                ("🏭 Commesse e statistiche", ["Resoconto Commesse", "Gestione fasi commessa", "📅 Pianificazione", "🗂️ Attività di reparto",
-                                              "Statistiche area", PAGINA_MAPPA_IMPIANTI_VISTA]),
-                ("📍 Chi è dove", [PAGINA_MIO_REPARTO, PAGINA_DISPONIBILITA_TEAM]),
-            ], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
+            resp_page = render_menu_a_categorie(menu_cat["resp_team_menu"], key_prefix="resp_team_menu", titolo_categoria="Sezione team")
             st.session_state["_ultima_pagina_vista"] = resp_page
             if resp_page not in (PAGINA_MIO_REPARTO, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA, "Richieste ferie/permessi", PAGINA_POSIZIONI):
                 df = carica_dati_db()
@@ -11459,7 +11542,7 @@ else:
 
         elif modalita == "🧳 Trasferte Service":
             trasferte_page = render_menu_a_categorie(
-                categorie_trasferte_service(), key_prefix="resp_trasferte_menu", titolo_categoria="Sezione Trasferte")
+                menu_cat["resp_trasferte_menu"], key_prefix="resp_trasferte_menu", titolo_categoria="Sezione Trasferte")
             st.session_state["_ultima_pagina_vista"] = trasferte_page
 
             if trasferte_page == PAGINA_NUOVA_TRASFERTA:
@@ -11492,9 +11575,7 @@ else:
                 render_situazione_service(key_prefix="resp_personale")
 
         elif modalita == "👥 Risorse Umane":
-            hr_page = render_menu_a_categorie([
-                ("🧾 Risorse umane", ["Richieste ferie/permessi", "Cartellini dipendenti"]),
-            ], key_prefix="resp_hr_menu", titolo_categoria="Risorse umane")
+            hr_page = render_menu_a_categorie(menu_cat["resp_hr_menu"], key_prefix="resp_hr_menu", titolo_categoria="Risorse umane")
             st.session_state["_ultima_pagina_vista"] = hr_page
             if hr_page == "Richieste ferie/permessi":
                 render_richieste_ferie_hr(user_info, key_prefix="resp_hr")
@@ -11503,10 +11584,7 @@ else:
                 render_risorse_umane(df, key_prefix="resp_hr")
 
         elif modalita == "💰 Gestione Costi":
-            costi_page = render_menu_a_categorie([
-                ("💰 Costi", ["💰 Costi commesse", "Resoconto Commesse"]),
-                ("📈 Statistiche", ["Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", PAGINA_BI]),
-            ], key_prefix="resp_costi_menu", titolo_categoria="Sezione Costi")
+            costi_page = render_menu_a_categorie(menu_cat["resp_costi_menu"], key_prefix="resp_costi_menu", titolo_categoria="Sezione Costi")
             st.session_state["_ultima_pagina_vista"] = costi_page
             df = carica_dati_db()
 
@@ -11532,28 +11610,8 @@ else:
         # Il Service ha in più le trasferte di tutti e dove sono i dipendenti; chi non è
         # Service vede "Rapporto di intervento" solo se ha almeno una trasferta.
         sono_service = is_area_service(user_info["area"])
-        pagine_commesse = ["Le mie Commesse", "📅 Pianificazione"] + ([PAGINA_MAPPA_IMPIANTI] if sono_service else [PAGINA_MAPPA_IMPIANTI_VISTA])
-        categorie_utente = [
-            ("🕒 Timbra", ["Timbrature"]),
-            ("🏠 Oggi", [PAGINA_HOME]),
-        ]
-        if sono_service:
-            categorie_utente.append(("🧳 Trasferte", [PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE, PAGINA_REPORT_RICEVUTI,
-                                                      PAGINA_REPORT_INTERVENTO, PAGINA_STATISTICHE_ASSISTENZA]))
-            categorie_utente.append(("📍 Chi è dove", [PAGINA_SITUAZIONE_SERVICE, PAGINA_DISPONIBILITA_TEAM]))
-        else:
-            categorie_utente.append(("👥 Il mio reparto", [PAGINA_MIO_REPARTO]))
-        categorie_utente.append(("🏭 Commesse", pagine_commesse))
-        if not sono_service and ha_trasferte(user_info["name"]):
-            categorie_utente.append(("📷 Rapporto di intervento", [PAGINA_REPORT_INTERVENTO]))
-        categorie_utente.append(("👤 Io", ["Riepilogo personale", "Report mensile", "Richiesta ferie/permessi", "Richiesta rettifica", "Profilo"]))
-        # Risorse umane / Costi compaiono solo per chi fa parte di quelle aree.
-        if is_area_amministrazione(user_info["area"]):
-            categorie_utente.append(("🧾 Risorse umane", ["Richieste ferie/permessi", "Cartellini dipendenti"]))
-        if is_area_costi(user_info["area"]):
-            categorie_utente.append(("💰 Costi e statistiche", ["💰 Costi commesse", "Resoconto Commesse", "Grafici e Classifiche", "🌱 Sostenibilità (Smart Working)", PAGINA_BI]))
         pagina_utente = render_menu_a_categorie(
-            categorie_utente, key_prefix="user_menu", titolo_categoria="Funzione utente")
+            menu_cat["user_menu"], key_prefix="user_menu", titolo_categoria="Funzione utente")
         st.session_state["_ultima_pagina_vista"] = pagina_utente
         if pagina_utente not in ("Timbrature", PAGINA_HOME, PAGINA_MIO_REPARTO, PAGINA_SITUAZIONE_SERVICE, PAGINA_NUOVA_TRASFERTA, PAGINA_TRASFERTE_PROGRAMMATE, PAGINA_TRASFERTE_EFFETTUATE,
                                     PAGINA_REPORT_RICEVUTI, PAGINA_MAPPA_IMPIANTI, PAGINA_DISPONIBILITA_TEAM, PAGINA_MAPPA_IMPIANTI_VISTA,
@@ -11561,17 +11619,17 @@ else:
             df = carica_dati_db()
 
         if pagina_utente == PAGINA_HOME:
-            azioni_utente = [("🕒 Timbra", "🕒 Timbra", "Timbrature")]
+            azioni_utente = [("🕒 Timbra", "👤 Area personale", "Timbrature")]
             if sono_service:
                 azioni_utente += [("➕ Programma una trasferta", "🧳 Trasferte", PAGINA_NUOVA_TRASFERTA),
                                   ("📍 Dove sono ora i dipendenti", "📍 Chi è dove", PAGINA_SITUAZIONE_SERVICE)]
             else:
                 azioni_utente.append(("👥 Il mio reparto", "👥 Il mio reparto", PAGINA_MIO_REPARTO))
-            azioni_utente += [("🌴 Chiedi ferie o permessi", "👤 Io", "Richiesta ferie/permessi"),
-                              ("🏭 Le mie commesse", "🏭 Commesse", "Le mie Commesse")]
+            azioni_utente += [("🌴 Chiedi ferie o permessi", "👤 Area personale", "Richiesta ferie/permessi"),
+                              ("🏭 Le mie commesse", "👤 Area personale", "Le mie Commesse")]
             if is_area_amministrazione(user_info["area"]):
                 azioni_utente.insert(1, ("✅ Ferie e permessi da approvare", "🧾 Risorse umane", "Richieste ferie/permessi"))
-            render_home(user_info, "user_menu", azioni_utente, mostra_panoramica=sono_service, profilo=("user_menu", "👤 Io", "Profilo"),
+            render_home(user_info, "user_menu", azioni_utente, mostra_panoramica=sono_service, profilo=("user_menu", "👤 Area personale", "Profilo"),
                         approvazioni=True if is_area_amministrazione(user_info["area"]) else None)
 
         elif pagina_utente == PAGINA_MIO_REPARTO:
