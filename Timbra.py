@@ -2417,22 +2417,15 @@ def _inject_stile_vimek():
     section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {{
         gap: .4rem;
     }}
-    section[data-testid="stSidebar"] h6,
-    section[data-testid="stSidebar"] h6 * {{
+    section[data-testid="stSidebar"] .navv-titolo {{
+        display: block;
         color: #8fa8c8 !important;
-        font-size: .72rem !important;
-        font-weight: 700 !important;
+        font-size: .72rem;
+        font-weight: 700;
         letter-spacing: .1em;
         text-transform: uppercase;
-        line-height: 1.3 !important;
-    }}
-    section[data-testid="stSidebar"] h6 {{
-        margin: 0 !important;
-        padding: .9rem 0 .15rem .3rem !important;
-    }}
-    section[data-testid="stSidebar"] h6 [data-testid="stHeaderActionElements"],
-    section[data-testid="stSidebar"] h6 a {{
-        display: none !important;
+        line-height: 1.3;
+        padding: .8rem 0 .1rem .3rem;
     }}
     /* Intestazione dei riquadri: sempre sfondo scuro e testo chiaro, anche al passaggio del mouse
        (di base Streamlit la rende chiara e il testo chiaro diventa illeggibile). */
@@ -10533,9 +10526,10 @@ def _voce_menu_laterale(contenitore, testo, chiave, attiva, args):
 
 def _titolo_menu_laterale(contenitore, testo):
     """Titolo piccolo, maiuscolo, grigio-azzurro: separa 'La mia area' da 'Il mio gruppo' o le sezioni di un riquadro."""
-    # Un vero titolo (###### = h6) e non un blocco HTML: i blocchi HTML nella barra laterale
-    # risultavano alti zero e il riquadro successivo ci finiva sopra.
-    contenitore.markdown(f"###### {testo}")
+    # Deve stare dentro un paragrafo (<p><span>): Streamlit toglie 1rem sotto ogni blocco di testo per
+    # compensare il margine del paragrafo, quindi un titolo o un <div> al posto del <p> tirava il
+    # riquadro successivo 1rem più in alto, sopra il titolo.
+    contenitore.markdown(f'<span class="navv-titolo">{testo}</span>', unsafe_allow_html=True)
 
 def _stato_menu(categorie, key_prefix):
     """(sezione attiva, pagina attiva) del menu 'key_prefix', correggendo i valori di sessione non
