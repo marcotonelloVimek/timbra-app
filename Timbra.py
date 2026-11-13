@@ -2417,16 +2417,22 @@ def _inject_stile_vimek():
     section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {{
         gap: .4rem;
     }}
-    section[data-testid="stSidebar"] .navv-titolo {{
+    section[data-testid="stSidebar"] h6,
+    section[data-testid="stSidebar"] h6 * {{
         color: #8fa8c8 !important;
-        font-size: .72rem;
-        font-weight: 700;
+        font-size: .72rem !important;
+        font-weight: 700 !important;
         letter-spacing: .1em;
         text-transform: uppercase;
-        display: block;
-        margin: 0;
-        padding: .8rem 0 .1rem .3rem;
-        line-height: 1.2;
+        line-height: 1.3 !important;
+    }}
+    section[data-testid="stSidebar"] h6 {{
+        margin: 0 !important;
+        padding: .9rem 0 .15rem .3rem !important;
+    }}
+    section[data-testid="stSidebar"] h6 [data-testid="stHeaderActionElements"],
+    section[data-testid="stSidebar"] h6 a {{
+        display: none !important;
     }}
     /* Intestazione dei riquadri: sempre sfondo scuro e testo chiaro, anche al passaggio del mouse
        (di base Streamlit la rende chiara e il testo chiaro diventa illeggibile). */
@@ -10527,7 +10533,9 @@ def _voce_menu_laterale(contenitore, testo, chiave, attiva, args):
 
 def _titolo_menu_laterale(contenitore, testo):
     """Titolo piccolo, maiuscolo, grigio-azzurro: separa 'La mia area' da 'Il mio gruppo' o le sezioni di un riquadro."""
-    contenitore.markdown(f'<div class="navv-titolo">{testo}</div>', unsafe_allow_html=True)
+    # Un vero titolo (###### = h6) e non un blocco HTML: i blocchi HTML nella barra laterale
+    # risultavano alti zero e il riquadro successivo ci finiva sopra.
+    contenitore.markdown(f"###### {testo}")
 
 def _stato_menu(categorie, key_prefix):
     """(sezione attiva, pagina attiva) del menu 'key_prefix', correggendo i valori di sessione non
