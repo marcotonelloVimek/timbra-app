@@ -2423,7 +2423,26 @@ def _inject_stile_vimek():
         font-weight: 700;
         letter-spacing: .1em;
         text-transform: uppercase;
-        margin: .7rem 0 0 .2rem;
+        display: block;
+        margin: 0;
+        padding: .8rem 0 .1rem .3rem;
+        line-height: 1.2;
+    }}
+    /* Intestazione dei riquadri: sempre sfondo scuro e testo chiaro, anche al passaggio del mouse
+       (di base Streamlit la rende chiara e il testo chiaro diventa illeggibile). */
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] details[open] > summary {{
+        background-color: transparent !important;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary:focus,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary:active {{
+        background-color: rgba(255,255,255,.16) !important;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover *,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary:focus *,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary:active * {{
+        color: #ffffff !important;
     }}
     section[data-testid="stSidebar"] .stButton>button,
     section[data-testid="stSidebar"] .stButton>button > div,
@@ -2451,6 +2470,28 @@ def _inject_stile_vimek():
     section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] * {{
         color: {VIMEK_NAVY} !important;
         font-weight: 700;
+    }}
+    /* La pagina attiva resta bianca con testo blu anche al passaggio del mouse. */
+    section[data-testid="stSidebar"] .stButton>button[kind="primary"]:hover,
+    section[data-testid="stSidebar"] .stButton>button[kind="primary"]:focus,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] .stButton>button[kind="primary"]:hover,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] .stButton>button[kind="primary"]:focus,
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"]:hover,
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"]:focus {{
+        background-color: #ffffff !important;
+        border-color: #ffffff !important;
+    }}
+    /* Le altre voci: al passaggio del mouse un velo chiaro, testo sempre bianco. */
+    section[data-testid="stSidebar"] .stButton>button[kind="secondary"]:hover,
+    section[data-testid="stSidebar"] .stButton>button[kind="secondary"]:focus,
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-secondary"]:hover,
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-secondary"]:focus {{
+        background-color: rgba(255,255,255,.2) !important;
+        border-color: rgba(255,255,255,.35) !important;
+    }}
+    section[data-testid="stSidebar"] .stButton>button[kind="secondary"]:hover *,
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-secondary"]:hover * {{
+        color: #ffffff !important;
     }}
 
     /* Telefono: margini ridotti, pulsanti e campi comodi da toccare col dito */
@@ -10895,7 +10936,7 @@ else:
     _render_logo_header(container=st.sidebar)
     st.sidebar.markdown("---")
     _ruolo_visibile = {"admin": "Amministratore", "responsabile": "Responsabile"}.get(user_info["role"], "Operatore")
-    st.sidebar.markdown(f"**{user_info['name']}**  \n{_ruolo_visibile}" + (f" · {user_info['area']}" if user_info.get("area") and user_info["area"] != "All" else ""))
+    st.sidebar.markdown(f"**{user_info['name'].strip()}**  \n{_ruolo_visibile}" + (f" · {user_info['area']}" if user_info.get("area") and user_info["area"] != "All" else ""))
     st.sidebar.button("Esci", on_click=logout)
     col_saluto, col_campanella, col_esci = st.columns([4, 1, 1])
     col_saluto.markdown(f"#### Ciao, {user_info['name']}!")
