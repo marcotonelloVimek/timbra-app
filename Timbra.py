@@ -241,6 +241,19 @@ def db_migration_error_classes():
 DEFAULT_FERIE_GIORNI = 20
 DEFAULT_PERMESSO_ORE = 16.0
 DEFAULT_COSTO_ORARIO = 25.0  # €/h di partenza per il costo del personale per livello (da personalizzare)
+# Categoria del dipendente: il costo orario dipende da livello CCNL + categoria (un impiegato e un
+# operaio dello stesso livello costano all'azienda in modo diverso).
+CATEGORIE_DIPENDENTE = ["Operaio", "Impiegato"]
+DEFAULT_CATEGORIA = "Impiegato"
+
+def categoria_valida(valore):
+    """'Operaio' o 'Impiegato' (anche da testo scritto a mano o vuoto: in quel caso la categoria di partenza)."""
+    testo = str(valore or "").strip().lower()
+    if testo.startswith("operai"):
+        return "Operaio"
+    if testo.startswith("impiegat"):
+        return "Impiegato"
+    return DEFAULT_CATEGORIA
 ORE_ORDINARIE_GIORNALIERE = 8.0  # Soglia oltre la quale le ore lavorate in un giorno sono straordinario
 # Arrotondamento alla mezz'ora richiesto dall'ufficio paghe: "vicino" = alla mezz'ora
 # più vicina (0.25 e 0.75 salgono: 0.25 -> 0.5), "difetto" = sempre per difetto,
@@ -465,7 +478,8 @@ def init_db():
                         orario_fine_giornata TEXT DEFAULT '',
                         pausa_pranzo_inizio TEXT DEFAULT '',
                         pausa_pranzo_fine TEXT DEFAULT '',
-                        email TEXT DEFAULT ''
+                        email TEXT DEFAULT '',
+                        categoria TEXT DEFAULT 'Impiegato'
                     )''')
 
         # Migrazione: aggiungi le colonne livello (inquadramento CCNL), data di
@@ -478,6 +492,7 @@ def init_db():
             ("distanza_km", "REAL DEFAULT 0"), ("orario_fine_giornata", "TEXT DEFAULT ''"),
             ("pausa_pranzo_inizio", "TEXT DEFAULT ''"), ("pausa_pranzo_fine", "TEXT DEFAULT ''"),
             ("email", "TEXT DEFAULT ''"),
+            ("categoria", "TEXT DEFAULT 'Impiegato'"),     # operaio / impiegato (esistenti: Impiegato)
         ]:
             try:
                 c.execute(f"ALTER TABLE utenti ADD COLUMN {colonna_utente} {tipo_colonna}")
@@ -493,7 +508,8 @@ def init_db():
                         livello TEXT PRIMARY KEY,
                         ferie_giorni_anno REAL NOT NULL,
                         permesso_ore_anno REAL NOT NULL,
-                        costo_orario REAL NOT NULL DEFAULT 25.0
+                        costo_orario REAL NOT NULL DEFAULT 25.0,
+                        costo_orario_operaio REAL
                     )''')
         # Migrazione: aggiungi la colonna costo_orario se la tabella esisteva già
         try:
@@ -509,6 +525,16 @@ def init_db():
         for livello_default in ["1", "2", "3", "3S", "4", "5", "5S", "6", "7"]:
             c.execute("INSERT OR IGNORE INTO livelli_ferie_permessi (livello, ferie_giorni_anno, permesso_ore_anno, costo_orario) VALUES (?,?,?,?)",
                       (livello_default, DEFAULT_FERIE_GIORNI, DEFAULT_PERMESSO_ORE, DEFAULT_COSTO_ORARIO))
+        # Costo orario per categoria: 'costo_orario' è quello degli IMPIEGATI (i valori già impostati),
+        # 'costo_orario_operaio' quello degli operai. Dove manca si parte dallo stesso valore degli
+        # impiegati, così i costi di prima non cambiano finché non lo modifichi.
+        try:
+            c.execute("ALTER TABLE livelli_ferie_permessi ADD COLUMN costo_orario_operaio REAL")
+            conn.commit()
+        except db_migration_error_classes():
+            pass  # Colonna già esistente
+        c.execute("UPDATE livelli_ferie_permessi SET costo_orario_operaio = costo_orario WHERE costo_orario_operaio IS NULL")
+        conn.commit()
 
         # Tabella Sostenibilità - parametri (personalizzabili) per stimare risparmio
         # energetico e CO2 evitata dallo smart working; riga singola (id=1).
@@ -1995,7 +2021,7 @@ def render_bi_commesse(df, key_prefix):
         st.markdown("**Valore (barra larga chiara) e costo reale (barra stretta scura)**")
         st.altair_chart(_grafico_barre_doppie(con_valore, "Commessa", "Valore", "Costo_totale", "Valore €", "Costo reale €"), use_container_width=True)
         st.dataframe(con_valore, use_container_width=True, hide_index=True)
-        st.caption("Costo reale = ore timbrate sulle fasi × costo orario del livello + costi delle trasferte. Non comprende materiali, acquisti e costi generali: "
+        st.caption("Costo reale = ore timbrate sulle fasi × costo orario (livello e categoria operaio/impiegato) + costi delle trasferte. Non comprende materiali, acquisti e costi generali: "
                    "il margine è quindi una stima per eccesso. «Margine previsto» usa le ore stimate delle fasi (preventivo).")
     else:
         fasi_costi = compute_costi_fasi_commessa(df)
@@ -2660,14 +2686,29 @@ def get_users_livello_map():
         c.execute("SELECT nome, livello FROM utenti")
         return {row[0]: (row[1] or "") for row in c.fetchall()}
 
+def get_users_livello_categoria_map():
+    """Mappa {nome_dipendente: (livello, categoria)}, per il costo orario (livello + categoria)."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nome, livello, categoria FROM utenti")
+        return {row[0]: ((row[1] or ""), categoria_valida(row[2])) for row in c.fetchall()}
+
 def get_livelli_costo_orario_map():
-    """Mappa {livello: costo_orario}, stesso motivo di get_users_area_map(): da usare
-    insieme a get_users_livello_map() invece di chiamare get_costo_orario_per_livello()
+    """Mappa {(livello, categoria): costo_orario}, stesso motivo di get_users_area_map(): da usare
+    insieme a get_users_livello_categoria_map() invece di chiamare get_costo_orario_per_livello()
     per ogni dipendente in un ciclo o in un .apply()."""
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("SELECT livello, costo_orario FROM livelli_ferie_permessi")
-        return {row[0]: float(row[1]) for row in c.fetchall() if row[1] is not None}
+        c.execute("SELECT livello, costo_orario, costo_orario_operaio FROM livelli_ferie_permessi")
+        mappa = {}
+        for livello, costo_impiegato, costo_operaio in c.fetchall():
+            if costo_impiegato is not None:
+                mappa[(livello, "Impiegato")] = float(costo_impiegato)
+            if costo_operaio is not None:
+                mappa[(livello, "Operaio")] = float(costo_operaio)
+            elif costo_impiegato is not None:
+                mappa[(livello, "Operaio")] = float(costo_impiegato)
+        return mappa
 
 def get_users_distanza_map():
     """Mappa {nome_dipendente: distanza_km}, stesso motivo di get_users_area_map(): da
@@ -7786,7 +7827,8 @@ def get_livelli_ferie_permessi_dettaglio():
     with db_connect() as conn:
         return pd.read_sql(
             "SELECT livello AS Livello, ferie_giorni_anno AS 'Ferie (giorni/anno)', "
-            "permesso_ore_anno AS 'Permesso (ore/anno)', costo_orario AS 'Costo orario (€/h)' "
+            "permesso_ore_anno AS 'Permesso (ore/anno)', costo_orario_operaio AS 'Costo orario operaio (€/h)', "
+            "costo_orario AS 'Costo orario impiegato (€/h)' "
             "FROM livelli_ferie_permessi ORDER BY livello", conn)
 
 def get_ferie_permessi_per_livello(livello):
@@ -7801,21 +7843,25 @@ def get_ferie_permessi_per_livello(livello):
                 return float(row[0]), float(row[1])
     return float(DEFAULT_FERIE_GIORNI), float(DEFAULT_PERMESSO_ORE)
 
-def get_costo_orario_per_livello(livello):
-    """Costo orario (€/h) configurato per il livello indicato. Se il livello non è
+def get_costo_orario_per_livello(livello, categoria=DEFAULT_CATEGORIA):
+    """Costo orario (€/h) configurato per livello e categoria (Operaio/Impiegato). Se il livello non è
     impostato o non risulta configurato, usa il costo orario di default aziendale."""
     if livello:
         with db_connect() as conn:
             c = conn.cursor()
-            c.execute("SELECT costo_orario FROM livelli_ferie_permessi WHERE livello=?", (livello,))
+            c.execute("SELECT costo_orario, costo_orario_operaio FROM livelli_ferie_permessi WHERE livello=?", (livello,))
             row = c.fetchone()
-            if row and row[0] is not None:
-                return float(row[0])
+            if row:
+                if categoria_valida(categoria) == "Operaio" and row[1] is not None:
+                    return float(row[1])
+                if row[0] is not None:
+                    return float(row[0])
     return float(DEFAULT_COSTO_ORARIO)
 
-def aggiorna_livello_ferie_permessi(livello, ferie_giorni_anno, permesso_ore_anno, costo_orario):
-    """Crea (se nuovo) o aggiorna un livello CCNL con ferie/permessi annuali e costo
-    orario. Restituisce (ok, messaggio_errore)."""
+def aggiorna_livello_ferie_permessi(livello, ferie_giorni_anno, permesso_ore_anno, costo_orario, costo_orario_operaio=None):
+    """Crea (se nuovo) o aggiorna un livello CCNL con ferie/permessi annuali e costo orario di
+    impiegati ('costo_orario') e operai ('costo_orario_operaio'; se omesso, uguale a quello degli
+    impiegati). Restituisce (ok, messaggio_errore)."""
     livello = (livello or "").strip()
     if not livello:
         return False, "Il nome del livello è obbligatorio."
@@ -7823,16 +7869,18 @@ def aggiorna_livello_ferie_permessi(livello, ferie_giorni_anno, permesso_ore_ann
         ferie_giorni_anno = float(ferie_giorni_anno)
         permesso_ore_anno = float(permesso_ore_anno)
         costo_orario = float(costo_orario)
+        costo_orario_operaio = costo_orario if costo_orario_operaio is None else float(costo_orario_operaio)
     except (TypeError, ValueError):
-        return False, "Ferie, permessi e costo orario devono essere numeri."
-    if ferie_giorni_anno < 0 or permesso_ore_anno < 0 or costo_orario < 0:
-        return False, "Ferie, permessi e costo orario non possono essere negativi."
+        return False, "Ferie, permessi e costi orari devono essere numeri."
+    if ferie_giorni_anno < 0 or permesso_ore_anno < 0 or costo_orario < 0 or costo_orario_operaio < 0:
+        return False, "Ferie, permessi e costi orari non possono essere negativi."
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("""INSERT INTO livelli_ferie_permessi (livello, ferie_giorni_anno, permesso_ore_anno, costo_orario) VALUES (?,?,?,?)
+        c.execute("""INSERT INTO livelli_ferie_permessi (livello, ferie_giorni_anno, permesso_ore_anno, costo_orario, costo_orario_operaio) VALUES (?,?,?,?,?)
                      ON CONFLICT(livello) DO UPDATE SET ferie_giorni_anno=excluded.ferie_giorni_anno,
-                        permesso_ore_anno=excluded.permesso_ore_anno, costo_orario=excluded.costo_orario""",
-                  (livello, ferie_giorni_anno, permesso_ore_anno, costo_orario))
+                        permesso_ore_anno=excluded.permesso_ore_anno, costo_orario=excluded.costo_orario,
+                        costo_orario_operaio=excluded.costo_orario_operaio""",
+                  (livello, ferie_giorni_anno, permesso_ore_anno, costo_orario, costo_orario_operaio))
         conn.commit()
     return True, ""
 
@@ -7896,11 +7944,11 @@ def get_dati_personali_utente(username):
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""SELECT livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata,
-                            pausa_pranzo_inizio, pausa_pranzo_fine, role
+                            pausa_pranzo_inizio, pausa_pranzo_fine, role, categoria
                      FROM utenti WHERE username=?""", (username,))
         row = c.fetchone()
     if not row:
-        return {"livello": "", "data_assunzione": None, "codice_fiscale": "", "data_nascita": None,
+        return {"livello": "", "categoria": DEFAULT_CATEGORIA, "data_assunzione": None, "codice_fiscale": "", "data_nascita": None,
                 "distanza_km": 0.0, "orario_fine_giornata": DEFAULT_ORARIO_FINE_GIORNATA_TIME,
                 "pausa_pranzo_inizio": _parse_pausa_pranzo("", "")[0], "pausa_pranzo_fine": _parse_pausa_pranzo("", "")[1],
                 "ha_pausa_pranzo": True}
@@ -7911,10 +7959,11 @@ def get_dati_personali_utente(username):
         except (ValueError, TypeError):
             return None
 
-    livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata, pausa_inizio, pausa_fine, ruolo = row
+    livello, data_assunzione, codice_fiscale, data_nascita, distanza_km, orario_fine_giornata, pausa_inizio, pausa_fine, ruolo, categoria = row
     pausa_pranzo = _parse_pausa_pranzo(pausa_inizio, pausa_fine)
     return {
         "livello": livello or "",
+        "categoria": categoria_valida(categoria),
         "data_assunzione": _parse_data(data_assunzione),
         "codice_fiscale": codice_fiscale or "",
         "data_nascita": _parse_data(data_nascita),
@@ -8069,27 +8118,29 @@ def compute_saldo_ferie_permessi_mensile(df_requests, nome_dipendente, anno, mes
 
 def compute_costo_dipendenti(df, start_date, end_date, employee_name=None):
     """Costo del personale nel periodo: ore lavorate (Ingresso->Uscita) per ciascun
-    dipendente, moltiplicate per il costo orario del suo livello CCNL. Il costo orario
+    dipendente, moltiplicate per il costo orario del suo livello CCNL e della sua categoria
+    (operaio/impiegato). Il costo orario
     è quello configurato in 'Gestione Utenti DB' -> 'Livelli CCNL' (o il default
     aziendale se il dipendente non ha un livello impostato): è una stima, non un dato
     di paga ufficiale."""
     ore_per_dipendente = compute_daily_work(df)
     if ore_per_dipendente.empty:
-        return pd.DataFrame(columns=["Dipendente", "Area", "Livello", "Ore_lavorate", "Costo_orario", "Costo_totale"])
+        return pd.DataFrame(columns=["Dipendente", "Area", "Livello", "Categoria", "Ore_lavorate", "Costo_orario", "Costo_totale"])
     ore_per_dipendente = ore_per_dipendente[(ore_per_dipendente["Data"] >= start_date) & (ore_per_dipendente["Data"] <= end_date)]
     if employee_name:
         ore_per_dipendente = ore_per_dipendente[ore_per_dipendente["Dipendente"] == employee_name]
     if ore_per_dipendente.empty:
-        return pd.DataFrame(columns=["Dipendente", "Area", "Livello", "Ore_lavorate", "Costo_orario", "Costo_totale"])
+        return pd.DataFrame(columns=["Dipendente", "Area", "Livello", "Categoria", "Ore_lavorate", "Costo_orario", "Costo_totale"])
 
     agg = ore_per_dipendente.groupby("Dipendente", as_index=False).agg({"Ore_lavorate": "sum"})
     # Tre mappe con una query ciascuna, invece di tre query per ogni dipendente in tabella.
     mappa_aree = get_users_area_map()
-    mappa_livelli = get_users_livello_map()
+    mappa_livelli = get_users_livello_categoria_map()
     mappa_costi_livello = get_livelli_costo_orario_map()
     agg["Area"] = agg["Dipendente"].map(lambda n: mappa_aree.get(n, "Unknown"))
-    agg["Livello"] = agg["Dipendente"].map(lambda n: mappa_livelli.get(n) or "(non impostato)")
-    agg["Costo_orario"] = agg["Dipendente"].map(lambda n: mappa_costi_livello.get(mappa_livelli.get(n), float(DEFAULT_COSTO_ORARIO)))
+    agg["Livello"] = agg["Dipendente"].map(lambda n: mappa_livelli.get(n, ("", ""))[0] or "(non impostato)")
+    agg["Categoria"] = agg["Dipendente"].map(lambda n: mappa_livelli.get(n, ("", DEFAULT_CATEGORIA))[1])
+    agg["Costo_orario"] = agg["Dipendente"].map(lambda n: _costo_orario_dipendente(n, mappa_livelli, mappa_costi_livello))
     agg["Ore_lavorate"] = agg["Ore_lavorate"].round(2)
     agg["Costo_totale"] = (agg["Ore_lavorate"] * agg["Costo_orario"]).round(2)
     return agg.sort_values("Costo_totale", ascending=False).reset_index(drop=True)
@@ -8110,13 +8161,16 @@ def compute_costo_per_area(df, start_date, end_date, area_filter=None):
     return agg.sort_values("Costo_totale", ascending=False).reset_index(drop=True)
 
 def _costo_orario_dipendente(dipendente, mappa_livelli, mappa_costi_livello):
-    """Costo orario (€/h) di un dipendente in base al suo livello CCNL, con lo
+    """Costo orario (€/h) di un dipendente in base al suo livello CCNL e alla sua categoria
+    (operaio/impiegato): 'mappa_livelli' = get_users_livello_categoria_map(), 'mappa_costi_livello' =
+    get_livelli_costo_orario_map(). Con lo
     stesso fallback sul costo aziendale di default usato in tutta l'app (vedi
     compute_costo_dipendenti). Se 'dipendente' è vuoto/None (fase non ancora
     assegnata a nessuno), usa direttamente il costo di default."""
     if not dipendente:
         return float(DEFAULT_COSTO_ORARIO)
-    return mappa_costi_livello.get(mappa_livelli.get(dipendente), float(DEFAULT_COSTO_ORARIO))
+    livello, categoria = mappa_livelli.get(dipendente, ("", DEFAULT_CATEGORIA))
+    return mappa_costi_livello.get((livello, categoria), float(DEFAULT_COSTO_ORARIO))
 
 def get_costi_trasferte(df):
     """Costo di ogni trasferta programmata, per la pagina 'Costi': costo di
@@ -8145,7 +8199,7 @@ def get_costi_trasferte(df):
     trasferte["Costo_trasporto"] = trasferte["Costo_trasporto"].fillna(0.0)
 
     ore_giornaliere = compute_daily_work(df)  # Dipendente, Data, Ore_lavorate
-    mappa_livelli = get_users_livello_map()
+    mappa_livelli = get_users_livello_categoria_map()
     mappa_costi_livello = get_livelli_costo_orario_map()
 
     def _costo_personale(riga):
@@ -8283,7 +8337,7 @@ def compute_costi_fasi_commessa(df, commessa_filter=None, area_filter=None, fase
 
     fasi = _applica_filtri(fasi).copy()
 
-    mappa_livelli = get_users_livello_map()
+    mappa_livelli = get_users_livello_categoria_map()
     mappa_costi_livello = get_livelli_costo_orario_map()
     if fasi.empty:
         fasi["Costo_ipotetico"] = pd.Series(dtype=float)
@@ -8497,7 +8551,7 @@ def compute_ore_assistenza(df, start_date=None, end_date=None, commessa_filter=N
         return pd.DataFrame(columns=colonne)
     mappa_area = get_users_area_map()
     mappa_orario_fine = get_users_orario_fine_map()
-    mappa_livelli = get_users_livello_map()
+    mappa_livelli = get_users_livello_categoria_map()
     mappa_costi_livello = get_livelli_costo_orario_map()
     with db_connect() as conn:
         info_commesse = {nome: (cliente or "", anno) for nome, cliente, anno in
@@ -8614,7 +8668,7 @@ def compute_ore_attivita_non_commessa(df, tipo, start_date=None, end_date=None, 
         return pd.DataFrame(columns=colonne)
     mappa_area = get_users_area_map()
     mappa_orario_fine = get_users_orario_fine_map()
-    mappa_livelli = get_users_livello_map()
+    mappa_livelli = get_users_livello_categoria_map()
     mappa_costi_livello = get_livelli_costo_orario_map()
     ora_attuale = get_current_datetime()
     righe = []
@@ -10116,8 +10170,9 @@ def render_area_personale(username, key_prefix):
     dati = get_dati_personali_utente(username)
 
     st.markdown("**Inquadramento** _(impostato dall'amministratore)_")
-    col_inq1, col_inq2 = st.columns(2)
+    col_inq1, col_inq0, col_inq2 = st.columns(3)
     col_inq1.metric("Livello CCNL", dati["livello"] or "(non impostato)")
+    col_inq0.metric("Categoria", dati["categoria"])
     col_inq2.metric("Data di assunzione", dati["data_assunzione"].strftime("%d/%m/%Y") if dati["data_assunzione"] else "(non impostata)")
 
     st.markdown("---")
@@ -10158,7 +10213,7 @@ def render_grafici_classifiche(df, key_prefix):
     st.write("### 📈 Grafici e Classifiche per Area")
     g_start = st.date_input("Inizio periodo", value=datetime.date.today().replace(day=1), key=f"{key_prefix}_g_start")
     g_end = st.date_input("Fine periodo", value=datetime.date.today(), key=f"{key_prefix}_g_end")
-    st.caption("Il costo del personale qui sotto è calcolato automaticamente in base alle ore lavorate da ciascun dipendente e al costo orario del suo livello CCNL (configurabile in 'Gestione Utenti DB' → 'Livelli CCNL'). È una stima, non un dato di paga ufficiale.")
+    st.caption("Il costo del personale qui sotto è calcolato automaticamente in base alle ore lavorate da ciascun dipendente e al costo orario del suo livello CCNL e della sua categoria, operaio o impiegato (configurabile in 'Gestione Utenti DB' → 'Livelli CCNL'). È una stima, non un dato di paga ufficiale.")
 
     def compute_hours_by_area(df_all, start_date, end_date, area_filter=None):
         df_hours = compute_daily_work(df_all)
@@ -11101,7 +11156,7 @@ else:
 
             # Carica elenco utenti live per gestirli
             with db_connect() as conn:
-                utenti_db = pd.read_sql("SELECT username, nome, email, role, area, posizione, livello, colore, data_assunzione, codice_fiscale, data_nascita, distanza_km FROM utenti", conn)
+                utenti_db = pd.read_sql("SELECT username, nome, email, role, area, posizione, categoria, livello, colore, data_assunzione, codice_fiscale, data_nascita, distanza_km FROM utenti", conn)
 
             livelli_disponibili = get_livelli_disponibili()
 
@@ -11118,7 +11173,9 @@ else:
                 new_role = st.selectbox("Ruolo", ["user", "admin", "responsabile"])
                 new_area = st.text_input("Area").strip()
                 new_position = st.text_input("Posizione").strip()
-                new_level = st.selectbox("Livello CCNL", options=livelli_disponibili, help="Determina le ferie/permessi annuali maturati e il costo orario stimato (vedi 'Livelli CCNL' qui sotto).") if livelli_disponibili else ""
+                new_categoria = st.radio("Categoria", CATEGORIE_DIPENDENTE, index=CATEGORIE_DIPENDENTE.index(DEFAULT_CATEGORIA), horizontal=True, key="nuovo_utente_categoria",
+                                         help="Operaio o impiegato: il costo orario cambia in base alla categoria (vedi 'Livelli CCNL').")
+                new_level = st.selectbox("Livello CCNL", options=livelli_disponibili, help="Determina le ferie/permessi annuali maturati e, insieme alla categoria, il costo orario stimato (vedi 'Livelli CCNL' qui sotto).") if livelli_disponibili else ""
                 new_hire_date = st.date_input("Data di assunzione", value=datetime.date.today(), key="new_user_hire_date", help="Usata per calcolare correttamente la maturazione di ferie e permessi dal mese di assunzione invece che da gennaio.")
                 new_color = st.color_picker("Colore", value="#4fa8ff" if new_role != "responsabile" else "#2f5d62")
 
@@ -11131,8 +11188,8 @@ else:
                         try:
                             with db_connect() as conn:
                                 c = conn.cursor()
-                                c.execute("INSERT INTO utenti (username, nome, password, role, area, posizione, livello, colore, data_assunzione, email) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                          (new_username, new_name, hash_password(new_password), new_role, new_area, new_position, new_level, new_color, new_hire_date.isoformat(), new_email))
+                                c.execute("INSERT INTO utenti (username, nome, password, role, area, posizione, livello, colore, data_assunzione, email, categoria) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                                          (new_username, new_name, hash_password(new_password), new_role, new_area, new_position, new_level, new_color, new_hire_date.isoformat(), new_email, new_categoria))
                                 conn.commit()
                             get_area_names.clear()
                             get_users_in_area.clear()
@@ -11150,6 +11207,9 @@ else:
                 livello_attuale = utenti_db.loc[utenti_db["username"] == selected_username, "livello"].iloc[0] if selected_username in utenti_db["username"].tolist() else ""
                 opzioni_livello = livelli_disponibili if livelli_disponibili else [""]
                 indice_livello = opzioni_livello.index(livello_attuale) if livello_attuale in opzioni_livello else 0
+                categoria_attuale = categoria_valida(utenti_db.loc[utenti_db["username"] == selected_username, "categoria"].iloc[0]) if selected_username in utenti_db["username"].tolist() else DEFAULT_CATEGORIA
+                new_categoria = st.radio("Categoria", CATEGORIE_DIPENDENTE, index=CATEGORIE_DIPENDENTE.index(categoria_attuale), horizontal=True,
+                                         key=f"modifica_categoria_{selected_username}", help="Operaio o impiegato: il costo orario cambia in base alla categoria (vedi 'Livelli CCNL').")
                 new_level = st.selectbox("Livello CCNL", options=opzioni_livello, index=indice_livello, key="modifica_livello_utente")
                 data_assunzione_attuale = utenti_db.loc[utenti_db["username"] == selected_username, "data_assunzione"].iloc[0] if selected_username in utenti_db["username"].tolist() else ""
                 try:
@@ -11166,9 +11226,9 @@ else:
                         with db_connect() as conn:
                             c = conn.cursor()
                             if new_password:
-                                c.execute("UPDATE utenti SET password=?, role=?, livello=?, colore=?, data_assunzione=?, email=? WHERE username=?", (hash_password(new_password), new_role, new_level, new_color, new_hire_date.isoformat(), nuova_email, selected_username))
+                                c.execute("UPDATE utenti SET password=?, role=?, livello=?, colore=?, data_assunzione=?, email=?, categoria=? WHERE username=?", (hash_password(new_password), new_role, new_level, new_color, new_hire_date.isoformat(), nuova_email, new_categoria, selected_username))
                             else:
-                                c.execute("UPDATE utenti SET role=?, livello=?, colore=?, data_assunzione=?, email=? WHERE username=?", (new_role, new_level, new_color, new_hire_date.isoformat(), nuova_email, selected_username))
+                                c.execute("UPDATE utenti SET role=?, livello=?, colore=?, data_assunzione=?, email=?, categoria=? WHERE username=?", (new_role, new_level, new_color, new_hire_date.isoformat(), nuova_email, new_categoria, selected_username))
                             conn.commit()
                         get_area_names.clear()
                         get_users_in_area.clear()
@@ -11199,24 +11259,29 @@ else:
                 if modalita_livello == "Esistente" and livelli_disponibili:
                     livello_sel = st.selectbox("Seleziona livello", options=livelli_disponibili, key="livello_ccnl_select")
                     ferie_attuali, permesso_attuali = get_ferie_permessi_per_livello(livello_sel)
-                    costo_attuale = get_costo_orario_per_livello(livello_sel)
+                    costo_attuale = get_costo_orario_per_livello(livello_sel, "Impiegato")
+                    costo_attuale_operaio = get_costo_orario_per_livello(livello_sel, "Operaio")
                 else:
                     livello_sel = st.text_input("Nome nuovo livello (es. 2S)", key="livello_ccnl_nuovo").strip()
                     ferie_attuali, permesso_attuali = float(DEFAULT_FERIE_GIORNI), float(DEFAULT_PERMESSO_ORE)
                     costo_attuale = float(DEFAULT_COSTO_ORARIO)
+                    costo_attuale_operaio = float(DEFAULT_COSTO_ORARIO)
 
-                col_liv1, col_liv2, col_liv3 = st.columns(3)
+                col_liv1, col_liv2, col_liv3, col_liv4 = st.columns(4)
                 with col_liv1:
                     nuove_ferie_livello = st.number_input("Ferie (giorni/anno)", min_value=0.0, step=0.5, value=ferie_attuali, key=f"ferie_livello_{livello_sel}")
                 with col_liv2:
                     nuovo_permesso_livello = st.number_input("Permesso/ROL (ore/anno)", min_value=0.0, step=1.0, value=permesso_attuali, key=f"permesso_livello_{livello_sel}")
                 with col_liv3:
-                    nuovo_costo_livello = st.number_input("Costo orario (€/h)", min_value=0.0, step=0.5, value=costo_attuale, key=f"costo_livello_{livello_sel}", help="Stima del costo orario aziendale per un dipendente di questo livello: usato per calcolare automaticamente il costo del personale in 'Grafici e Classifiche'. Non è un dato di paga ufficiale: personalizzalo in base ai costi reali (retribuzione, contributi, TFR, ecc.).")
+                    nuovo_costo_livello = st.number_input("Costo orario impiegato (€/h)", min_value=0.0, step=0.5, value=costo_attuale, key=f"costo_livello_{livello_sel}", help="Stima del costo orario aziendale per un IMPIEGATO di questo livello: usato per calcolare automaticamente il costo del personale in 'Grafici e Classifiche'. Non è un dato di paga ufficiale: personalizzalo in base ai costi reali (retribuzione, contributi, TFR, ecc.).")
+                with col_liv4:
+                    nuovo_costo_livello_operaio = st.number_input("Costo orario operaio (€/h)", min_value=0.0, step=0.5, value=costo_attuale_operaio, key=f"costo_livello_operaio_{livello_sel}",
+                                                                  help="Come il costo dell'impiegato, ma per un OPERAIO di questo livello.")
 
                 col_liv_btn1, col_liv_btn2 = st.columns(2)
                 with col_liv_btn1:
                     if st.button("💾 Salva livello", key="btn_salva_livello"):
-                        ok, errore = aggiorna_livello_ferie_permessi(livello_sel, nuove_ferie_livello, nuovo_permesso_livello, nuovo_costo_livello)
+                        ok, errore = aggiorna_livello_ferie_permessi(livello_sel, nuove_ferie_livello, nuovo_permesso_livello, nuovo_costo_livello, nuovo_costo_livello_operaio)
                         if ok:
                             notifica_e_ricarica(f"Livello '{livello_sel}' salvato.")
                         else:
